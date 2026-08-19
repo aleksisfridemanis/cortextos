@@ -12,9 +12,18 @@ export const dynamic = 'force-dynamic';
  * as bus/send-message.sh. The agent's fast-checker daemon picks it up
  * on its next inbox check cycle (every 1 second).
  *
- * Body: { agent: string, text: string, type?: string }
+ * Body: { agent: string, text: string, type?: string, reply_to?: string }
  * Returns: { success: boolean, messageId: string }
  */
+
+/**
+ * reply_to is interpolated RAW into the PTY header the daemon injects
+ * (`[reply_to: ...]` in src/daemon/fast-checker.ts formatInboxMessage — it
+ * sanitizes `from`, not this). Until this route existed only the signed bus path
+ * could set the field. Anything outside a message id is rejected here, at the
+ * edge, rather than sanitized downstream.
+ */
+const REPLY_TO_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 export async function POST(request: NextRequest) {
   let body: Record<string, unknown>;
   try {
@@ -23,10 +32,11 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const { agent, text, type } = body as {
+  const { agent, text, type, reply_to } = body as {
     agent?: string;
     text?: string;
     type?: string;
+    reply_to?: string;
   };
 
   if (!agent || typeof agent !== 'string') {
@@ -37,6 +47,9 @@ export async function POST(request: NextRequest) {
   }
   if (!text || typeof text !== 'string') {
     return Response.json({ error: 'text is required' }, { status: 400 });
+  }
+  if (reply_to !== undefined && (typeof reply_to !== 'string' || !REPLY_TO_PATTERN.test(reply_to))) {
+    return Response.json({ error: 'Invalid reply_to' }, { status: 400 });
   }
 
   // Verify the agent actually exists in the registry (defense against
@@ -76,7 +89,7 @@ export async function POST(request: NextRequest) {
       priority: 'normal',
       timestamp: new Date().toISOString(),
       text: text,
-      reply_to: null,
+      reply_to: reply_to ?? null,
     };
 
     // Atomic write: temp file then rename (same pattern as send-message.sh)

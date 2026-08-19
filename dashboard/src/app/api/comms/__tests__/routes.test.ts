@@ -408,6 +408,79 @@ describe('GET /api/comms/channel/[pair]', () => {
     expect(data[0].local_file).toBe('/tmp/v1.webm');
   });
 
+  // 15
+  it('carries thread_id and kind through from the room log', async () => {
+    writeRoomLog('dm-boris--nick', [
+      {
+        id: 'run-1', room_id: 'dm-boris--nick', from: 'boris', to: 'nick',
+        timestamp: '2026-04-15T09:00:00Z', text: 'deploy', reply_to: null,
+        thread_id: 'run-1', source: 'bus', attachments: [], kind: 'tool_run',
+      },
+      {
+        id: 's0', room_id: 'dm-boris--nick', from: 'boris', to: 'nick',
+        timestamp: '2026-04-15T09:00:01Z', text: 'build', reply_to: 'run-1',
+        thread_id: 'run-1', source: 'bus', attachments: [], kind: 'tool_step',
+      },
+    ]);
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--nick'),
+      { params: Promise.resolve({ pair: 'boris--nick' }) },
+    );
+    const data = await res.json();
+    expect(data).toHaveLength(2);
+    expect(data.map((m: Record<string, unknown>) => m.kind)).toEqual(['tool_run', 'tool_step']);
+    expect(data.map((m: Record<string, unknown>) => m.thread_id)).toEqual(['run-1', 'run-1']);
+  });
+
+  // 16 PRESERVE+control
+  it('still renders an inc1 room-log line that has no kind', async () => {
+    writeRoomLog('dm-boris--nick', [{
+      id: 'inc1', room_id: 'dm-boris--nick', from: 'boris', to: 'nick',
+      timestamp: '2026-04-15T09:00:00Z', text: 'written before inc2', reply_to: null,
+      thread_id: 'inc1', source: 'bus', attachments: [],
+    }]);
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--nick'),
+      { params: Promise.resolve({ pair: 'boris--nick' }) },
+    );
+    const data = await res.json();
+    expect(data).toHaveLength(1);
+    expect(data[0].text).toBe('written before inc2');
+    // Absent, not null — the UI branches on falsiness of `kind`.
+    expect(data[0].kind).toBeUndefined();
+  });
+
+  // 17 — DOCUMENTS a known limitation, deliberately not fixed.
+  it('limit truncation can separate a run root from its steps', async () => {
+    writeRoomLog('dm-boris--nick', [
+      {
+        id: 'run-1', room_id: 'dm-boris--nick', from: 'boris', to: 'nick',
+        timestamp: '2026-04-15T09:00:00Z', text: 'deploy', reply_to: null,
+        thread_id: 'run-1', source: 'bus', attachments: [], kind: 'tool_run',
+      },
+      {
+        id: 's0', room_id: 'dm-boris--nick', from: 'boris', to: 'nick',
+        timestamp: '2026-04-15T09:00:01Z', text: 'build', reply_to: 'run-1',
+        thread_id: 'run-1', source: 'bus', attachments: [], kind: 'tool_step',
+      },
+    ]);
+
+    // limit slices the TAIL, so the root falls off and the step survives.
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--nick?limit=1'),
+      { params: Promise.resolve({ pair: 'boris--nick' }) },
+    );
+    const data = await res.json();
+    expect(data).toHaveLength(1);
+    expect(data[0].id).toBe('s0');
+    // The client folds this into a run row with a null root and the run's
+    // label falls back to a generic one. Accepted: pagination is the fix, and
+    // it is out of scope for this increment.
+    expect(data.some((m: Record<string, unknown>) => m.kind === 'tool_run')).toBe(false);
+  });
+
   it('does not render an empty-text room log entry', async () => {
     writeRoomLog('dm-boris--nick', [{
       id: 'stub',

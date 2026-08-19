@@ -24,6 +24,8 @@ export interface RoomMessage {
   reply_to: string | null;
   thread_id: string;
   source: string;
+  /** Tool-run marker. Absent on ordinary messages and on every inc1 line. */
+  kind?: string;
   attachments: Array<{ kind: string; path: string; mime?: string; transcript?: string }>;
   priority?: string;
 }

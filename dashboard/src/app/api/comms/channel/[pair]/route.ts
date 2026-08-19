@@ -15,6 +15,11 @@ interface BusMessage {
   timestamp: string;
   text: string;
   reply_to: string | null;
+  /** Thread root. Room-log projection only — the queue and JSONL copies have
+   *  no such field, and a synthesized one would fold unrelated messages. */
+  thread_id?: string;
+  /** Tool-run marker, room-log projection only. Absent on ordinary messages. */
+  kind?: string;
   /** Optional origin marker — set when the message came from a Telegram voice
    *  note so the UI can render a microphone indicator next to the transcript. */
   media_type?: string;
@@ -92,6 +97,8 @@ export async function GET(
       timestamp: msg.timestamp,
       text: msg.text,
       reply_to: msg.reply_to,
+      thread_id: msg.thread_id,
+      ...(msg.kind ? { kind: msg.kind } : {}),
     };
     byId.set(msg.id, rendered);
     messages.push(rendered);

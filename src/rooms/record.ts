@@ -69,7 +69,14 @@ function resolveThreadId(
   roomId: string,
   id: string,
   replyTo: string | null,
+  kind: RoomMessageKind | undefined,
 ): string {
+  // A tool run always roots its OWN thread, even when reply_to points at the
+  // message that triggered it. Inheriting there would give two runs triggered by
+  // the same message one thread_id (MEASURED: both got 'trigger'), and the UI
+  // folds a run by thread_id — so they would collapse into a single row.
+  // reply_to still records what set the run off.
+  if (kind === 'tool_run') return id;
   if (!replyTo) return id;
   const parent = readRoomLog(ctxRoot, roomId).find(m => m.id === replyTo);
   return parent ? parent.thread_id : replyTo;
@@ -115,7 +122,7 @@ export function recordRoomMessage(ctxRoot: string, input: RoomMessageInput): Roo
     timestamp: input.timestamp,
     text: input.text,
     reply_to,
-    thread_id: resolveThreadId(ctxRoot, roomId, input.id, reply_to),
+    thread_id: resolveThreadId(ctxRoot, roomId, input.id, reply_to, input.kind),
     source: input.source,
     // Emitted only when set, so an ordinary message's line stays byte-identical
     // to what inc1 wrote — no schema churn for the readers already in the field.

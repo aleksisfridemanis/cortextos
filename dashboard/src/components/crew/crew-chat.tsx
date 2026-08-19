@@ -7,6 +7,7 @@ import {
   IconMicrophone,
   IconPhoto,
   IconPaint,
+  IconArrowBackUp,
   IconSend,
   IconVolume,
   IconVolumeOff,
@@ -30,6 +31,10 @@ interface BusMessage {
   timestamp: string;
   text: string;
   reply_to: string | null;
+  /** Thread root — room-log messages only. Tool runs fold on this. */
+  thread_id?: string;
+  /** 'tool_run' | 'tool_step' | 'tool_run_end' on a tool-run record. */
+  kind?: string;
   media_type?: string;
 }
 
@@ -59,6 +64,61 @@ export function mergeMessages(
     if (localIds.has(m.id) && !byId.has(m.id)) byId.set(m.id, m);
   }
   return [...byId.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+}
+
+export interface ToolRunRowData {
+  type: 'tool_run';
+  id: string;
+  root: BusMessage | null;
+  steps: BusMessage[];
+  end: BusMessage | null;
+}
+
+export type ChatRow = { type: 'message'; message: BusMessage } | ToolRunRowData;
+
+/**
+ * Fold a tool run's records into ONE row.
+ *
+ * A run is event-sourced — a root, N steps, one terminal, each its own record,
+ * nothing ever rewritten — so the collapsed row is DERIVED from the log rather
+ * than stored anywhere. That is the whole reason the summary survives a reload:
+ * the fold's input IS the log.
+ *
+ * Grouped on thread_id, never reply_to. A run root roots its own thread
+ * (src/rooms/record.ts), so the key is the run's own id and two runs triggered
+ * by the same message stay two rows.
+ *
+ * `root` can be null: /api/comms/channel truncates to `limit`, which can cut a
+ * run's root away from its steps. Documented by its test, deliberately not fixed.
+ *
+ * Exported for its own unit test — there is no React test harness here.
+ */
+export function foldToolRuns(messages: BusMessage[]): ChatRow[] {
+  const rows: ChatRow[] = [];
+  const runs = new Map<string, ToolRunRowData>();
+  for (const m of messages) {
+    if (!m.kind) {
+      rows.push({ type: 'message', message: m });
+      continue;
+    }
+    const key = m.thread_id ?? m.id;
+    let run = runs.get(key);
+    if (!run) {
+      run = { type: 'tool_run', id: key, root: null, steps: [], end: null };
+      runs.set(key, run);
+      rows.push(run);
+    }
+    if (m.kind === 'tool_run') run.root = m;
+    else if (m.kind === 'tool_step') run.steps.push(m);
+    else if (m.kind === 'tool_run_end') run.end = m;
+  }
+  return rows;
+}
+
+/** The collapsed label. Settles to `done` once a terminal record exists. */
+export function toolRunSummary(run: ToolRunRowData): string {
+  const n = run.steps.length;
+  return `\u2699 ${n} step${n === 1 ? '' : 's'} \u00b7 ${run.end ? 'done' : 'running'}`;
 }
 
 /**
@@ -94,6 +154,47 @@ export async function fetchMessagesInto(
   } catch {
     setLoading(false);
   }
+}
+
+/**
+ * One tool run, collapsed to a single row. Expanding is a pure disclosure of
+ * records already in hand — it never re-fetches, so the count revealed always
+ * equals the count the summary claimed.
+ */
+function ToolRunRow({ run }: { run: ToolRunRowData }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[80%] rounded-2xl rounded-bl-md border border-border/60 bg-muted/50 px-3.5 py-2 text-sm shadow-sm">
+        <button
+          type="button"
+          data-testid="tool-run"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          className="flex w-full items-center gap-2 text-left"
+        >
+          <span className="min-w-0 flex-1 truncate font-medium">
+            {run.root?.text ?? 'tool run'}
+          </span>
+          <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+            {toolRunSummary(run)}
+          </span>
+        </button>
+        {expanded && (
+          <ul className="mt-1.5 space-y-0.5 border-t border-border/60 pt-1.5">
+            {run.steps.map((step) => (
+              <li key={step.id} data-testid="tool-step" className="text-xs text-muted-foreground">
+                {step.text}
+              </li>
+            ))}
+            {run.end && (
+              <li className="text-xs font-medium text-muted-foreground">{run.end.text}</li>
+            )}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export interface CrewChatAgent {
@@ -170,6 +271,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   const [messages, setMessages] = useState<BusMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState('');
+  const [replyTarget, setReplyTarget] = useState<BusMessage | null>(null);
+  // Parent lookup for the quoted line inside a reply bubble.
+  const messagesById = new Map(messages.map((m) => [m.id, m]));
   const [sendError, setSendError] = useState('');
   const [attachment, setAttachment] = useState<File | null>(null);
   const [attachPreview, setAttachPreview] = useState<string | null>(null);
@@ -428,7 +532,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
       const res = await fetch('/api/messages/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agent: agent.name, text: messageText }),
+        body: JSON.stringify({
+          agent: agent.name,
+          text: messageText,
+          ...(replyTarget ? { reply_to: replyTarget.id } : {}),
+        }),
       });
       if (res.ok) {
         const sent = await res.json().catch(() => ({}));
@@ -445,10 +553,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
             priority: 'normal',
             timestamp: new Date().toISOString(),
             text: messageText,
-            reply_to: null,
+            reply_to: replyTarget?.id ?? null,
           },
         ]);
         setDraft('');
+        setReplyTarget(null);
         clearAttachment();
         forceScrollRef.current = true;
         setTimeout(fetchMessages, 500);
@@ -582,12 +691,27 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           </div>
         ) : (
           <>
-            {messages.map((msg) => {
+            {foldToolRuns(messages).map((row) => {
+              if (row.type === 'tool_run') return <ToolRunRow key={row.id} run={row} />;
+              const msg = row.message;
               const fromAgent = msg.from === agent.name;
+              const parent = msg.reply_to ? messagesById.get(msg.reply_to) : undefined;
               return (
-                <div key={msg.id} className={`flex items-end gap-2 ${fromAgent ? 'justify-start' : 'justify-end'}`}>
+                <div key={msg.id} className={`group flex items-end gap-2 ${fromAgent ? 'justify-start' : 'justify-end'}`}>
                   {fromAgent && (
                     <CrewAvatar name={agent.name} version={agent.avatarVersion} mood="active" size={26} className="mb-4" />
+                  )}
+                  {!fromAgent && (
+                    <button
+                      type="button"
+                      data-testid="reply-to"
+                      onClick={() => setReplyTarget(msg)}
+                      aria-label={`Reply to this message from ${msg.from}`}
+                      title="Reply"
+                      className="mb-4 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+                    >
+                      <IconArrowBackUp size={14} />
+                    </button>
                   )}
                   <div
                     className={`max-w-[80%] rounded-2xl px-3.5 py-2 text-sm shadow-sm ${
@@ -596,6 +720,18 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
                         : 'rounded-br-md bg-primary text-primary-foreground'
                     }`}
                   >
+                    {parent && (
+                      <span
+                        data-testid="reply-parent"
+                        className={`mb-1 block truncate border-l-2 pl-1.5 text-[11px] ${
+                          fromAgent
+                            ? 'border-border text-muted-foreground'
+                            : 'border-primary-foreground/40 text-primary-foreground/70'
+                        }`}
+                      >
+                        {parent.from}: {parent.text}
+                      </span>
+                    )}
                     {msg.media_type === 'voice' && (
                       <span
                         className={`mb-0.5 flex items-center gap-1 text-[10px] ${
@@ -614,6 +750,18 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
                       {formatTime(msg.timestamp)}
                     </p>
                   </div>
+                  {fromAgent && (
+                    <button
+                      type="button"
+                      data-testid="reply-to"
+                      onClick={() => setReplyTarget(msg)}
+                      aria-label={`Reply to this message from ${msg.from}`}
+                      title="Reply"
+                      className="mb-4 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+                    >
+                      <IconArrowBackUp size={14} />
+                    </button>
+                  )}
                 </div>
               );
             })}
@@ -635,6 +783,24 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
       <div className="border-t bg-background p-2">
         {(sendError || recorder.error) && (
           <p className="mb-1 px-1 text-xs text-destructive">{sendError || recorder.error}</p>
+        )}
+        {replyTarget && (
+          <div
+            data-testid="reply-quote"
+            className="mb-1 flex items-center gap-2 rounded-md border-l-2 border-primary bg-muted/50 px-2 py-1"
+          >
+            <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+              Replying to {replyTarget.from}: {replyTarget.text}
+            </span>
+            <button
+              type="button"
+              onClick={() => setReplyTarget(null)}
+              aria-label="Cancel reply"
+              className="shrink-0 text-muted-foreground hover:text-foreground"
+            >
+              <IconX size={12} />
+            </button>
+          </div>
         )}
         {attachPreview && (
           <div className="relative mb-2 inline-block">
