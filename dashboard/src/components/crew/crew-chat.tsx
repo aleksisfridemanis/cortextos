@@ -33,6 +33,69 @@ interface BusMessage {
   media_type?: string;
 }
 
+/**
+ * Reconcile a server fetch against what is already on screen.
+ *
+ * - Server copies win by id, so an optimistic bubble is replaced rather than
+ *   duplicated once the server catches up.
+ * - A local echo the server has not confirmed yet is kept; ids the server DID
+ *   confirm are removed from `localIds`, so each echo is dropped exactly once.
+ * - The result is timestamp-ordered. Appending pending echoes after the server
+ *   list put them out of order the moment a reply arrived first.
+ *
+ * Exported for its own unit test — there is no React test harness here.
+ */
+export function mergeMessages(
+  prev: BusMessage[],
+  incoming: BusMessage[],
+  localIds: Set<string>,
+): BusMessage[] {
+  const byId = new Map<string, BusMessage>();
+  for (const m of incoming) {
+    if (!byId.has(m.id)) byId.set(m.id, m);
+    localIds.delete(m.id);
+  }
+  for (const m of prev) {
+    if (localIds.has(m.id) && !byId.has(m.id)) byId.set(m.id, m);
+  }
+  return [...byId.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+}
+
+/**
+ * Fetch one channel poll and apply it to the thread.
+ *
+ * Exported and setter-injected rather than inlined in the component: the
+ * "a failed fetch is not an empty conversation" guard below is the entire
+ * fix for the blanking bug, and a guard that lives only inside a React
+ * closure cannot be shown to fail (there is no React test harness here and
+ * adding one is a forbidden new dependency). This shape lets the guard be
+ * driven directly with a stubbed fetch.
+ */
+export async function fetchMessagesInto(
+  pair: string,
+  setMessages: (updater: (prev: BusMessage[]) => BusMessage[]) => void,
+  setLoading: (value: boolean) => void,
+  localIds: Set<string>,
+): Promise<void> {
+  try {
+    const r = await fetch(`/api/comms/channel/${pair}?limit=200`);
+    // A failed fetch is not an empty conversation — leave what is on screen.
+    if (!r.ok) {
+      setLoading(false);
+      return;
+    }
+    const data = await r.json();
+    if (!Array.isArray(data)) {
+      setLoading(false);
+      return;
+    }
+    setMessages((prev) => mergeMessages(prev, data as BusMessage[], localIds));
+    setLoading(false);
+  } catch {
+    setLoading(false);
+  }
+}
+
 export interface CrewChatAgent {
   name: string;
   tagline: string;
@@ -134,23 +197,10 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
       ? 'active now'
       : 'resting';
 
-  const fetchMessages = useCallback(async () => {
-    try {
-      const r = await fetch(`/api/comms/channel/${pair}?limit=200`);
-      const data: BusMessage[] = r.ok ? await r.json() : [];
-      // Merge by id so an optimistic just-sent bubble is replaced, not
-      // duplicated, when the server catches up.
-      setMessages((prev) => {
-        const ids = new Set(data.map((m) => m.id));
-        const pending = prev.filter((m) => localIdsRef.current.has(m.id) && !ids.has(m.id));
-        for (const m of data) localIdsRef.current.delete(m.id);
-        return [...data, ...pending];
-      });
-      setLoading(false);
-    } catch {
-      setLoading(false);
-    }
-  }, [pair]);
+  const fetchMessages = useCallback(
+    () => fetchMessagesInto(pair, setMessages, setLoading, localIdsRef.current),
+    [pair],
+  );
 
   // Agent switch — reset and refetch.
   useEffect(() => {

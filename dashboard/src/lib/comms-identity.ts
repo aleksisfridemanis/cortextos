@@ -46,7 +46,9 @@ export function resolveIdentity(ctxRoot: string): CommsIdentity {
   }
 
   // Canonical user = dashboard admin username (always set in .env.local)
-  const canonicalUser = (process.env.ADMIN_USERNAME ?? 'user').toLowerCase();
+  // `||` not `??`: a set-but-empty ADMIN_USERNAME would otherwise yield '',
+  // producing pair keys with an empty side.
+  const canonicalUser = (process.env.ADMIN_USERNAME || 'user').toLowerCase();
 
   return { agents, canonicalUser };
 }

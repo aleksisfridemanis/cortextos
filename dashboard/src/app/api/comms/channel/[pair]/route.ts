@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { getCTXRoot } from '@/lib/config';
 import { resolveIdentity, buildPairKey } from '@/lib/comms-identity';
+import { readRoomLog } from '@/lib/rooms';
 
 export const dynamic = 'force-dynamic';
 
@@ -17,6 +18,24 @@ interface BusMessage {
   /** Optional origin marker — set when the message came from a Telegram voice
    *  note so the UI can render a microphone indicator next to the transcript. */
   media_type?: string;
+  /** Path to the recorded audio, for voice messages sent from the dashboard. */
+  local_file?: string;
+}
+
+/**
+ * Presentation fields the canonical room log does not carry (the bus envelope
+ * has no place for them) but the queue and JSONL copies do. The room log runs
+ * first and claims the id, so without this the mic indicator would vanish the
+ * moment the daemon recorded a voice message. Enrich rather than duplicate.
+ */
+const ENRICHABLE_FIELDS = ['media_type', 'local_file'] as const;
+
+function enrich(target: BusMessage, source: Record<string, unknown>): void {
+  for (const field of ENRICHABLE_FIELDS) {
+    if (target[field] === undefined && typeof source[field] === 'string') {
+      target[field] = source[field] as string;
+    }
+  }
 }
 
 /**
@@ -57,7 +76,29 @@ export async function GET(
   // land in the same channel as bus messages for the same conversation.
   const identity = resolveIdentity(ctxRoot);
 
-  // Primary source: persistent message history log (JSONL)
+  // Primary source: the canonical room log. Every delivered message is
+  // recorded here by the daemon, in both directions, under one id — so
+  // anything it carries suppresses the parallel-store reconstruction below.
+  const byId = new Map<string, BusMessage>();
+  for (const msg of readRoomLog(ctxRoot, `dm-${pair}`)) {
+    if (!msg.text) continue; // never render an empty bubble
+    if (!matchesSearch(msg.text)) continue;
+    if (before && msg.timestamp >= before) continue;
+    const rendered: BusMessage = {
+      id: msg.id,
+      from: msg.from,
+      to: msg.to ?? '',
+      priority: msg.priority ?? 'normal',
+      timestamp: msg.timestamp,
+      text: msg.text,
+      reply_to: msg.reply_to,
+    };
+    byId.set(msg.id, rendered);
+    messages.push(rendered);
+  }
+
+  // Legacy source: persistent message history log (JSONL). No writer remains;
+  // kept for one increment as the overlap safety net during the live bounce.
   const historyLog = path.join(ctxRoot, 'logs', 'message-history.jsonl');
   if (fs.existsSync(historyLog)) {
     try {
@@ -67,48 +108,53 @@ export async function GET(
         try {
           const msg: BusMessage = JSON.parse(line);
           if (!msg.id || !msg.from || !msg.to || !msg.timestamp) continue;
+          const known = byId.get(msg.id);
+          if (known) { enrich(known, msg as unknown as Record<string, unknown>); continue; }
           const msgPair = buildPairKey(msg.from, msg.to, identity);
           if (msgPair !== pair) continue;
           if (!matchesSearch(msg.text)) continue;
           if (before && msg.timestamp >= before) continue;
+          byId.set(msg.id, msg);
           messages.push(msg);
         } catch { /* skip corrupt lines */ }
       }
     } catch { /* fall through to inbox scan */ }
   }
 
-  // Fallback: scan inbox directories for messages not yet in the history log
-  const seen = new Set<string>(messages.map(m => m.id));
-  const inboxBase = path.join(ctxRoot, 'inbox');
+  // Fallback: scan the bus queues for messages the room log does not carry
+  // (anything delivered before this build, or never delivered at all).
+  //
+  // The queues are three SIBLING trees — <ctxRoot>/{inbox,inflight,processed}/
+  // <agent> — not subdirectories of inbox/<agent>. Scanning inbox/<agent>/
+  // processed made agent↔agent messages disappear from this view about a
+  // second after they were sent, as soon as the fast-checker ACKed them.
+  for (const agent of [a1, a2]) {
+    for (const queue of ['inbox', 'inflight', 'processed']) {
+      const dir = path.join(ctxRoot, queue, agent);
+      if (!fs.existsSync(dir)) continue;
 
-  if (fs.existsSync(inboxBase)) {
-    for (const agent of [a1, a2]) {
-      for (const sub of ['processed', 'inflight', '']) {
-        const dir = sub ? path.join(inboxBase, agent, sub) : path.join(inboxBase, agent);
-        if (!fs.existsSync(dir)) continue;
+      let files: string[];
+      try {
+        files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
+      } catch { continue; }
 
-        let files: string[];
+      for (const file of files) {
         try {
-          files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
-        } catch { continue; }
+          const raw = fs.readFileSync(path.join(dir, file), 'utf-8');
+          const msg: BusMessage = JSON.parse(raw);
+          if (!msg.id || !msg.from || !msg.to || !msg.timestamp) continue;
+          const known = byId.get(msg.id);
+          if (known) { enrich(known, msg as unknown as Record<string, unknown>); continue; }
 
-        for (const file of files) {
-          try {
-            const raw = fs.readFileSync(path.join(dir, file), 'utf-8');
-            const msg: BusMessage = JSON.parse(raw);
-            if (!msg.id || !msg.from || !msg.to || !msg.timestamp) continue;
-            if (seen.has(msg.id)) continue;
+          const msgPair = buildPairKey(msg.from, msg.to, identity);
+          if (msgPair !== pair) continue;
 
-            const msgPair = buildPairKey(msg.from, msg.to, identity);
-            if (msgPair !== pair) continue;
+          if (!matchesSearch(msg.text)) continue;
+          if (before && msg.timestamp >= before) continue;
 
-            if (!matchesSearch(msg.text)) continue;
-            if (before && msg.timestamp >= before) continue;
-
-            seen.add(msg.id);
-            messages.push(msg);
-          } catch { /* skip */ }
-        }
+          byId.set(msg.id, msg);
+          messages.push(msg);
+        } catch { /* skip */ }
       }
     }
   }
@@ -149,8 +195,15 @@ export async function GET(
             try {
               const raw = JSON.parse(line);
               if (!raw.timestamp) continue;
-              const msgId = `tg-${isInbound ? 'in' : 'out'}-${agent}-${raw.message_id || raw.timestamp}`;
-              if (seen.has(msgId)) continue;
+              // Prefer the entry's OWN id when it has one. The dashboard's
+              // send route writes an inbound-messages.jsonl entry carrying the
+              // bus message id but no message_id, so a synthesized id could
+              // never collide with the inbox copy — and the same message
+              // rendered twice. Real Telegram entries have no `id` and still
+              // fall through to the synthesized form.
+              const msgId = raw.id ?? `tg-${isInbound ? 'in' : 'out'}-${agent}-${raw.message_id || raw.timestamp}`;
+              const known = byId.get(msgId);
+              if (known) { enrich(known, raw); continue; }
 
               // Resolve both sides through the identity layer so inbound
               // (user→agent) and outbound (agent→user) land in the same channel.
@@ -195,7 +248,7 @@ export async function GET(
           if (!msg.text) continue;
           if (!matchesSearch(msg.text)) continue;
           if (before && msg.timestamp >= before) continue;
-          seen.add(msg.id);
+          byId.set(msg.id, msg);
           messages.push(msg);
         }
       }

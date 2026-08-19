@@ -7,6 +7,7 @@
 import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { logEvent } from '../bus/event.js';
+import { recordRoomMessage, resolveCanonicalUser } from '../rooms/index.js';
 import type { BusPaths, TelegramMessage } from '../types/index.js';
 import { stripControlChars } from '../utils/validate.js';
 
@@ -131,6 +132,33 @@ export function recordInboundTelegram(
     });
   } catch (err) {
     log?.(`logEvent(telegram_received) failed: ${err}`);
+  }
+
+  // Canonical room log. The id mirrors the one the dashboard synthesizes for
+  // this same entry (`tg-in-<agent>-<message_id>`) so the two records dedupe
+  // against each other while the JSONL overlap is still in place.
+  // Wrapped whole, like the logEvent call above: recording must never break
+  // message processing.
+  //
+  // Empty-text messages are NOT recorded: a voice note logs a stub here with
+  // no text at all, and the transcript arrives on a separate path. Recording
+  // the stub would pin an empty bubble in the room log under the id the
+  // transcript would need. Media stays on the JSONL path until structured
+  // attachment ingestion lands.
+  if (text.trim()) {
+    try {
+      recordRoomMessage(ctxRoot, {
+        id: `tg-in-${agentName}-${msg.message_id}`,
+        from: resolveCanonicalUser(ctxRoot),
+        to: agentName,
+        timestamp: new Date().toISOString(),
+        text,
+        reply_to: null,
+        source: 'telegram',
+      });
+    } catch (err) {
+      log?.(`recordRoomMessage(telegram_in) failed: ${err}`);
+    }
   }
 }
 

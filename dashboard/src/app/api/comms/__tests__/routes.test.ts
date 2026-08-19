@@ -14,6 +14,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { NextRequest } from 'next/server';
+import { appendRoomMessage } from '../../../../../../src/rooms/log';
+import type { RoomMessage } from '../../../../../../src/types';
 
 // ---------------------------------------------------------------------------
 // Global setup — one shared tmp root across all tests in this file.
@@ -73,6 +75,41 @@ function writeHistory(messages: Array<Record<string, unknown>>) {
 
 function makeRequest(url: string): NextRequest {
   return new NextRequest(new URL(url, 'http://localhost'));
+}
+
+/** Write a raw bus message file into one of the flat per-agent queues. */
+function writeQueueMessage(
+  queue: 'inbox' | 'inflight' | 'processed',
+  agent: string,
+  msg: Record<string, unknown>,
+) {
+  const dir = path.join(rootTmp, queue, agent);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `2-${msg.id}.json`), JSON.stringify(msg));
+}
+
+/** Append entries to an agent's Telegram-style inbound/outbound JSONL. */
+function writeAgentLog(
+  agent: string,
+  file: 'inbound-messages.jsonl' | 'outbound-messages.jsonl',
+  entries: Array<Record<string, unknown>>,
+) {
+  const dir = path.join(rootTmp, 'logs', agent);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, file), entries.map(e => JSON.stringify(e)).join('\n') + '\n');
+}
+
+/**
+ * Seed a canonical room log through the REAL daemon-side writer, not a
+ * hand-rolled JSON dump. This is what makes the route's read-only
+ * reimplementation (dashboard/src/lib/rooms.ts) a conformance check rather
+ * than a second guess: if the two ever disagree on layout or admission rules,
+ * these tests break.
+ */
+function writeRoomLog(roomId: string, messages: Array<Record<string, unknown>>) {
+  for (const m of messages) {
+    appendRoomMessage(rootTmp, m as unknown as RoomMessage);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +228,205 @@ describe('GET /api/comms/channel/[pair]', () => {
       { params: Promise.resolve({ pair: 'Boris--NICK' }) },
     );
     expect(res2.status).toBe(400);
+  });
+
+  // A dashboard-sent message exists TWICE on disk: once as the inbox file the
+  // agent consumes, and once as an inbound-messages.jsonl entry carrying the
+  // same `id` but no `message_id`. The Telegram synthesis path used to ignore
+  // `id` and mint `tg-in-<agent>-<timestamp>`, which can never collide with
+  // the inbox id — so the same message rendered twice.
+  it('renders a dashboard-sent message once, not twice', async () => {
+    const ts = '2026-04-15T09:00:00.000Z';
+    writeQueueMessage('inbox', 'boris', {
+      id: '1755600000000-james-abcde',
+      from: 'james',
+      to: 'boris',
+      priority: 'normal',
+      timestamp: ts,
+      text: 'hello from the dashboard',
+      reply_to: null,
+    });
+    writeAgentLog('boris', 'inbound-messages.jsonl', [{
+      id: '1755600000000-james-abcde',
+      timestamp: ts,
+      agent: 'boris',
+      direction: 'inbound',
+      type: 'text',
+      text: 'hello from the dashboard',
+      from_name: 'james',
+      source: 'dashboard',
+    }]);
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--james'),
+      { params: Promise.resolve({ pair: 'boris--james' }) },
+    );
+    const data = await res.json();
+    expect(data.filter((m: { text: string }) => m.text === 'hello from the dashboard')).toHaveLength(1);
+    expect(data).toHaveLength(1);
+  });
+
+  // Positive control for the test above: a REAL Telegram entry has no `id`,
+  // so it must still be synthesized from message_id and rendered.
+  it('still synthesizes an id for a real Telegram entry that has none', async () => {
+    writeAgentLog('boris', 'inbound-messages.jsonl', [{
+      message_id: 42,
+      from_name: 'james',
+      chat_id: 1,
+      text: 'sent from Telegram',
+      timestamp: '2026-04-15T09:00:00.000Z',
+    }]);
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--james'),
+      { params: Promise.resolve({ pair: 'boris--james' }) },
+    );
+    const data = await res.json();
+    expect(data).toHaveLength(1);
+    expect(data[0].id).toBe('tg-in-boris-42');
+    expect(data[0].text).toBe('sent from Telegram');
+  });
+
+  // Agent↔agent bus messages live in <ctxRoot>/{processed,inflight}/<agent>,
+  // NOT <ctxRoot>/inbox/<agent>/{processed,inflight}. Scanning the wrong base
+  // made them vanish from the channel ~1s after send, as soon as the
+  // fast-checker moved them out of the inbox.
+  it('finds messages that have already moved to processed/inflight', async () => {
+    // No inbox/ at all: the sibling queues must still be scanned.
+    fs.rmSync(path.join(rootTmp, 'inbox'), { recursive: true, force: true });
+    writeQueueMessage('processed', 'boris', {
+      id: 'p1',
+      from: 'boris',
+      to: 'nick',
+      priority: 'normal',
+      timestamp: '2026-04-15T09:00:00Z',
+      text: 'already acked',
+      reply_to: null,
+    });
+    writeQueueMessage('inflight', 'nick', {
+      id: 'f1',
+      from: 'nick',
+      to: 'boris',
+      priority: 'normal',
+      timestamp: '2026-04-15T10:00:00Z',
+      text: 'mid-delivery',
+      reply_to: null,
+    });
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--nick'),
+      { params: Promise.resolve({ pair: 'boris--nick' }) },
+    );
+    const data = await res.json();
+    expect(data.map((m: { id: string }) => m.id)).toEqual(['p1', 'f1']);
+  });
+
+  it('serves the canonical room log and does not double it against its inbox twin', async () => {
+    writeRoomLog('dm-boris--nick', [{
+      id: 'r1',
+      room_id: 'dm-boris--nick',
+      from: 'boris',
+      to: 'nick',
+      timestamp: '2026-04-15T09:00:00Z',
+      text: 'canonical',
+      reply_to: null,
+      thread_id: 'r1',
+      source: 'bus',
+      attachments: [],
+      priority: 'normal',
+    }]);
+    // The same message, still sitting in the queue it was delivered through.
+    writeQueueMessage('processed', 'boris', {
+      id: 'r1',
+      from: 'boris',
+      to: 'nick',
+      priority: 'normal',
+      timestamp: '2026-04-15T09:00:00Z',
+      text: 'canonical',
+      reply_to: null,
+    });
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--nick'),
+      { params: Promise.resolve({ pair: 'boris--nick' }) },
+    );
+    const data = await res.json();
+    expect(data).toHaveLength(1);
+    expect(data[0].id).toBe('r1');
+    expect(data[0].text).toBe('canonical');
+  });
+
+  // TC2 discriminator: this case has NO queue or JSONL twin, so it can only
+  // pass if the route actually reads the canonical room log. The "does not
+  // double it against its inbox twin" test below is satisfied by the queue
+  // fallback alone and proves nothing on its own.
+  it('renders a message that exists ONLY in the room log', async () => {
+    writeRoomLog('dm-boris--nick', [{
+      id: 'only1', room_id: 'dm-boris--nick', from: 'boris', to: 'nick',
+      timestamp: '2026-04-15T09:00:00Z', text: 'room-log only', reply_to: null,
+      thread_id: 'only1', source: 'bus', attachments: [],
+    }]);
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--nick'),
+      { params: Promise.resolve({ pair: 'boris--nick' }) },
+    );
+    const data = await res.json();
+    expect(data).toHaveLength(1);
+    expect(data[0].id).toBe('only1');
+    expect(data[0].text).toBe('room-log only');
+  });
+
+  // The bus envelope has no media_type, so the room log cannot carry it. The
+  // room log claims the id first, so without enrichment the mic indicator
+  // disappears the moment the daemon records a dashboard voice message.
+  it('keeps media_type and local_file from the queue copy of a recorded message', async () => {
+    writeRoomLog('dm-boris--james', [{
+      id: 'v1', room_id: 'dm-boris--james', from: 'james', to: 'boris',
+      timestamp: '2026-04-15T09:00:00Z', text: 'spoken words', reply_to: null,
+      thread_id: 'v1', source: 'bus', attachments: [],
+    }]);
+    writeQueueMessage('processed', 'boris', {
+      id: 'v1',
+      from: 'james',
+      to: 'boris',
+      priority: 'normal',
+      timestamp: '2026-04-15T09:00:00Z',
+      text: 'spoken words',
+      reply_to: null,
+      media_type: 'voice',
+      local_file: '/tmp/v1.webm',
+    });
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--james'),
+      { params: Promise.resolve({ pair: 'boris--james' }) },
+    );
+    const data = await res.json();
+    expect(data).toHaveLength(1);
+    expect(data[0].media_type).toBe('voice');
+    expect(data[0].local_file).toBe('/tmp/v1.webm');
+  });
+
+  it('does not render an empty-text room log entry', async () => {
+    writeRoomLog('dm-boris--nick', [{
+      id: 'stub',
+      room_id: 'dm-boris--nick',
+      from: 'boris',
+      to: 'nick',
+      timestamp: '2026-04-15T09:00:00Z',
+      text: '',
+      reply_to: null,
+      thread_id: 'stub',
+      source: 'telegram',
+      attachments: [],
+    }]);
+
+    const res = await channel.GET(
+      makeRequest('/api/comms/channel/boris--nick'),
+      { params: Promise.resolve({ pair: 'boris--nick' }) },
+    );
+    expect(await res.json()).toEqual([]);
   });
 });
 

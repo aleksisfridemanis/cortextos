@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox, sendMessage } from '../bus/message.js';
+import { recordRoomMessage, inboxMessageToRoomInput } from '../rooms/index.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -48,6 +49,9 @@ export class FastChecker {
   private typingLastSent: number = 0;
   // Hook-based typing: track when we last injected a Telegram message (ms)
   private lastMessageInjectedAt: number = 0;
+  // Rooms whose canonical-log write has already been reported as failing, so
+  // a permanently unwritable rooms/ dir logs once instead of once per poll.
+  private roomRecordFailures: Set<string> = new Set();
   // Track outbound message log size to detect when agent sends a reply
   private outboundLogSize: number = 0;
   // Track stdout log size to detect when agent is actively producing output
@@ -270,6 +274,17 @@ export class FastChecker {
         for (const id of ackIds) {
           ackInbox(this.paths, id);
         }
+        // Canonical room log — an additive record of what was just delivered,
+        // written AFTER the ACK above and wrapped whole (room-id derivation
+        // included, not just the append). Nothing in here can reach delivery
+        // or the ACK: both have already completed by this line.
+        for (const msg of inboxMessages) {
+          try {
+            recordRoomMessage(this.paths.ctxRoot, inboxMessageToRoomInput(msg));
+          } catch (err) {
+            this.warnRoomRecordFailureOnce(msg, err);
+          }
+        }
         this.log(`Injected ${messageBlock.length} bytes`);
         // Only update typing timestamp for Telegram messages, not inbox/cron.
         // Inbox messages (agent-to-agent, session continuations) must not
@@ -289,6 +304,23 @@ export class FastChecker {
 
     // Context monitor: check usage thresholds and fire warnings/handoffs
     await this.checkContextStatus();
+  }
+
+  /**
+   * Report a room-recording failure at most once per room per process — an
+   * unwritable room directory fails on every poll and would otherwise flood
+   * the log. Itself guarded: reporting a recording failure must never become
+   * a delivery failure.
+   */
+  private warnRoomRecordFailureOnce(msg: InboxMessage, err: unknown): void {
+    try {
+      const key = `${msg.from}->${msg.to}`;
+      if (this.roomRecordFailures.has(key)) return;
+      this.roomRecordFailures.add(key);
+      this.log(`recordRoomMessage failed for ${key}: ${err}`);
+    } catch {
+      // Nothing left to do — the message was already delivered and ACKed.
+    }
   }
 
   /**

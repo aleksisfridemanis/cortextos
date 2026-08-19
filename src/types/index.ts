@@ -25,6 +25,61 @@ export interface InboxMessage {
   sig?: string; // Security (H10): HMAC-SHA256 signature — optional for backwards compat
 }
 
+// Room Types
+//
+// Rooms are the canonical, room-keyed record of every message the fleet
+// delivers. They sit BESIDE InboxMessage, never inside it: InboxMessage is
+// the HMAC-signed delivery envelope (payload = id:from:to:text) and adding a
+// field to it would make messages written by a still-running old daemon fail
+// verification during a rolling restart.
+//
+// Room ids are DERIVED, not looked up — the registry below is an index, not a
+// routing dependency. If rooms.json is missing or corrupt, recording still
+// works.
+
+export type RoomKind = 'dm' | 'agent' | 'channel';
+
+export interface Room {
+  /** Derived id: dm-<a>--<b>, agent-<name>, or ch-<slug>. Path-segment safe. */
+  id: string;
+  kind: RoomKind;
+  title: string;
+  /** Normalized participant names. */
+  members: string[];
+  /** For kind:"agent" — the agent whose session this room is scoped to. */
+  agent?: string;
+  created_at: string; // ISO 8601
+  created_by: string;
+  archived?: boolean;
+}
+
+export interface RoomAttachment {
+  kind: 'image' | 'file' | 'voice';
+  /** Path relative to CTX_ROOT (forward-slash separated). */
+  path: string;
+  mime?: string;
+  /** For kind:"voice" — the transcribed text, when transcription ran. */
+  transcript?: string;
+}
+
+/** Which transport delivered the message. */
+export type RoomMessageSource = 'bus' | 'telegram' | 'slack' | 'buzz';
+
+export interface RoomMessage {
+  id: string;
+  room_id: string;
+  from: string;
+  to?: string;
+  timestamp: string; // ISO 8601
+  text: string;
+  reply_to: string | null;
+  /** Root of the thread: the message's own id, or the id it replies to. */
+  thread_id: string;
+  source: RoomMessageSource;
+  attachments: RoomAttachment[];
+  priority?: Priority;
+}
+
 // Task Types
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled';

@@ -24,6 +24,7 @@ import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
+import { recordRoomMessage, resolveCanonicalUser } from '../rooms/index.js';
 import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
 
 /**
@@ -1061,6 +1062,24 @@ busCommand
           const preview = message.length > 120 ? message.slice(0, 120) + '…' : message;
           logEvent(paths, env.agentName, env.org, 'message', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }), { refreshHeartbeat: true });
         } catch { /* non-fatal */ }
+        // Canonical room log. Id mirrors the dashboard's synthesized id for
+        // this same outbound entry so the two dedupe while the JSONL overlap
+        // is still in place. Skipped when Telegram returned no message_id —
+        // the dashboard falls back to a timestamp-derived id there, which we
+        // cannot reproduce, and a wrong id would render the message twice.
+        if (sentMessageId) {
+          try {
+            recordRoomMessage(env.ctxRoot, {
+              id: `tg-out-${env.agentName}-${sentMessageId}`,
+              from: env.agentName,
+              to: resolveCanonicalUser(env.ctxRoot),
+              timestamp: new Date().toISOString(),
+              text: message,
+              reply_to: null,
+              source: 'telegram',
+            });
+          } catch { /* non-fatal — the message was already sent */ }
+        }
       }
 
       console.log('Message sent');
