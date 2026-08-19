@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { getCTXRoot } from '@/lib/config';
-import { resolveIdentity } from '@/lib/comms-identity';
+import { resolveIdentity, buildPairKey } from '@/lib/comms-identity';
+import { readRoomTail } from '@/lib/rooms';
 import { findAvatarFile } from '@/lib/crew-avatars';
 
 export const dynamic = 'force-dynamic';
@@ -15,6 +16,11 @@ export interface CrewMember {
    *  custom art yet (the UI renders a generated critter instead). Doubles
    *  as the cache-busting version for /api/avatars/[agent]?v=. */
   avatarVersion: number | null;
+  /** ISO timestamp of the last message in this agent's DM room, null when
+   *  the conversation is empty. Drives roster sort-by-recency. */
+  lastActivity: string | null;
+  /** Preview text of that last message, null when empty. */
+  lastPreview: string | null;
 }
 
 /**
@@ -80,6 +86,11 @@ export async function GET() {
         }
       }
 
+      // Last-message time + preview from the DM room-log tail (cheap: only the
+      // tail bytes are read). readRoomTail swallows a missing log to {null,null}.
+      const pair = buildPairKey(name, identity.canonicalUser, identity);
+      const tail = readRoomTail(ctxRoot, `dm-${pair}`);
+
       agents.push({
         name,
         org: entry.org ?? '',
@@ -89,6 +100,8 @@ export async function GET() {
           DEFAULT_TAGLINES[name] ??
           (entry.org ? entry.org.replace(/-/g, ' ') : 'On the crew'),
         avatarVersion,
+        lastActivity: tail.lastActivity,
+        lastPreview: tail.lastPreview,
       });
     }
   } catch {

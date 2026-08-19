@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect } from 'react';
 import { CrewAvatar } from './crew-avatar';
 import type { CrewMood } from './crew-critter';
 
@@ -7,6 +8,8 @@ export interface RosterEntry {
   name: string;
   tagline: string;
   avatarVersion: number | null;
+  lastActivity: string | null;
+  lastPreview: string | null;
   mood: CrewMood;
 }
 
@@ -14,9 +17,38 @@ interface CrewRosterProps {
   agents: RosterEntry[];
   selected: string | null;
   onSelect: (name: string) => void;
-  /** 'rail' = compact vertical list (desktop sidebar). 'grid' = big
-   *  character cards (mobile home screen). */
-  variant: 'rail' | 'grid';
+  /** 'rail' = compact vertical list (desktop sidebar). 'list' = full-width
+   *  Telegram-style chat rows (mobile home screen). */
+  variant: 'rail' | 'list';
+  /** Warm a room's message cache ahead of selection. Called on row hover
+   *  (desktop) and for the top rows on mount (mobile). */
+  onPrefetch?: (name: string) => void;
+}
+
+// How many top rows to warm on mount for the mobile list — the ones a user is
+// most likely to open first.
+const PREFETCH_TOP_N = 4;
+
+/**
+ * Telegram-style last-activity stamp: time today, "Yesterday", weekday within
+ * the last week, else a short date. Empty string for no/invalid activity.
+ * Pure — exported for its own unit test.
+ */
+export function formatChatTimestamp(iso: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  if (now.getTime() - d.getTime() < 7 * 86_400_000) {
+    return d.toLocaleDateString([], { weekday: 'short' });
+  }
+  return d.toLocaleDateString([], { month: 'numeric', day: 'numeric' });
 }
 
 function StatusDot({ mood }: { mood: CrewMood }) {
@@ -34,15 +66,18 @@ function StatusDot({ mood }: { mood: CrewMood }) {
   );
 }
 
-function statusLabel(mood: CrewMood): string {
-  return mood === 'typing' ? 'working…' : mood === 'active' ? 'around' : 'resting';
-}
-
 /**
  * The crew — every enabled agent as a character. Order is the registry
  * order and never changes with presence; only the status styling moves.
  */
-export function CrewRoster({ agents, selected, onSelect, variant }: CrewRosterProps) {
+export function CrewRoster({ agents, selected, onSelect, variant, onPrefetch }: CrewRosterProps) {
+  // Warm the top rows of the mobile list on mount so the first tap opens
+  // without a cold fetch. Desktop rail warms on hover instead (below).
+  useEffect(() => {
+    if (variant !== 'list' || !onPrefetch) return;
+    for (const a of agents.slice(0, PREFETCH_TOP_N)) onPrefetch(a.name);
+  }, [variant, agents, onPrefetch]);
+
   if (agents.length === 0) {
     return (
       <div className="py-8 text-center text-sm text-muted-foreground">No agents enabled.</div>
@@ -56,6 +91,7 @@ export function CrewRoster({ agents, selected, onSelect, variant }: CrewRosterPr
           <button
             key={a.name}
             onClick={() => onSelect(a.name)}
+            onMouseEnter={() => onPrefetch?.(a.name)}
             className={`flex w-full items-center gap-3 rounded-xl px-2.5 py-2 text-left transition-colors ${
               selected === a.name ? 'bg-muted' : 'hover:bg-muted/50'
             }`}
@@ -77,33 +113,36 @@ export function CrewRoster({ agents, selected, onSelect, variant }: CrewRosterPr
     );
   }
 
+  // 'list' — Telegram-style full-width chat rows. Avatar + name + last-message
+  // preview + time. No unread badge (shipped as a separate follow-on).
   return (
-    <div className="grid grid-cols-2 gap-3 overflow-y-auto p-1 sm:grid-cols-3">
+    <div className="overflow-y-auto">
       {agents.map((a) => (
         <button
           key={a.name}
           onClick={() => onSelect(a.name)}
-          className="flex flex-col items-center gap-2 rounded-2xl border bg-muted/20 px-3 py-4 transition-colors hover:border-primary/40 hover:bg-muted/40"
+          onMouseEnter={() => onPrefetch?.(a.name)}
+          className="flex w-full items-center gap-3 border-b border-border/60 px-3 py-2.5 text-left transition-colors active:bg-muted/50"
         >
-          <div className="relative">
-            <CrewAvatar name={a.name} version={a.avatarVersion} mood={a.mood} size={76} ring />
+          <div className="relative shrink-0">
+            <CrewAvatar name={a.name} version={a.avatarVersion} mood={a.mood} size={52} />
             <StatusDot mood={a.mood} />
           </div>
-          <div className="min-w-0 text-center">
-            <p className="truncate text-sm font-semibold">{a.name}</p>
-            <p className="truncate text-xs text-muted-foreground">{a.tagline}</p>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-baseline gap-2">
+              <p className="min-w-0 flex-1 truncate text-[15px] font-semibold leading-tight">
+                {a.name}
+              </p>
+              {a.lastActivity && (
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {formatChatTimestamp(a.lastActivity)}
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5 line-clamp-2 text-sm text-muted-foreground">
+              {a.lastPreview ?? a.tagline}
+            </p>
           </div>
-          <span
-            className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-              a.mood === 'typing'
-                ? 'bg-emerald-400/15 text-emerald-500'
-                : a.mood === 'active'
-                  ? 'bg-emerald-400/10 text-emerald-600 dark:text-emerald-400'
-                  : 'bg-muted text-muted-foreground'
-            }`}
-          >
-            {statusLabel(a.mood)}
-          </span>
         </button>
       ))}
     </div>

@@ -1,9 +1,9 @@
 'use client';
 
-import { Suspense } from 'react';
+import { Suspense, useCallback } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { CrewRoster } from '@/components/crew/crew-roster';
-import { CrewChat } from '@/components/crew/crew-chat';
+import { CrewChat, warmRoomCache } from '@/components/crew/crew-chat';
 import { useCrew } from '@/components/crew/use-crew';
 import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
 import '@/components/crew/crew.css';
@@ -27,6 +27,11 @@ function CrewPageInner() {
     router.replace('/crew', { scroll: false });
   }
 
+  const prefetch = useCallback(
+    (name: string) => warmRoomCache([user, name].sort().join('--')),
+    [user],
+  );
+
   if (loading) {
     return <div className="py-12 text-center text-sm text-muted-foreground">Waking the crew…</div>;
   }
@@ -36,7 +41,13 @@ function CrewPageInner() {
       {/* Desktop: rail + chat side by side. */}
       <div className="hidden min-h-0 flex-1 gap-3 md:grid md:grid-cols-[290px_1fr]">
         <div className="min-h-0 overflow-hidden rounded-xl border bg-muted/10">
-          <CrewRoster agents={roster} selected={selected} onSelect={select} variant="rail" />
+          <CrewRoster
+            agents={roster}
+            selected={selected}
+            onSelect={select}
+            variant="rail"
+            onPrefetch={prefetch}
+          />
         </div>
         {selectedAgent ? (
           <CrewChat
@@ -69,8 +80,14 @@ function CrewPageInner() {
           />
         </div>
       ) : (
-        <div className="min-h-0 flex-1 md:hidden">
-          <CrewRoster agents={roster} selected={null} onSelect={select} variant="grid" />
+        <div className="min-h-0 flex-1 overflow-hidden md:hidden">
+          <CrewRoster
+            agents={roster}
+            selected={null}
+            onSelect={select}
+            variant="list"
+            onPrefetch={prefetch}
+          />
         </div>
       )}
     </div>

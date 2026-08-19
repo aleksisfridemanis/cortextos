@@ -52,12 +52,48 @@
   animation: crew-ring 1.6s ease-in-out infinite;
 }
 
+/* Message bubbles fade + slide up as they mount. Keyed by message id, so this
+   fires only for a newly added bubble — an existing bubble keeps its DOM node
+   across a poll re-render and does not re-animate. */
+@keyframes crew-msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.crew-msg-in {
+  animation: crew-msg-in 0.18s ease-out;
+}
+
+/* Long-press context menu pop. */
+@keyframes crew-menu-in {
+  from { opacity: 0; transform: scale(0.94); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.crew-menu-in {
+  animation: crew-menu-in 0.12s ease-out;
+  transform-origin: top left;
+}
+
+/* Scroll-to-bottom button fade-in. */
+@keyframes crew-scroll-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.crew-scroll-down {
+  animation: crew-scroll-in 0.15s ease-out;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .crew-blink,
   .crew-antenna-pulse,
   .crew-zz,
   .crew-dot,
-  .crew-ring-typing {
+  .crew-ring-typing,
+  .crew-msg-in,
+  .crew-menu-in,
+  .crew-scroll-down {
     animation: none;
   }
 }

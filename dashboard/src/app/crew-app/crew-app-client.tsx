@@ -1,9 +1,9 @@
 'use client';
 
-import { Suspense } from 'react';
+import { Suspense, useCallback } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { CrewRoster } from '@/components/crew/crew-roster';
-import { CrewChat } from '@/components/crew/crew-chat';
+import { CrewChat, warmRoomCache } from '@/components/crew/crew-chat';
 import { useCrew } from '@/components/crew/use-crew';
 import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
 import '@/components/crew/crew.css';
@@ -37,6 +37,11 @@ function CrewAppInner() {
   function back() {
     router.replace('/crew-app', { scroll: false });
   }
+
+  const prefetch = useCallback(
+    (name: string) => warmRoomCache([user, name].sort().join('--')),
+    [user],
+  );
 
   return (
     <div
@@ -79,7 +84,13 @@ function CrewAppInner() {
             </p>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto pb-4">
-            <CrewRoster agents={roster} selected={null} onSelect={select} variant="grid" />
+            <CrewRoster
+              agents={roster}
+              selected={null}
+              onSelect={select}
+              variant="list"
+              onPrefetch={prefetch}
+            />
           </div>
         </div>
       )}

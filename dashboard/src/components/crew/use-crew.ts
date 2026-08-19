@@ -17,6 +17,23 @@ export interface CrewMember {
   org: string;
   tagline: string;
   avatarVersion: number | null;
+  lastActivity: string | null;
+  lastPreview: string | null;
+}
+
+/**
+ * Sort comparator for the roster: most-recently-active first, agents that have
+ * never messaged last. ISO timestamps sort correctly under localeCompare, so
+ * `b` before `a` gives descending recency. Pure — exported for its own test.
+ */
+export function byRecency(
+  a: { lastActivity: string | null },
+  b: { lastActivity: string | null },
+): number {
+  if (a.lastActivity === b.lastActivity) return 0;
+  if (a.lastActivity === null) return 1;
+  if (b.lastActivity === null) return -1;
+  return b.lastActivity.localeCompare(a.lastActivity);
 }
 
 interface PresenceEntry {
@@ -111,12 +128,16 @@ export function useCrew(): CrewState {
 
   const roster: RosterEntry[] = useMemo(
     () =>
-      agents.map((a) => ({
-        name: a.name,
-        tagline: a.tagline,
-        avatarVersion: a.avatarVersion,
-        mood: moodOf(presence.get(a.name)),
-      })),
+      agents
+        .map((a) => ({
+          name: a.name,
+          tagline: a.tagline,
+          avatarVersion: a.avatarVersion,
+          lastActivity: a.lastActivity,
+          lastPreview: a.lastPreview,
+          mood: moodOf(presence.get(a.name)),
+        }))
+        .sort(byRecency),
     [agents, presence],
   );
 

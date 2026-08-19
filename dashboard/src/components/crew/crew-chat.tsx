@@ -11,6 +11,8 @@ import {
   IconSend,
   IconVolume,
   IconVolumeOff,
+  IconChevronDown,
+  IconCopy,
   IconX,
 } from '@tabler/icons-react';
 import { CrewAvatar } from './crew-avatar';
@@ -33,6 +35,51 @@ const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? useLayoutEffec
 // instead of blanking to a spinner while a cold refetch runs. In-memory only —
 // the keys are pair strings that never leave this module.
 const roomCache = new Map<string, BusMessage[]>();
+
+/**
+ * Warm a room's message cache ahead of selection, so opening it paints from
+ * cache instead of a cold spinner. No-op if the room is already cached or the
+ * fetch fails — a real open will retry. The pair is a sorted `user--agent`
+ * key that never leaves this module. (Item 3.)
+ *
+ * Honest limit: this moves the fs latency earlier, it does not remove it — the
+ * channel route is force-dynamic, so a cold first paint after a reload still
+ * pays for the read.
+ */
+export function warmRoomCache(pair: string): void {
+  if (roomCache.has(pair)) return;
+  fetchMessagesInto(
+    pair,
+    (updater) => {
+      roomCache.set(pair, updater(roomCache.get(pair) ?? []));
+    },
+    () => {},
+    new Set(),
+  );
+}
+
+/**
+ * Clamp a textarea's content height to at most `maxLines`. `scrollHeight`
+ * includes vertical padding, so `padding` is added back to the line budget.
+ * Pure — exported for its own unit test. (Item 1.)
+ */
+export function clampTextareaHeight(
+  scrollHeight: number,
+  lineHeight: number,
+  maxLines = 12,
+  padding = 0,
+): number {
+  return Math.min(scrollHeight, lineHeight * maxLines + padding);
+}
+
+/**
+ * Join the typed text and any uploaded image URLs into the wire message — each
+ * URL on its own line so the inline-image renderer picks up every one. Empty
+ * parts are dropped. Pure — exported for its own unit test. (Item 9.)
+ */
+export function buildMessageText(text: string, urls: string[]): string {
+  return [text, ...urls].filter(Boolean).join('\n');
+}
 
 interface BusMessage {
   id: string;
@@ -192,7 +239,7 @@ export async function fetchMessagesInto(
 function ToolRunRow({ run }: { run: ToolRunRowData }) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className="flex justify-start">
+    <div className="crew-msg-in flex justify-start">
       <div className="max-w-[80%] rounded-2xl rounded-bl-md border border-border/60 bg-muted/50 px-3.5 py-2 text-sm shadow-sm">
         <button
           type="button"
@@ -321,9 +368,13 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   // Parent lookup for the quoted line inside a reply bubble.
   const messagesById = new Map(messages.map((m) => [m.id, m]));
   const [sendError, setSendError] = useState('');
-  const [attachment, setAttachment] = useState<File | null>(null);
-  const [attachPreview, setAttachPreview] = useState<string | null>(null);
+  // Multiple image attachments, each with its own preview object URL. (Item 9.)
+  const [attachments, setAttachments] = useState<Array<{ file: File; url: string }>>([]);
   const [uploadOpen, setUploadOpen] = useState(false);
+  // Show the scroll-to-bottom button when scrolled away from newest. (Item 4.)
+  const [showScrollDown, setShowScrollDown] = useState(false);
+  // Long-press context menu (mobile only). (Item 5.)
+  const [menuFor, setMenuFor] = useState<{ msg: BusMessage; x: number; y: number } | null>(null);
   const [sending, setSending] = useState(false);
   const [ttsOn, setTtsOn] = useState(false);
   const spokenIdsRef = useRef<Set<string>>(new Set());
@@ -338,6 +389,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   const forceScrollRef = useRef(true);
   const pinnedRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Long-press bookkeeping (mobile). coarseRef is set after mount because
+  // matchMedia is unavailable during SSR.
+  const coarseRef = useRef(false);
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const touchStartPos = useRef<{ x: number; y: number } | null>(null);
 
   const typing = mood === 'typing';
 
@@ -573,55 +629,151 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
         pinnedRef.current = true;
       }
     }
-  }, [messages, replyTarget, attachment, draft]);
+  }, [messages, replyTarget, attachments.length, draft]);
 
-  function applyAttachment(file: File) {
-    setAttachment(file);
-    setAttachPreview(URL.createObjectURL(file));
+  // Toggle the scroll-to-bottom button as the user scrolls away from newest.
+  // (Item 4.) Re-bound on `loading` like the other scroll listeners, since the
+  // scroll container remounts across the loading boundary.
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+    function onScroll() {
+      if (!container) return;
+      const dist = container.scrollHeight - container.scrollTop - container.clientHeight;
+      setShowScrollDown(dist > 120);
+    }
+    onScroll();
+    container.addEventListener('scroll', onScroll, { passive: true });
+    return () => container.removeEventListener('scroll', onScroll);
+  }, [loading]);
+
+  // Coarse-pointer detection for the long-press menu — mount-only. (Item 5.)
+  useEffect(() => {
+    coarseRef.current =
+      typeof window !== 'undefined' && (window.matchMedia?.('(pointer: coarse)').matches ?? false);
+  }, []);
+
+  // Collapse the textarea back to one line once the draft is cleared. (Item 1.)
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (el && draft === '') {
+      el.style.height = 'auto';
+      el.style.overflowY = 'hidden';
+    }
+  }, [draft]);
+
+  function scrollToBottom() {
+    const container = scrollRef.current;
+    if (!container) return;
+    forceScrollRef.current = true;
+    pinnedRef.current = true;
+    container.scrollTop = container.scrollHeight;
+    setShowScrollDown(false);
+  }
+
+  // Grow the textarea with its content, up to a line cap. (Item 1.)
+  function autoGrow(el: HTMLTextAreaElement) {
+    el.style.height = 'auto';
+    const cs = getComputedStyle(el);
+    const lineHeight = parseFloat(cs.lineHeight) || 20;
+    const padding = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    const h = clampTextareaHeight(el.scrollHeight, lineHeight, 12, padding);
+    el.style.height = `${h}px`;
+    el.style.overflowY = el.scrollHeight > h ? 'auto' : 'hidden';
+  }
+
+  function addAttachments(files: File[]) {
+    const images = files.filter((f) => f.type.startsWith('image/'));
+    if (images.length === 0) return;
+    setAttachments((prev) => [...prev, ...images.map((file) => ({ file, url: URL.createObjectURL(file) }))]);
     setSendError('');
   }
 
-  function clearAttachment() {
-    setAttachment(null);
-    if (attachPreview) URL.revokeObjectURL(attachPreview);
-    setAttachPreview(null);
+  function removeAttachment(index: number) {
+    setAttachments((prev) => {
+      const target = prev[index];
+      if (target) URL.revokeObjectURL(target.url);
+      return prev.filter((_, i) => i !== index);
+    });
+  }
+
+  function clearAttachments() {
+    setAttachments((prev) => {
+      for (const a of prev) URL.revokeObjectURL(a.url);
+      return [];
+    });
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
   function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
     const items = e.clipboardData?.items;
     if (!items) return;
+    const files: File[] = [];
     for (const item of Array.from(items)) {
       if (item.kind === 'file' && item.type.startsWith('image/')) {
         const file = item.getAsFile();
-        if (file) {
-          e.preventDefault();
-          applyAttachment(file);
-          return;
-        }
+        if (file) files.push(file);
       }
     }
+    if (files.length > 0) {
+      e.preventDefault();
+      addAttachments(files);
+    }
+  }
+
+  // Long-press on a bubble opens a small Reply/Copy menu (mobile only). A finger
+  // that lands on the selectable message text is left to native iOS selection.
+  function clearLongPress() {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  }
+
+  function onBubbleTouchStart(e: React.TouchEvent, msg: BusMessage) {
+    if (!coarseRef.current) return;
+    if ((e.target as HTMLElement).closest('[data-msg-text]')) return;
+    const t = e.touches[0];
+    if (!t) return;
+    touchStartPos.current = { x: t.clientX, y: t.clientY };
+    clearLongPress();
+    longPressTimer.current = setTimeout(() => {
+      setMenuFor({ msg, x: t.clientX, y: t.clientY });
+    }, 470);
+  }
+
+  function onBubbleTouchMove(e: React.TouchEvent) {
+    const start = touchStartPos.current;
+    const t = e.touches[0];
+    if (!start || !t) return;
+    if (Math.hypot(t.clientX - start.x, t.clientY - start.y) > 10) clearLongPress();
   }
 
   async function handleSend() {
     if (sendingRef.current) return;
-    if (!draft.trim() && !attachment) return;
+    if (!draft.trim() && attachments.length === 0) return;
     sendingRef.current = true;
     setSending(true);
     setSendError('');
     try {
       let messageText = draft.trim();
-      if (attachment) {
-        const formData = new FormData();
-        formData.append('file', attachment);
-        const uploadRes = await fetch('/api/comms/upload', { method: 'POST', body: formData });
-        if (!uploadRes.ok) {
-          const data = await uploadRes.json().catch(() => ({}));
-          setSendError(data.error || 'Upload failed');
-          return;
+      if (attachments.length > 0) {
+        // Upload each image; abort on the first failure so a message never
+        // goes out with a partial set of attachments. (Item 9.)
+        const urls: string[] = [];
+        for (const att of attachments) {
+          const formData = new FormData();
+          formData.append('file', att.file);
+          const uploadRes = await fetch('/api/comms/upload', { method: 'POST', body: formData });
+          if (!uploadRes.ok) {
+            const data = await uploadRes.json().catch(() => ({}));
+            setSendError(data.error || 'Upload failed');
+            return;
+          }
+          const { url } = await uploadRes.json();
+          urls.push(url);
         }
-        const { url } = await uploadRes.json();
-        messageText = messageText ? `${messageText}\n${url}` : url;
+        messageText = buildMessageText(messageText, urls);
       }
 
       const res = await fetch('/api/messages/send', {
@@ -653,7 +805,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
         ]);
         setDraft('');
         setReplyTarget(null);
-        clearAttachment();
+        clearAttachments();
         forceScrollRef.current = true;
         setTimeout(fetchMessages, 500);
       } else {
@@ -742,7 +894,14 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
               const fromAgent = msg.from === agent.name;
               const parent = msg.reply_to ? messagesById.get(msg.reply_to) : undefined;
               return (
-                <div key={msg.id} className={`group flex items-end gap-2 ${fromAgent ? 'justify-start' : 'justify-end'}`}>
+                <div
+                  key={msg.id}
+                  className={`crew-msg-in group flex items-end gap-2 ${fromAgent ? 'justify-start' : 'justify-end'}`}
+                  onTouchStart={(e) => onBubbleTouchStart(e, msg)}
+                  onTouchMove={onBubbleTouchMove}
+                  onTouchEnd={clearLongPress}
+                  onTouchCancel={clearLongPress}
+                >
                   {fromAgent && (
                     <CrewAvatar name={agent.name} version={agent.avatarVersion} mood="active" size={26} className="mb-4" />
                   )}
@@ -759,7 +918,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
                     </button>
                   )}
                   <div
-                    className={`max-w-[80%] rounded-2xl px-3.5 py-2 text-sm shadow-sm ${
+                    className={`max-w-[80%] select-none rounded-2xl px-3.5 py-2 text-sm shadow-sm ${
                       fromAgent
                         ? 'rounded-bl-md border border-border/60 bg-muted/50'
                         : 'rounded-br-md bg-primary text-primary-foreground'
@@ -786,7 +945,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
                         <IconMicrophone size={11} aria-hidden /> voice
                       </span>
                     )}
-                    <MessageContent text={msg.text} />
+                    <span data-msg-text className="select-text">
+                      <MessageContent text={msg.text} />
+                    </span>
                     <p
                       className={`mt-0.5 text-right text-[10px] ${
                         fromAgent ? 'text-muted-foreground' : 'text-primary-foreground/70'
@@ -825,85 +986,134 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
     </>
   );
 
-  // Shared composer — reply quote, attachment preview, recording UI and the
-  // input row, wrapped differently per layout (floating pill vs bordered bar).
-  const chatBar = (
-    <>
-        {(sendError || recorder.error) && (
-          <p className="mb-1 px-1 text-xs text-destructive">{sendError || recorder.error}</p>
-        )}
-        {replyTarget && (
-          <div
-            data-testid="reply-quote"
-            className="mb-1 flex items-center gap-2 rounded-md border-l-2 border-primary bg-muted/50 px-2 py-1"
+  // Composer pieces — shared across both layouts, then assembled two ways: a
+  // grouped bordered bar (desktop) and individual floating controls (frameless
+  // mobile, item 2).
+  const sendDisabled = sending || (!draft.trim() && attachments.length === 0);
+
+  const fileInput = (
+    <input
+      ref={fileInputRef}
+      type="file"
+      multiple
+      accept="image/jpeg,image/png,image/gif,image/webp"
+      className="hidden"
+      onChange={(e) => {
+        const files = e.target.files ? Array.from(e.target.files) : [];
+        if (files.length) addAttachments(files);
+        e.target.value = '';
+      }}
+    />
+  );
+
+  const errorLine = (sendError || recorder.error) ? (
+    <p className="mb-1 px-1 text-xs text-destructive">{sendError || recorder.error}</p>
+  ) : null;
+
+  const replyQuote = replyTarget ? (
+    <div
+      data-testid="reply-quote"
+      className="mb-1 flex items-center gap-2 rounded-md border-l-2 border-primary bg-muted/50 px-2 py-1"
+    >
+      <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+        Replying to {replyTarget.from}: {replyTarget.text}
+      </span>
+      <button
+        type="button"
+        onClick={() => setReplyTarget(null)}
+        aria-label="Cancel reply"
+        className="shrink-0 text-muted-foreground hover:text-foreground"
+      >
+        <IconX size={12} />
+      </button>
+    </div>
+  ) : null;
+
+  // Item 9 — horizontal strip of image thumbnails, each removable.
+  const attachStrip = attachments.length > 0 ? (
+    <div className="mb-2 flex gap-2 overflow-x-auto pb-1">
+      {attachments.map((att, i) => (
+        <div key={att.url} className="relative shrink-0">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={att.url} alt="Attachment preview" className="h-16 w-16 rounded-md border object-cover" />
+          <button
+            onClick={() => removeAttachment(i)}
+            className="absolute -right-1.5 -top-1.5 rounded-full bg-destructive p-0.5 text-destructive-foreground shadow-sm hover:bg-destructive/90"
+            aria-label="Remove attachment"
           >
-            <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-              Replying to {replyTarget.from}: {replyTarget.text}
-            </span>
-            <button
-              type="button"
-              onClick={() => setReplyTarget(null)}
-              aria-label="Cancel reply"
-              className="shrink-0 text-muted-foreground hover:text-foreground"
-            >
-              <IconX size={12} />
-            </button>
-          </div>
-        )}
-        {attachPreview && (
-          <div className="relative mb-2 inline-block">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={attachPreview} alt="Attachment preview" className="max-h-24 rounded-md border" />
-            <button
-              onClick={clearAttachment}
-              className="absolute -right-1.5 -top-1.5 rounded-full bg-destructive p-0.5 text-destructive-foreground shadow-sm hover:bg-destructive/90"
-              aria-label="Remove attachment"
-            >
-              <IconX size={12} />
-            </button>
-          </div>
-        )}
-        {recorder.recording ? (
-          <div className="flex items-center gap-3 px-1">
-            <span className="crew-antenna-pulse h-2.5 w-2.5 shrink-0 rounded-full bg-red-500" aria-hidden />
-            <span className="text-sm font-medium tabular-nums text-foreground">
-              {formatElapsed(recorder.elapsed)}
-            </span>
-            <span className="flex-1 truncate text-xs text-muted-foreground">
-              Recording for {agent.name}…
-            </span>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => recorder.cancel()}
-              aria-label="Discard recording"
-              title="Discard recording"
-            >
-              <IconX size={16} />
-            </Button>
-            <Button
-              size="sm"
-              className="rounded-full"
-              onClick={sendVoice}
-              disabled={sending}
-              aria-label="Send voice message"
-              title="Send voice message"
-            >
-              <IconSend size={16} />
-            </Button>
-          </div>
-        ) : (
+            <IconX size={12} />
+          </button>
+        </div>
+      ))}
+    </div>
+  ) : null;
+
+  const recordingRow = (
+    <div className="flex items-center gap-3 px-1">
+      <span className="crew-antenna-pulse h-2.5 w-2.5 shrink-0 rounded-full bg-red-500" aria-hidden />
+      <span className="text-sm font-medium tabular-nums text-foreground">
+        {formatElapsed(recorder.elapsed)}
+      </span>
+      <span className="flex-1 truncate text-xs text-muted-foreground">
+        Recording for {agent.name}…
+      </span>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => recorder.cancel()}
+        aria-label="Discard recording"
+        title="Discard recording"
+      >
+        <IconX size={16} />
+      </Button>
+      <Button
+        size="sm"
+        className="rounded-full"
+        onClick={sendVoice}
+        disabled={sending}
+        aria-label="Send voice message"
+        title="Send voice message"
+      >
+        <IconSend size={16} />
+      </Button>
+    </div>
+  );
+
+  // The one textarea, rendered with a layout-specific className. Only one of the
+  // two bars mounts at a time, so sharing textareaRef is safe.
+  const textareaEl = (className: string) => (
+    <textarea
+      ref={textareaRef}
+      value={draft}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        setSendError('');
+        autoGrow(e.currentTarget);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          handleSend();
+        }
+      }}
+      onPaste={handlePaste}
+      placeholder={`Message ${agent.name}…`}
+      rows={1}
+      className={className}
+    />
+  );
+
+  // Desktop — grouped controls in one row, wrapped by the bordered bar below.
+  const chatBarGrouped = (
+    <>
+      {errorLine}
+      {replyQuote}
+      {attachStrip}
+      {recorder.recording ? (
+        recordingRow
+      ) : (
         <div className="flex gap-2">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/jpeg,image/png,image/gif,image/webp"
-            className="hidden"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) applyAttachment(f);
-            }}
-          />
+          {fileInput}
           <Button
             variant="ghost"
             size="sm"
@@ -914,24 +1124,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           >
             <IconPhoto size={16} />
           </Button>
-          <textarea
-            ref={textareaRef}
-            value={draft}
-            onChange={(e) => {
-              setDraft(e.target.value);
-              setSendError('');
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleSend();
-              }
-            }}
-            onPaste={handlePaste}
-            placeholder={`Message ${agent.name}…`}
-            rows={1}
-            className="max-h-32 min-h-9 flex-1 resize-none rounded-2xl border bg-muted/30 px-3.5 py-2 text-base outline-none focus:border-primary/50 md:text-sm"
-          />
+          {textareaEl(
+            'min-h-9 flex-1 resize-none rounded-2xl border bg-muted/30 px-3.5 py-2 text-base outline-none focus:border-primary/50 md:text-sm',
+          )}
           <Button
             variant="ghost"
             size="sm"
@@ -947,15 +1142,124 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
             size="sm"
             className="shrink-0 self-end rounded-full"
             onClick={handleSend}
-            disabled={sending || (!draft.trim() && !attachment)}
+            disabled={sendDisabled}
             aria-label="Send"
           >
             <IconSend size={16} />
           </Button>
         </div>
-        )}
+      )}
     </>
   );
+
+  // Frameless mobile — individual floating pills (item 2). Errors/reply/attach
+  // still need a backdrop to read over the full-bleed list, so they sit in a
+  // small floating card; the input row itself is decomposed into floats.
+  const composerPillClass =
+    'h-11 w-11 shrink-0 self-end rounded-full border bg-card/80 text-muted-foreground shadow-sm backdrop-blur';
+
+  const chatBarFloating = recorder.recording ? (
+    <div className="rounded-3xl border bg-card/90 p-2 shadow-lg backdrop-blur">
+      {errorLine}
+      {recordingRow}
+    </div>
+  ) : (
+    <>
+      {(errorLine || replyQuote || attachStrip) && (
+        <div className="mb-2 rounded-2xl border bg-card/90 p-2 shadow-lg backdrop-blur">
+          {errorLine}
+          {replyQuote}
+          {attachStrip}
+        </div>
+      )}
+      <div className="flex items-end gap-2">
+        {fileInput}
+        <Button
+          variant="ghost"
+          size="icon"
+          className={composerPillClass}
+          onClick={() => fileInputRef.current?.click()}
+          title="Attach image"
+          aria-label="Attach image"
+        >
+          <IconPhoto size={20} />
+        </Button>
+        {textareaEl(
+          'min-h-11 flex-1 resize-none rounded-2xl border bg-card/80 px-3.5 py-2.5 text-base shadow-sm outline-none backdrop-blur focus:border-primary/50',
+        )}
+        <Button
+          variant="ghost"
+          size="icon"
+          className={composerPillClass}
+          onClick={() => recorder.start()}
+          disabled={sending}
+          title="Record a voice message"
+          aria-label="Record a voice message"
+        >
+          <IconMicrophone size={20} />
+        </Button>
+        <Button
+          size="icon"
+          className="h-11 w-11 shrink-0 self-end rounded-full shadow-sm"
+          onClick={handleSend}
+          disabled={sendDisabled}
+          aria-label="Send"
+        >
+          <IconSend size={20} />
+        </Button>
+      </div>
+    </>
+  );
+
+  // The scroll-to-bottom button (item 4). Circular, down-chevron, shown only
+  // when scrolled away from newest. Placed per layout below.
+  const scrollDownButton = showScrollDown ? (
+    <button
+      type="button"
+      onClick={scrollToBottom}
+      aria-label="Scroll to latest"
+      className="crew-scroll-down flex h-9 w-9 items-center justify-center rounded-full border bg-card/90 text-muted-foreground shadow-md backdrop-blur transition-colors hover:text-foreground"
+    >
+      <IconChevronDown size={20} />
+    </button>
+  ) : null;
+
+  // The long-press context menu (item 5). Fixed overlay, so a single instance
+  // renders correctly in either layout. Only ever populated on a coarse pointer.
+  const longPressMenu = menuFor ? (
+    <div className="fixed inset-0 z-50" onClick={() => setMenuFor(null)}>
+      <div className="absolute inset-0 bg-black/40" />
+      <div
+        className="crew-menu-in absolute min-w-[160px] rounded-2xl border bg-popover p-1 text-popover-foreground shadow-xl"
+        style={{
+          top: Math.min(menuFor.y, (typeof window !== 'undefined' ? window.innerHeight : 0) - 120),
+          left: Math.min(menuFor.x, (typeof window !== 'undefined' ? window.innerWidth : 0) - 180),
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            setReplyTarget(menuFor.msg);
+            setMenuFor(null);
+          }}
+          className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm hover:bg-muted"
+        >
+          <IconArrowBackUp size={18} /> Reply
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            navigator.clipboard?.writeText(menuFor.msg.text);
+            setMenuFor(null);
+          }}
+          className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm hover:bg-muted"
+        >
+          <IconCopy size={18} /> Copy
+        </button>
+      </div>
+    </div>
+  ) : null;
 
   const upload = (
     <AvatarUpload
@@ -1025,13 +1329,14 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           </Button>
         </div>
 
-        {/* Floating chat bar */}
+        {/* Floating chat bar — decomposed into individual floats (item 2), with
+            the scroll-to-bottom button floating just above it (item 4). */}
         <div className="absolute inset-x-0 bottom-0 z-10 p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
-          <div className="rounded-3xl border bg-card/90 p-1.5 shadow-lg backdrop-blur">
-            {chatBar}
-          </div>
+          {scrollDownButton && <div className="mb-2 flex justify-end pr-1">{scrollDownButton}</div>}
+          {chatBarFloating}
         </div>
 
+        {longPressMenu}
         {upload}
       </div>
     );
@@ -1076,15 +1381,19 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
       </div>
 
       {/* Messages */}
-      <div ref={scrollRef} className="flex-1 min-h-0 space-y-2.5 overflow-y-auto px-3 py-3">
-        {messageBody}
+      <div className="relative flex-1 min-h-0">
+        <div ref={scrollRef} className="h-full space-y-2.5 overflow-y-auto px-3 py-3">
+          {messageBody}
+        </div>
+        {scrollDownButton && <div className="absolute bottom-3 right-4">{scrollDownButton}</div>}
       </div>
 
       {/* Chat bar */}
       <div className="border-t bg-background p-2">
-        {chatBar}
+        {chatBarGrouped}
       </div>
 
+      {longPressMenu}
       {upload}
     </div>
   );
