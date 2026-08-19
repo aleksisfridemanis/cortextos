@@ -6,7 +6,7 @@
  * no React test harness here and adding one is a forbidden new dependency.
  */
 import { describe, it, expect } from 'vitest';
-import { foldToolRuns, toolRunSummary, type ToolRunRowData } from '../crew-chat';
+import { foldToolRuns, toolRunSummary, formatTime, type ToolRunRowData } from '../crew-chat';
 
 interface Msg {
   id: string;
@@ -148,5 +148,22 @@ describe('foldToolRuns', () => {
     const row = rows[0] as ToolRunRowData;
     expect(row.root).toBeNull();
     expect(row.steps).toHaveLength(1);
+  });
+});
+
+describe('formatTime', () => {
+  // Both polarities. The empty-string arm is the one that mattered: new Date('') gives
+  // Invalid Date, whose toLocaleTimeString RETURNS "Invalid Date" rather than throwing,
+  // so the try/catch that looked like it handled this never ran.
+  it('renders a time for a valid timestamp', () => {
+    expect(formatTime('2026-08-19T14:26:57.099Z')).toMatch(/\d{1,2}:\d{2}/);
+  });
+
+  it('renders nothing — not the string "Invalid Date" — for an empty timestamp', () => {
+    expect(formatTime('')).toBe('');
+  });
+
+  it('renders nothing for an unparseable timestamp', () => {
+    expect(formatTime('not-a-date')).toBe('');
   });
 });

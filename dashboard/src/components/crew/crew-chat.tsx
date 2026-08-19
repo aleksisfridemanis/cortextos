@@ -242,9 +242,15 @@ interface CrewChatProps {
   frameless?: boolean;
 }
 
-function formatTime(iso: string): string {
+export function formatTime(iso: string): string {
+  const d = new Date(iso);
+  // Invalid Date does NOT throw from toLocaleTimeString — it returns the literal string
+  // "Invalid Date", so the catch below never fired for the case that actually occurs
+  // (an empty timestamp). The tool-run row falls back to '' when a run has no end, no
+  // steps and no root, which rendered "Invalid Date" to the user instead of no time.
+  if (Number.isNaN(d.getTime())) return '';
   try {
-    return new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   } catch {
     return iso;
   }
