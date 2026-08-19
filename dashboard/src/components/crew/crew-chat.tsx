@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
   IconArrowLeft,
@@ -22,6 +22,17 @@ import { useVoiceRecorder, formatElapsed } from './voice-recorder';
 // tab is visible, at a gentle interval — the fleet writes messages on a
 // 1s inbox check so 5s freshness feels live without hammering the API.
 const POLL_MS = 5000;
+
+// useLayoutEffect warns during SSR; a client component is still rendered on the
+// server by Next. Bind to the isomorphic variant at module load (stable, so no
+// rules-of-hooks violation) to keep the synchronous re-pin without the warning.
+const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? useLayoutEffect : useEffect;
+
+// Per-room message cache, keyed by the sorted `user--agent` pair. Seeds a room's
+// initial state so switching back to a room shows its last messages instantly
+// instead of blanking to a spinner while a cold refetch runs. In-memory only —
+// the keys are pair strings that never leave this module.
+const roomCache = new Map<string, BusMessage[]>();
 
 interface BusMessage {
   id: string;
@@ -302,8 +313,9 @@ function MessageContent({ text }: { text: string }) {
 }
 
 export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless = false }: CrewChatProps) {
-  const [messages, setMessages] = useState<BusMessage[]>([]);
-  const [loading, setLoading] = useState(true);
+  const pair = [user, agent.name].sort().join('--');
+  const [messages, setMessages] = useState<BusMessage[]>(() => roomCache.get(pair) ?? []);
+  const [loading, setLoading] = useState(() => !roomCache.has(pair));
   const [draft, setDraft] = useState('');
   const [replyTarget, setReplyTarget] = useState<BusMessage | null>(null);
   // Parent lookup for the quoted line inside a reply bubble.
@@ -325,8 +337,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   const fileInputRef = useRef<HTMLInputElement>(null);
   const forceScrollRef = useRef(true);
   const pinnedRef = useRef(true);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const pair = [user, agent.name].sort().join('--');
   const typing = mood === 'typing';
 
   const statusText = typing
@@ -335,15 +347,35 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
       ? 'active now'
       : 'resting';
 
+  // The setter also writes through to the room cache, so the last known
+  // messages for this pair are there to seed the next visit to this room.
   const fetchMessages = useCallback(
-    () => fetchMessagesInto(pair, setMessages, setLoading, localIdsRef.current),
+    () =>
+      fetchMessagesInto(
+        pair,
+        (updater) =>
+          setMessages((prev) => {
+            const next = updater(prev);
+            roomCache.set(pair, next);
+            return next;
+          }),
+        setLoading,
+        localIdsRef.current,
+      ),
     [pair],
   );
 
-  // Agent switch — reset and refetch.
+  // Agent switch — seed from cache (no blank), refetch to revalidate. Only a
+  // cache miss shows the spinner; a known room stays on screen through the fetch.
   useEffect(() => {
-    setLoading(true);
-    setMessages([]);
+    const cached = roomCache.get(pair);
+    if (cached) {
+      setMessages(cached);
+      setLoading(false);
+    } else {
+      setLoading(true);
+      setMessages([]);
+    }
     forceScrollRef.current = true;
     fetchMessages();
   }, [pair, fetchMessages]);
@@ -498,21 +530,50 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
     };
   }, [loading]);
 
-  // Auto-scroll: keep the viewport pinned to the newest message.
+  // Swipe-to-blur keyboard dismiss. Gated to a coarse pointer with a visual
+  // viewport: a net-downward drag on the message list while the input is focused
+  // blurs it, so the OS collapses the keyboard and the viewport re-expands. The
+  // web exposes no API to finger-track the keyboard's height, so this delivers
+  // the dismiss without the pixel-for-pixel drag Telegram-native can do.
   useEffect(() => {
-    const iv = setInterval(() => {
-      const container = scrollRef.current;
-      if (!container) return;
-      if (forceScrollRef.current || pinnedRef.current) {
-        container.scrollTop = container.scrollHeight;
-        if (forceScrollRef.current) {
-          forceScrollRef.current = false;
-          pinnedRef.current = true;
-        }
+    const container = scrollRef.current;
+    if (!container) return;
+    if (typeof window === 'undefined' || !window.visualViewport) return;
+    if (!window.matchMedia?.('(pointer: coarse)').matches) return;
+    let startY = 0;
+    function onStart(e: TouchEvent) {
+      startY = e.touches[0]?.clientY ?? 0;
+    }
+    function onMove(e: TouchEvent) {
+      const active = document.activeElement as HTMLElement | null;
+      if (active !== textareaRef.current) return;
+      const y = e.touches[0]?.clientY ?? 0;
+      if (y - startY > 48) active?.blur();
+    }
+    container.addEventListener('touchstart', onStart, { passive: true });
+    container.addEventListener('touchmove', onMove, { passive: true });
+    return () => {
+      container.removeEventListener('touchstart', onStart);
+      container.removeEventListener('touchmove', onMove);
+    };
+  }, [loading]);
+
+  // Auto-scroll: re-pin to the newest message synchronously after any layout
+  // shift — a new message, or the chat bar growing/shrinking as a reply,
+  // attachment or draft is added or cleared. Doing it in a layout effect (not a
+  // 400ms interval) kills the send-flash where the list jumped up then eased
+  // back down over ~1s as the decoupled poll caught up.
+  useIsomorphicLayoutEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+    if (forceScrollRef.current || pinnedRef.current) {
+      container.scrollTop = container.scrollHeight;
+      if (forceScrollRef.current) {
+        forceScrollRef.current = false;
+        pinnedRef.current = true;
       }
-    }, 400);
-    return () => clearInterval(iv);
-  }, []);
+    }
+  }, [messages, replyTarget, attachment, draft]);
 
   function applyAttachment(file: File) {
     setAttachment(file);
@@ -653,61 +714,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
     }
   }
 
-  return (
-    <div
-      className={`flex h-full min-h-0 flex-col overflow-hidden bg-background ${
-        frameless ? '' : 'rounded-xl border'
-      }`}
-    >
-      {/* Companion header */}
-      <div
-        className={`flex items-center gap-3 border-b px-3 py-2.5 ${
-          frameless ? 'bg-background/85 backdrop-blur' : 'bg-muted/20'
-        }`}
-      >
-        {onBack && (
-          <Button variant="ghost" size="sm" className="shrink-0" onClick={onBack} aria-label="Back to crew">
-            <IconArrowLeft size={18} />
-          </Button>
-        )}
-        <CrewAvatar name={agent.name} version={agent.avatarVersion} mood={mood} size={44} ring />
-        <div className="min-w-0 flex-1">
-          <p className="truncate font-semibold leading-tight">{agent.name}</p>
-          <p className="truncate text-xs text-muted-foreground">
-            {typing ? (
-              <span className="text-emerald-500">{statusText}</span>
-            ) : mood === 'active' ? (
-              <span className="text-emerald-600 dark:text-emerald-400">{statusText}</span>
-            ) : (
-              statusText
-            )}
-          </p>
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          className={`shrink-0 ${ttsOn ? 'text-emerald-500' : 'text-muted-foreground'}`}
-          onClick={toggleTts}
-          title={ttsOn ? 'Voice replies on — tap to mute' : 'Read replies aloud'}
-          aria-label={ttsOn ? 'Turn off voice replies' : 'Turn on voice replies'}
-        >
-          {ttsOn ? <IconVolume size={17} /> : <IconVolumeOff size={17} />}
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="shrink-0 text-muted-foreground"
-          onClick={() => setUploadOpen(true)}
-          title="Change character art"
-          aria-label="Change character art"
-        >
-          <IconPaint size={17} />
-        </Button>
-      </div>
-
-      {/* Messages */}
-      <div ref={scrollRef} className="flex-1 min-h-0 space-y-2.5 overflow-y-auto px-3 py-3">
-        {loading ? (
+  // Shared list body — identical bubbles, tool runs and typing dots in both the
+  // frameless (floating, full-bleed) and desktop (bordered card) layouts.
+  const messageBody = (
+    <>
+      {loading ? (
           <div className="py-8 text-center text-sm text-muted-foreground">Loading…</div>
         ) : messages.length === 0 && !typing ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
@@ -811,10 +822,13 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
             )}
           </>
         )}
-      </div>
+    </>
+  );
 
-      {/* Chat bar */}
-      <div className="border-t bg-background p-2">
+  // Shared composer — reply quote, attachment preview, recording UI and the
+  // input row, wrapped differently per layout (floating pill vs bordered bar).
+  const chatBar = (
+    <>
         {(sendError || recorder.error) && (
           <p className="mb-1 px-1 text-xs text-destructive">{sendError || recorder.error}</p>
         )}
@@ -901,6 +915,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
             <IconPhoto size={16} />
           </Button>
           <textarea
+            ref={textareaRef}
             value={draft}
             onChange={(e) => {
               setDraft(e.target.value);
@@ -939,15 +954,138 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           </Button>
         </div>
         )}
+    </>
+  );
+
+  const upload = (
+    <AvatarUpload
+      agent={agent.name}
+      hasAvatar={agent.avatarVersion !== null}
+      open={uploadOpen}
+      onOpenChange={setUploadOpen}
+      onSaved={onAvatarChanged}
+    />
+  );
+
+  // Status line, reused by both header treatments.
+  const status = typing ? (
+    <span className="text-emerald-500">{statusText}</span>
+  ) : mood === 'active' ? (
+    <span className="text-emerald-600 dark:text-emerald-400">{statusText}</span>
+  ) : (
+    <span className="text-muted-foreground">{statusText}</span>
+  );
+
+  const pillClass =
+    'pointer-events-auto h-10 w-10 rounded-full border bg-card/80 p-0 text-muted-foreground shadow-sm backdrop-blur';
+
+  // Frameless: Telegram-style floating layout. The message list runs full-bleed
+  // and scrolls behind translucent pill controls that float over the top and
+  // bottom. Used on the mobile dashboard overlay and the standalone crew-app.
+  if (frameless) {
+    return (
+      <div className="relative h-full min-h-0 overflow-hidden bg-background">
+        <div ref={scrollRef} className="absolute inset-0 space-y-2.5 overflow-y-auto px-3 pb-28 pt-16">
+          {messageBody}
+        </div>
+
+        {/* Floating header pills */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center gap-2 px-2 pt-2">
+          {onBack && (
+            <Button variant="ghost" size="icon" className={pillClass} onClick={onBack} aria-label="Back to crew">
+              <IconArrowLeft size={18} />
+            </Button>
+          )}
+          <div className="pointer-events-auto flex min-w-0 flex-1 items-center gap-2 rounded-full border bg-card/80 px-2 py-1 shadow-sm backdrop-blur">
+            <CrewAvatar name={agent.name} version={agent.avatarVersion} mood={mood} size={30} ring />
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold leading-tight">{agent.name}</p>
+              <p className="truncate text-[11px] leading-tight">{status}</p>
+            </div>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={`${pillClass} ${ttsOn ? 'text-emerald-500' : ''}`}
+            onClick={toggleTts}
+            title={ttsOn ? 'Voice replies on — tap to mute' : 'Read replies aloud'}
+            aria-label={ttsOn ? 'Turn off voice replies' : 'Turn on voice replies'}
+          >
+            {ttsOn ? <IconVolume size={17} /> : <IconVolumeOff size={17} />}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={pillClass}
+            onClick={() => setUploadOpen(true)}
+            title="Change character art"
+            aria-label="Change character art"
+          >
+            <IconPaint size={17} />
+          </Button>
+        </div>
+
+        {/* Floating chat bar */}
+        <div className="absolute inset-x-0 bottom-0 z-10 p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+          <div className="rounded-3xl border bg-card/90 p-1.5 shadow-lg backdrop-blur">
+            {chatBar}
+          </div>
+        </div>
+
+        {upload}
+      </div>
+    );
+  }
+
+  // Desktop / non-frameless: bordered-panel-free card (Q5 strips the border so
+  // the chat sits seamlessly next to the roster rail), header kept intact.
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
+      {/* Companion header */}
+      <div className="flex items-center gap-3 border-b bg-muted/20 px-3 py-2.5">
+        {onBack && (
+          <Button variant="ghost" size="sm" className="shrink-0" onClick={onBack} aria-label="Back to crew">
+            <IconArrowLeft size={18} />
+          </Button>
+        )}
+        <CrewAvatar name={agent.name} version={agent.avatarVersion} mood={mood} size={44} ring />
+        <div className="min-w-0 flex-1">
+          <p className="truncate font-semibold leading-tight">{agent.name}</p>
+          <p className="truncate text-xs">{status}</p>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          className={`shrink-0 ${ttsOn ? 'text-emerald-500' : 'text-muted-foreground'}`}
+          onClick={toggleTts}
+          title={ttsOn ? 'Voice replies on — tap to mute' : 'Read replies aloud'}
+          aria-label={ttsOn ? 'Turn off voice replies' : 'Turn on voice replies'}
+        >
+          {ttsOn ? <IconVolume size={17} /> : <IconVolumeOff size={17} />}
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="shrink-0 text-muted-foreground"
+          onClick={() => setUploadOpen(true)}
+          title="Change character art"
+          aria-label="Change character art"
+        >
+          <IconPaint size={17} />
+        </Button>
       </div>
 
-      <AvatarUpload
-        agent={agent.name}
-        hasAvatar={agent.avatarVersion !== null}
-        open={uploadOpen}
-        onOpenChange={setUploadOpen}
-        onSaved={onAvatarChanged}
-      />
+      {/* Messages */}
+      <div ref={scrollRef} className="flex-1 min-h-0 space-y-2.5 overflow-y-auto px-3 py-3">
+        {messageBody}
+      </div>
+
+      {/* Chat bar */}
+      <div className="border-t bg-background p-2">
+        {chatBar}
+      </div>
+
+      {upload}
     </div>
   );
 }

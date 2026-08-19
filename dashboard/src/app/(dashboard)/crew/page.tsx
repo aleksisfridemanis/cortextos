@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { CrewRoster } from '@/components/crew/crew-roster';
 import { CrewChat } from '@/components/crew/crew-chat';
 import { useCrew } from '@/components/crew/use-crew';
+import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
 import '@/components/crew/crew.css';
 
 function CrewPageInner() {
@@ -12,9 +13,11 @@ function CrewPageInner() {
   const searchParams = useSearchParams();
   const selected = searchParams.get('with');
   const { user, agents, roster, loading, moodFor, onAvatarChanged } = useCrew();
+  // The mobile chat is a fixed overlay under the Topbar; pin its height to the
+  // visual viewport so the floating chat bar clears the on-screen keyboard.
+  const { viewportHeight } = useKeyboardInset();
 
   const selectedAgent = agents.find((a) => a.name === selected) ?? null;
-  const workingCount = roster.filter((r) => r.mood !== 'resting').length;
 
   function select(name: string) {
     router.replace(`/crew?with=${encodeURIComponent(name)}`, { scroll: false });
@@ -29,16 +32,7 @@ function CrewPageInner() {
   }
 
   return (
-    <div className="flex h-[calc(100dvh-168px)] flex-col gap-3 md:h-[calc(100dvh-118px)]">
-      <div className="flex items-baseline justify-between">
-        <h1 className="text-xl font-semibold">Crew</h1>
-        <p className="text-xs text-muted-foreground">
-          {workingCount > 0
-            ? `${workingCount} of ${roster.length} up and about`
-            : `all ${roster.length} resting`}
-        </p>
-      </div>
-
+    <div className="flex h-[calc(100dvh-136px)] flex-col gap-3 md:h-[calc(100dvh-86px)]">
       {/* Desktop: rail + chat side by side. */}
       <div className="hidden min-h-0 flex-1 gap-3 md:grid md:grid-cols-[290px_1fr]">
         <div className="min-h-0 overflow-hidden rounded-xl border bg-muted/10">
@@ -58,20 +52,27 @@ function CrewPageInner() {
         )}
       </div>
 
-      {/* Mobile: roster screen, or full-screen chat with a back button. */}
-      <div className="min-h-0 flex-1 md:hidden">
-        {selectedAgent ? (
+      {/* Mobile: roster screen in flow, or full-screen floating chat overlaid
+          under the kept Topbar (which carries the nav hamburger). */}
+      {selectedAgent ? (
+        <div
+          className="fixed inset-x-0 top-12 bottom-0 z-40 overflow-hidden md:hidden"
+          style={viewportHeight !== null ? { height: `${viewportHeight - 48}px` } : undefined}
+        >
           <CrewChat
             agent={selectedAgent}
             user={user}
             mood={moodFor(selectedAgent.name)}
             onBack={back}
             onAvatarChanged={(v) => onAvatarChanged(selectedAgent.name, v)}
+            frameless
           />
-        ) : (
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 md:hidden">
           <CrewRoster agents={roster} selected={null} onSelect={select} variant="grid" />
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }

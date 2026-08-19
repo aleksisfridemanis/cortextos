@@ -1,10 +1,11 @@
 'use client';
 
-import { Suspense, useEffect, useState } from 'react';
+import { Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { CrewRoster } from '@/components/crew/crew-roster';
 import { CrewChat } from '@/components/crew/crew-chat';
 import { useCrew } from '@/components/crew/use-crew';
+import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
 import '@/components/crew/crew.css';
 
 function greeting(): string {
@@ -21,31 +22,10 @@ function CrewAppInner() {
   const selected = searchParams.get('with');
   const { user, agents, roster, loading, moodFor, onAvatarChanged } = useCrew();
 
-  // iOS keyboard fix: 100dvh does NOT shrink when the on-screen keyboard
-  // opens, which buries the chat bar behind it. visualViewport tracks the
-  // true visible area, so pin the app's height to it when available.
-  const [viewportH, setViewportH] = useState<number | null>(null);
-  useEffect(() => {
-    const vv = window.visualViewport;
-    if (!vv) return;
-    const update = () => {
-      setViewportH(Math.round(vv.height));
-      // iOS pans the whole page upward to reveal the focused input BEFORE
-      // our container shrinks, and the pan sticks afterwards — leaving the
-      // chat bar stranded near the top with dead space below. This app
-      // never legitimately scrolls the window (the root is overflow-hidden
-      // at exactly viewport height), so snap the pan back on every
-      // viewport change, after layout settles.
-      requestAnimationFrame(() => window.scrollTo(0, 0));
-    };
-    update();
-    vv.addEventListener('resize', update);
-    vv.addEventListener('scroll', update);
-    return () => {
-      vv.removeEventListener('resize', update);
-      vv.removeEventListener('scroll', update);
-    };
-  }, []);
+  // iOS keyboard fix: 100dvh does NOT shrink when the on-screen keyboard opens,
+  // which buries the chat bar behind it. Pin the app's height to the visual
+  // viewport instead (see useKeyboardInset for the full rationale).
+  const { viewportHeight: viewportH } = useKeyboardInset();
 
   const selectedAgent = agents.find((a) => a.name === selected) ?? null;
   const workingCount = roster.filter((r) => r.mood !== 'resting').length;

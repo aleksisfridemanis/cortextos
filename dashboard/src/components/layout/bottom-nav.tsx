@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { Suspense, useState } from 'react';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useSearchParams } from 'next/navigation';
 import { useOrg } from '@/hooks/use-org';
 import {
   IconLayoutDashboard,
@@ -44,10 +44,15 @@ const morePages = [
   { label: 'Settings', href: '/settings', icon: IconSettings },
 ];
 
-export function BottomNav() {
+function BottomNavInner() {
   const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [moreOpen, setMoreOpen] = useState(false);
   const { currentOrg } = useOrg();
+
+  // The crew chat page is a full-screen floating surface; its destinations stay
+  // reachable through the kept Topbar hamburger, so the bottom nav steps aside.
+  if (pathname === '/crew' && searchParams.get('with')) return null;
 
   function orgHref(href: string) {
     if (currentOrg && currentOrg !== 'all') {
@@ -137,5 +142,15 @@ export function BottomNav() {
         </div>
       </nav>
     </>
+  );
+}
+
+export function BottomNav() {
+  // useSearchParams requires a Suspense boundary; a null fallback keeps the
+  // fixed bottom bar out of the tree until it resolves.
+  return (
+    <Suspense fallback={null}>
+      <BottomNavInner />
+    </Suspense>
   );
 }
