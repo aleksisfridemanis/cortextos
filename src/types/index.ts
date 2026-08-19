@@ -343,7 +343,7 @@ export interface CronEntry {
 // {
 //   "name": "morning-briefing",
 //   "schedule": "0 13 * * *",
-//   "prompt": "Prepare and send the morning briefing to James.",
+//   "prompt": "Prepare and send the morning briefing to the operator.",
 //   "enabled": true,
 //   "created_at": "2026-04-01T00:00:00.000Z",
 //   "description": "Daily 09:00 ET briefing (UTC offset applied in schedule).",

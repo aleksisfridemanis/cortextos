@@ -12,13 +12,17 @@
 # The planted leak is generated in a temp dir at runtime — never committed —
 # because a committed file carrying the operator path would itself trip the
 # tree scan. The operator username is split ("cortex""tos") so THIS test file
-# carries no operator-path literal.
+# carries no operator-path literal. The operator NAME is split the same way for
+# the same reason. A literal here would fail SILENTLY today — this file matches
+# the guard's own tests/* skip — and would become the leak the moment anyone
+# widened the scoping.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GUARD=".github/scripts/leak-guard.sh"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 U="cortex""tos"
+NAME="Ja""mes"
 fails=0
 
 cat > "$TMP/planted.md" <<EOF
@@ -54,6 +58,22 @@ printf '%s\n' "$(bash "$GUARD" "$TMP/multiline.md" 2>&1)" | grep -q 'within 3 li
 { printf '| paul | agent |\n'; for i in $(seq 1 12); do printf 'filler line %s\n' "$i"; done; printf 'morning-review runs daily\n'; } > "$TMP/farapart.md"
 bash "$GUARD" "$TMP/farapart.md" >/dev/null 2>&1 \
   || { echo "FAIL: windowed check flagged name+cron far apart (false positive)"; fails=1; }
+
+# (e) RED case: the operator's NAME in prose, in a NON-TEST file, must FAIL and
+#     must be reported as the operator-name detection specifically — not merely
+#     as "something failed", which the roster or path checks could also produce.
+printf 'When %s replies in-thread, keep the conversation coherent.\n' "$NAME" > "$TMP/ships.md"
+bash "$GUARD" "$TMP/ships.md" >/dev/null 2>&1 \
+  && { echo "FAIL: scanner PASSED an operator name in a shipped-content file"; fails=1; }
+printf '%s\n' "$(bash "$GUARD" "$TMP/ships.md" 2>&1)" | grep -q 'operator name in shipped content' \
+  || { echo "FAIL: operator name not reported by the operator-name detection"; fails=1; }
+
+# (f) SCOPING control for (e): the SAME content at a test-skip path must PASS.
+#     Without this, (e) is satisfied by a pattern that flags everything, and the
+#     ~86 legitimate fixture occurrences would break the suite on the first run.
+printf 'When %s replies in-thread, keep the conversation coherent.\n' "$NAME" > "$TMP/fixture.test.md"
+bash "$GUARD" "$TMP/fixture.test.md" >/dev/null 2>&1 \
+  || { echo "FAIL: operator-name check fired on a test-scoped path (scoping broken)"; fails=1; }
 
 # (b) MUST PASS on the current clean tree.
 bash "$GUARD" --tree HEAD >/dev/null 2>&1 \

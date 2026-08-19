@@ -975,7 +975,7 @@ export class AgentProcess {
    *
    * codex-app-server: the boot prompt's inline "Send a Telegram message..."
    * instruction reaches the codex thread but is not executed reliably as a tool
-   * call, leaving James without the standard post-restart notification
+   * call, leaving the operator without the standard post-restart notification
    * claude-code peers send.
    *
    * opencode: the prompt is injected into the persistent TUI after startup.
@@ -987,7 +987,7 @@ export class AgentProcess {
    *  - msg1 (planned-restart lifecycle, "🔄 <agent> restarted (planned): ..."):
    *    for claude this is sent by hook-crash-alert.ts on PTY exit. codex/opencode
    *    runtimes do NOT run Claude Code hooks, so on a handoff restart the daemon
-   *    emits the same notification here for parity (James saw msg1 only for
+   *    emits the same notification here for parity (the operator saw msg1 only for
    *    claude agents otherwise). Format mirrors hook-crash-alert.ts:394-397.
    *  - msg2 (back-online / "back — ..." summary): codex reliably self-sends its
    *    own contextual reply via the boot prompt; opencode (deepseek) does NOT, so

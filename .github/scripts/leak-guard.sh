@@ -33,6 +33,19 @@ report() { printf '::error file=%s::LEAK-GUARD: %s\n' "$1" "$2" >&2; printf '  %
 OPERATOR_USERS='cortextos'
 HOME_PATH_RE="(/Users/(${OPERATOR_USERS})/|/home/(${OPERATOR_USERS})/)"
 
+# 1b. Operator NAME in content — the operator's real name never belongs in
+#    content a stranger installs. `package.json` `files` ships `templates/`, so a
+#    fresh install was receiving agent instructions about how to behave "when
+#    <operator> replies" — a person who is not the installer. That is a product
+#    defect first and a privacy matter second. OPERATOR_USERS above covers the
+#    operator's PATHS; this covers the operator's NAME. Same class, same place.
+#    Scoped to non-test files in scan_file, exactly like ROSTER_CRON_RE: the
+#    framework's test fixtures use the name in ~86 places and renaming them would
+#    bury every diff and reverse a CI-enforced convention for no gain, since
+#    tests are not in `files` and never ship.
+OPERATOR_NAMES='James'
+OPERATOR_NAME_RE="\\b(${OPERATOR_NAMES})\\b"
+
 # 2. Fleet-roster + cron-schedule TABLE shape — the phase-report leak. A line
 #    naming an agent alongside a cron schedule expression. Framework SOURCE and
 #    TEST fixtures legitimately build agent+cron structures, so this check is
@@ -83,6 +96,10 @@ scan_file() {
       # Flag when a roster name and a cron expr co-occur within a small window
       # (WINDOW=3 lines). Only fires when the same-line check did NOT already
       # report this file, so the roster+cron class is reported at most once.
+      # Operator name in shipped content (see OPERATOR_NAME_RE above).
+      if grep -nEqi "$OPERATOR_NAME_RE" "$f" 2>/dev/null; then
+        report "$f" "operator name in shipped content: $(grep -nEi "$OPERATOR_NAME_RE" "$f" | head -1 | tr -s ' ' | cut -c1-100)"
+      fi
       if [ "$roster_hit" -eq 0 ] && awk -v W=3 '
           /(boris|paul|sentinel|donna|nick)/ { name = NR }
           /(heartbeat\([0-9]|morning-review|evening-review|human-task-sweep|pr-monitor\([0-9]|\([0-9]+ [0-9*]+ \* \* )/ { cron = NR }

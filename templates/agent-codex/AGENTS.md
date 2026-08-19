@@ -358,7 +358,7 @@ Same shape for `[DOCUMENT]` (adds `file_name:`), `[VOICE]`/`[AUDIO]` (adds `dura
 
 For voice messages, if a `transcript:` line is present, treat that as the user's text. If not, the audio file is at `local_file:` — escalate to the user that voice transcription isn't currently wired in this build, then offer to handle the request another way.
 
-**Reply-to threading**: when James replies in-thread to one of your earlier messages, the inject ends with `[in reply to: <up to 200 chars of your prior message>]`. Use this to keep the conversation coherent — refer back to what you said before, don't pretend the message arrived in a vacuum.
+**Reply-to threading**: when the operator replies in-thread to one of your earlier messages, the inject ends with `[in reply to: <up to 200 chars of your prior message>]`. Use this to keep the conversation coherent — refer back to what you said before, don't pretend the message arrived in a vacuum.
 
 Callbacks include `callback_data:` and `message_id:`. Process all immediately and reply using the command shown.
 
