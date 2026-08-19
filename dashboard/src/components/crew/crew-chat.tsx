@@ -116,6 +116,23 @@ export function foldToolRuns(messages: BusMessage[]): ChatRow[] {
 }
 
 /** The collapsed label. Settles to `done` once a terminal record exists. */
+/**
+ * The per-message reply affordance.
+ *
+ * `opacity-40`, not `opacity-0`: this is a 430px-wide chat and a touch device has no
+ * hover, so a hover-only affordance does not exist at all on the primary form factor.
+ * MEASURED before this change: 22 buttons in the DOM, computed opacity 0, and Playwright
+ * still reported them `visible` — its check ignores opacity, so every automated assertion
+ * about them passed on something no human could see.
+ *
+ * `after:-inset-4` grows the hit area from 14px to ~46px, past the 44px platform minimum,
+ * WITHOUT affecting layout — real gutters that wide would eat the bubble width at 430px.
+ */
+const REPLY_AFFORDANCE_CLASS =
+  "relative mb-4 shrink-0 text-muted-foreground opacity-40 transition-opacity " +
+  "after:absolute after:-inset-4 after:content-[''] hover:text-foreground " +
+  "focus:opacity-100 group-hover:opacity-100";
+
 export function toolRunSummary(run: ToolRunRowData): string {
   const n = run.steps.length;
   return `\u2699 ${n} step${n === 1 ? '' : 's'} \u00b7 ${run.end ? 'done' : 'running'}`;
@@ -181,17 +198,28 @@ function ToolRunRow({ run }: { run: ToolRunRowData }) {
           </span>
         </button>
         {expanded && (
-          <ul className="mt-1.5 space-y-0.5 border-t border-border/60 pt-1.5">
-            {run.steps.map((step) => (
-              <li key={step.id} data-testid="tool-step" className="text-xs text-muted-foreground">
-                {step.text}
-              </li>
-            ))}
+          <>
+            <ul className="mt-1.5 space-y-0.5 border-t border-border/60 pt-1.5">
+              {run.steps.map((step) => (
+                <li key={step.id} data-testid="tool-step" className="text-xs text-muted-foreground">
+                  {step.text}
+                </li>
+              ))}
+            </ul>
+            {/* Outside the list on purpose. As an <li> it read as a 4th step under a
+                header claiming 3, so the count and the rows disagreed on screen. */}
             {run.end && (
-              <li className="text-xs font-medium text-muted-foreground">{run.end.text}</li>
+              <p className="mt-1.5 border-t border-border/60 pt-1.5 text-xs font-medium text-muted-foreground">
+                {run.end.text}
+              </p>
             )}
-          </ul>
+          </>
         )}
+        {/* Every message bubble carries a time; without one the run floats free of the
+            timeline. Last activity, not start, so it stays meaningful while running. */}
+        <p className="mt-0.5 text-right text-[10px] text-muted-foreground">
+          {formatTime(run.end?.timestamp ?? run.steps.at(-1)?.timestamp ?? run.root?.timestamp ?? '')}
+        </p>
       </div>
     </div>
   );
@@ -708,7 +736,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
                       onClick={() => setReplyTarget(msg)}
                       aria-label={`Reply to this message from ${msg.from}`}
                       title="Reply"
-                      className="mb-4 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+                      className={REPLY_AFFORDANCE_CLASS}
                     >
                       <IconArrowBackUp size={14} />
                     </button>
@@ -757,7 +785,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
                       onClick={() => setReplyTarget(msg)}
                       aria-label={`Reply to this message from ${msg.from}`}
                       title="Reply"
-                      className="mb-4 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+                      className={REPLY_AFFORDANCE_CLASS}
                     >
                       <IconArrowBackUp size={14} />
                     </button>
