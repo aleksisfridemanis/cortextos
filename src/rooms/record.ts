@@ -11,13 +11,14 @@
 
 import { dmRoomId, normalizeMember, validateRoomId } from './id.js';
 import { getRoom, upsertRoom } from './registry.js';
-import { appendRoomMessage } from './log.js';
+import { appendRoomMessage, readRoomLog } from './log.js';
 import type {
   InboxMessage,
   Priority,
   Room,
   RoomAttachment,
   RoomMessage,
+  RoomMessageKind,
   RoomMessageSource,
 } from '../types/index.js';
 
@@ -31,6 +32,8 @@ export interface RoomMessageInput {
   source: RoomMessageSource;
   priority?: Priority;
   attachments?: RoomAttachment[];
+  /** Tool-run marker. Omit for ordinary conversation. */
+  kind?: RoomMessageKind;
   /** Explicit room. Omit for a 1:1, whose id is derived from from/to. */
   roomId?: string;
 }
@@ -47,6 +50,29 @@ export function inboxMessageToRoomInput(msg: InboxMessage): RoomMessageInput {
     source: 'bus',
     priority: msg.priority,
   };
+}
+
+/**
+ * Root of the thread this message belongs to.
+ *
+ * A reply INHERITS its parent's thread_id, so an N-deep chain has one root.
+ * `thread_id = reply_to` looks equivalent and is not: it re-roots the thread at
+ * every hop, which is what the live logs already show.
+ *
+ * The log is read only for a reply, so an ordinary message costs no extra I/O.
+ * A parent that is not on disk yet is a real inter-transport race, not a
+ * hypothetical — falling back to reply_to keeps such a chain together from the
+ * reply onwards instead of orphaning it.
+ */
+function resolveThreadId(
+  ctxRoot: string,
+  roomId: string,
+  id: string,
+  replyTo: string | null,
+): string {
+  if (!replyTo) return id;
+  const parent = readRoomLog(ctxRoot, roomId).find(m => m.id === replyTo);
+  return parent ? parent.thread_id : replyTo;
 }
 
 /**
@@ -89,8 +115,11 @@ export function recordRoomMessage(ctxRoot: string, input: RoomMessageInput): Roo
     timestamp: input.timestamp,
     text: input.text,
     reply_to,
-    thread_id: reply_to ?? input.id,
+    thread_id: resolveThreadId(ctxRoot, roomId, input.id, reply_to),
     source: input.source,
+    // Emitted only when set, so an ordinary message's line stays byte-identical
+    // to what inc1 wrote — no schema churn for the readers already in the field.
+    ...(input.kind ? { kind: input.kind } : {}),
     attachments: input.attachments ?? [],
     ...(input.priority ? { priority: input.priority } : {}),
   };

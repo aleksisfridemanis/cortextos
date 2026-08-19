@@ -65,6 +65,14 @@ export interface RoomAttachment {
 /** Which transport delivered the message. */
 export type RoomMessageSource = 'bus' | 'telegram' | 'slack' | 'buzz';
 
+/**
+ * Marks a message as part of an event-sourced tool run rather than ordinary
+ * conversation. A run is a root plus N steps plus one terminal, each its own
+ * record — nothing is ever rewritten, because readRoomLog keeps the FIRST
+ * occurrence of an id and would silently drop an update sent under the same id.
+ */
+export type RoomMessageKind = 'tool_run' | 'tool_step' | 'tool_run_end';
+
 export interface RoomMessage {
   id: string;
   room_id: string;
@@ -76,6 +84,8 @@ export interface RoomMessage {
   /** Root of the thread: the message's own id, or the id it replies to. */
   thread_id: string;
   source: RoomMessageSource;
+  /** Absent on ordinary messages, including every line written before inc2. */
+  kind?: RoomMessageKind;
   attachments: RoomAttachment[];
   priority?: Priority;
 }
