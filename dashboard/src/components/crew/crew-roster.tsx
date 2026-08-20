@@ -27,7 +27,15 @@ interface CrewRosterProps {
 
 // How many top rows to warm on mount for the mobile list — the ones a user is
 // most likely to open first.
-const PREFETCH_TOP_N = 4;
+const PREFETCH_TOP_N = 2;
+
+/**
+ * The first `n` roster names — the rows warmed on mount. Pure — exported for
+ * its own unit test.
+ */
+export function prefetchTargets(agents: RosterEntry[], n: number): string[] {
+  return agents.slice(0, n).map((a) => a.name);
+}
 
 /**
  * Telegram-style last-activity stamp: time today, "Yesterday", weekday within
@@ -72,10 +80,21 @@ function StatusDot({ mood }: { mood: CrewMood }) {
  */
 export function CrewRoster({ agents, selected, onSelect, variant, onPrefetch }: CrewRosterProps) {
   // Warm the top rows of the mobile list on mount so the first tap opens
-  // without a cold fetch. Desktop rail warms on hover instead (below).
+  // without a cold fetch. Deferred to idle so the warm never competes with the
+  // roster's own first paint. Desktop rail warms on hover instead (below).
   useEffect(() => {
     if (variant !== 'list' || !onPrefetch) return;
-    for (const a of agents.slice(0, PREFETCH_TOP_N)) onPrefetch(a.name);
+    const run = () => {
+      for (const name of prefetchTargets(agents, PREFETCH_TOP_N)) onPrefetch(name);
+    };
+    const hasRIC = typeof window !== 'undefined' && 'requestIdleCallback' in window;
+    const handle: number | ReturnType<typeof setTimeout> = hasRIC
+      ? window.requestIdleCallback(run)
+      : setTimeout(run, 200);
+    return () => {
+      if (hasRIC) window.cancelIdleCallback(handle as number);
+      else clearTimeout(handle as ReturnType<typeof setTimeout>);
+    };
   }, [variant, agents, onPrefetch]);
 
   if (agents.length === 0) {

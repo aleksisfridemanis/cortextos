@@ -1,36 +1,87 @@
 'use client';
 
-import { Suspense, useCallback } from 'react';
+import { Suspense, useCallback, useEffect, useRef } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { CrewRoster } from '@/components/crew/crew-roster';
 import { CrewChat, warmRoomCache } from '@/components/crew/crew-chat';
-import { useCrew } from '@/components/crew/use-crew';
+import { useCrew, resolveInitialSelection, shouldTriggerPullRefresh } from '@/components/crew/use-crew';
 import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
 import '@/components/crew/crew.css';
+
+// Pull-down distance (px) past the top that fires a roster refresh on mobile.
+const PULL_THRESHOLD = 64;
 
 function CrewPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const selected = searchParams.get('with');
-  const { user, agents, roster, loading, moodFor, onAvatarChanged } = useCrew();
+  const { user, agents, roster, loading, moodFor, onAvatarChanged, refresh } = useCrew();
   // The mobile chat is a fixed overlay under the Topbar; pin its height to the
   // visual viewport so the floating chat bar clears the on-screen keyboard.
   const { viewportHeight } = useKeyboardInset();
+  // One-shot restore of the last-selected member (see effect below).
+  const restoredRef = useRef(false);
+  // Pull-to-refresh: the clientY where a top-anchored drag began, else null.
+  const pullStartRef = useRef<number | null>(null);
 
   const selectedAgent = agents.find((a) => a.name === selected) ?? null;
 
   function select(name: string) {
+    try {
+      sessionStorage.setItem('crew:last-with', name);
+    } catch {
+      /* ignore */
+    }
     router.replace(`/crew?with=${encodeURIComponent(name)}`, { scroll: false });
   }
 
   function back() {
+    try {
+      sessionStorage.removeItem('crew:last-with');
+    } catch {
+      /* ignore */
+    }
     router.replace('/crew', { scroll: false });
   }
+
+  // On a fresh load with no `?with=`, reopen the remembered member if they are
+  // still in the roster. Runs once, after the roster has loaded so the
+  // still-enabled check is meaningful, and never competes with roster polling.
+  useEffect(() => {
+    if (restoredRef.current || loading) return;
+    restoredRef.current = true;
+    if (selected) return;
+    let stored: string | null = null;
+    try {
+      stored = sessionStorage.getItem('crew:last-with');
+    } catch {
+      /* ignore */
+    }
+    const resolved = resolveInitialSelection(selected, stored, agents.map((a) => a.name));
+    if (resolved) {
+      router.replace(`/crew?with=${encodeURIComponent(resolved)}`, { scroll: false });
+    }
+  }, [loading, selected, agents, router]);
 
   const prefetch = useCallback(
     (name: string) => warmRoomCache([user, name].sort().join('--')),
     [user],
   );
+
+  function onListTouchStart(e: React.TouchEvent<HTMLDivElement>) {
+    pullStartRef.current = e.currentTarget.scrollTop <= 0 ? (e.touches[0]?.clientY ?? null) : null;
+  }
+  function onListTouchMove(e: React.TouchEvent<HTMLDivElement>) {
+    if (pullStartRef.current === null) return;
+    const delta = (e.touches[0]?.clientY ?? 0) - pullStartRef.current;
+    if (shouldTriggerPullRefresh(e.currentTarget.scrollTop, delta, PULL_THRESHOLD)) {
+      pullStartRef.current = null;
+      refresh();
+    }
+  }
+  function onListTouchEnd() {
+    pullStartRef.current = null;
+  }
 
   if (loading) {
     return <div className="py-12 text-center text-sm text-muted-foreground">Waking the crew…</div>;
@@ -80,7 +131,12 @@ function CrewPageInner() {
           />
         </div>
       ) : (
-        <div className="min-h-0 flex-1 overflow-hidden md:hidden">
+        <div
+          className="min-h-0 flex-1 overflow-y-auto md:hidden"
+          onTouchStart={onListTouchStart}
+          onTouchMove={onListTouchMove}
+          onTouchEnd={onListTouchEnd}
+        >
           <CrewRoster
             agents={roster}
             selected={null}

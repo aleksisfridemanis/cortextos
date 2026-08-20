@@ -81,6 +81,31 @@ export function buildMessageText(text: string, urls: string[]): string {
   return [text, ...urls].filter(Boolean).join('\n');
 }
 
+/**
+ * sessionStorage key for a member's unsent draft. Namespaced and per-agent so
+ * two open chats never share a draft. Pure — exported for its own unit test.
+ */
+export function draftKey(agent: string): string {
+  return `crew:draft:${agent}`;
+}
+
+/**
+ * Whether a click on the desktop chat surface should re-focus the composer.
+ * A coarse pointer never auto-focuses (it would raise the on-screen keyboard);
+ * an active text selection is left alone; clicks that land on their own
+ * interactive control (a button, link or field) are that control's, not a
+ * re-focus. Pure — exported for its own unit test. (Desktop only by wiring.)
+ */
+export function shouldRefocus(
+  target: Element | null,
+  hasSelection: boolean,
+  isCoarse: boolean,
+): boolean {
+  if (isCoarse || hasSelection) return false;
+  if (target?.closest('button, a, textarea, input')) return false;
+  return true;
+}
+
 interface BusMessage {
   id: string;
   from: string;
@@ -94,6 +119,14 @@ interface BusMessage {
   /** 'tool_run' | 'tool_step' | 'tool_run_end' on a tool-run record. */
   kind?: string;
   media_type?: string;
+}
+
+/**
+ * The clipboard payload for a message — the whole message text block. Pure —
+ * exported for its own unit test.
+ */
+export function copyPayload(msg: Pick<BusMessage, 'text'>): string {
+  return msg.text;
 }
 
 /**
@@ -175,21 +208,55 @@ export function foldToolRuns(messages: BusMessage[]): ChatRow[] {
 
 /** The collapsed label. Settles to `done` once a terminal record exists. */
 /**
- * The per-message reply affordance.
+ * The per-message actions pill (Reply + Copy).
  *
- * `opacity-40`, not `opacity-0`: this is a 430px-wide chat and a touch device has no
- * hover, so a hover-only affordance does not exist at all on the primary form factor.
- * MEASURED before this change: 22 buttons in the DOM, computed opacity 0, and Playwright
- * still reported them `visible` — its check ignores opacity, so every automated assertion
- * about them passed on something no human could see.
+ * Persistent, not hover-gated: this is a 430px-wide chat and a touch device has no
+ * hover, so a hover-only affordance did not exist at all on the primary form factor.
+ * A gray pill next to the bubble reads as tappable and is always present.
  *
- * `after:-inset-4` grows the hit area from 14px to ~46px, past the 44px platform minimum,
- * WITHOUT affecting layout — real gutters that wide would eat the bubble width at 430px.
+ * `after:-inset-4` on each button grows the hit area from 14px to ~46px, past the 44px
+ * platform minimum, WITHOUT affecting layout — it sits on the button so its own clicks
+ * still resolve to that button (an enlarged overlay on the non-interactive pill would
+ * instead swallow the taps).
  */
 const REPLY_AFFORDANCE_CLASS =
-  "relative mb-4 shrink-0 text-muted-foreground opacity-40 transition-opacity " +
-  "after:absolute after:-inset-4 after:content-[''] hover:text-foreground " +
-  "focus:opacity-100 group-hover:opacity-100";
+  "mb-4 flex shrink-0 items-center gap-0.5 rounded-full bg-muted px-1 py-0.5 text-muted-foreground";
+
+const MSG_ACTION_BTN_CLASS =
+  "relative rounded-full p-1 transition-colors hover:text-foreground " +
+  "after:absolute after:-inset-4 after:content-['']";
+
+function MessageActions({
+  msg,
+  onReply,
+}: {
+  msg: BusMessage;
+  onReply: (msg: BusMessage) => void;
+}) {
+  return (
+    <div className={REPLY_AFFORDANCE_CLASS}>
+      <button
+        type="button"
+        data-testid="reply-to"
+        onClick={() => onReply(msg)}
+        aria-label={`Reply to this message from ${msg.from}`}
+        title="Reply"
+        className={MSG_ACTION_BTN_CLASS}
+      >
+        <IconArrowBackUp size={14} />
+      </button>
+      <button
+        type="button"
+        onClick={() => navigator.clipboard?.writeText(copyPayload(msg))}
+        aria-label="Copy message text"
+        title="Copy"
+        className={MSG_ACTION_BTN_CLASS}
+      >
+        <IconCopy size={14} />
+      </button>
+    </div>
+  );
+}
 
 export function toolRunSummary(run: ToolRunRowData): string {
   const n = run.steps.length;
@@ -363,7 +430,15 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   const pair = [user, agent.name].sort().join('--');
   const [messages, setMessages] = useState<BusMessage[]>(() => roomCache.get(pair) ?? []);
   const [loading, setLoading] = useState(() => !roomCache.has(pair));
-  const [draft, setDraft] = useState('');
+  // Unsent draft, restored per-member from sessionStorage. (Item B4.)
+  const [draft, setDraft] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      return sessionStorage.getItem(draftKey(agent.name)) ?? '';
+    } catch {
+      return '';
+    }
+  });
   const [replyTarget, setReplyTarget] = useState<BusMessage | null>(null);
   // Parent lookup for the quoted line inside a reply bubble.
   const messagesById = new Map(messages.map((m) => [m.id, m]));
@@ -373,8 +448,6 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   const [uploadOpen, setUploadOpen] = useState(false);
   // Show the scroll-to-bottom button when scrolled away from newest. (Item 4.)
   const [showScrollDown, setShowScrollDown] = useState(false);
-  // Long-press context menu (mobile only). (Item 5.)
-  const [menuFor, setMenuFor] = useState<{ msg: BusMessage; x: number; y: number } | null>(null);
   const [sending, setSending] = useState(false);
   const [ttsOn, setTtsOn] = useState(false);
   const spokenIdsRef = useRef<Set<string>>(new Set());
@@ -389,11 +462,12 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   const forceScrollRef = useRef(true);
   const pinnedRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  // Long-press bookkeeping (mobile). coarseRef is set after mount because
-  // matchMedia is unavailable during SSR.
+  // Coarse-pointer flag, set after mount because matchMedia is unavailable
+  // during SSR. Gates the swipe-to-dismiss and desktop-only refocus paths.
   const coarseRef = useRef(false);
-  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const touchStartPos = useRef<{ x: number; y: number } | null>(null);
+  // Tracks the agent whose draft is currently loaded, so the persist effect
+  // does not write the outgoing agent's draft under the incoming key. (Item B4.)
+  const skipDraftPersistRef = useRef(false);
 
   const typing = mood === 'typing';
 
@@ -647,7 +721,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
     return () => container.removeEventListener('scroll', onScroll);
   }, [loading]);
 
-  // Coarse-pointer detection for the long-press menu — mount-only. (Item 5.)
+  // Coarse-pointer detection — mount-only. Gates swipe-dismiss and desktop refocus.
   useEffect(() => {
     coarseRef.current =
       typeof window !== 'undefined' && (window.matchMedia?.('(pointer: coarse)').matches ?? false);
@@ -661,6 +735,46 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
       el.style.overflowY = 'hidden';
     }
   }, [draft]);
+
+  // Reload the unsent draft when the agent changes. The component is reused
+  // across agents by a prop swap (crew/page.tsx passes no `key`), so a lazy
+  // useState initializer alone would keep the first agent's draft forever.
+  // (Item B4.) Skip the immediately-following persist so the outgoing draft is
+  // never written under the incoming agent's key.
+  useEffect(() => {
+    skipDraftPersistRef.current = true;
+    try {
+      setDraft(sessionStorage.getItem(draftKey(agent.name)) ?? '');
+    } catch {
+      setDraft('');
+    }
+  }, [agent.name]);
+
+  // Persist the draft per-agent as it changes; clear the key when emptied.
+  // sessionStorage (not localStorage like TTS at the toggle handler): drafts are
+  // meant to die with the tab session, not outlive it. (Item B4.)
+  useEffect(() => {
+    if (skipDraftPersistRef.current) {
+      skipDraftPersistRef.current = false;
+      return;
+    }
+    try {
+      if (draft === '') sessionStorage.removeItem(draftKey(agent.name));
+      else sessionStorage.setItem(draftKey(agent.name), draft);
+    } catch {
+      /* ignore */
+    }
+  }, [draft, agent.name]);
+
+  // Desktop autofocus: focus the composer on mount and on every agent change,
+  // but never on a coarse pointer (it would raise the on-screen keyboard).
+  // matchMedia is read directly here rather than via coarseRef to avoid an
+  // ordering race against the mount effect that sets coarseRef. (Item B2.)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (window.matchMedia?.('(pointer: coarse)').matches) return;
+    textareaRef.current?.focus();
+  }, [agent.name]);
 
   function scrollToBottom() {
     const container = scrollRef.current;
@@ -721,34 +835,6 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
     }
   }
 
-  // Long-press on a bubble opens a small Reply/Copy menu (mobile only). A finger
-  // that lands on the selectable message text is left to native iOS selection.
-  function clearLongPress() {
-    if (longPressTimer.current) {
-      clearTimeout(longPressTimer.current);
-      longPressTimer.current = null;
-    }
-  }
-
-  function onBubbleTouchStart(e: React.TouchEvent, msg: BusMessage) {
-    if (!coarseRef.current) return;
-    if ((e.target as HTMLElement).closest('[data-msg-text]')) return;
-    const t = e.touches[0];
-    if (!t) return;
-    touchStartPos.current = { x: t.clientX, y: t.clientY };
-    clearLongPress();
-    longPressTimer.current = setTimeout(() => {
-      setMenuFor({ msg, x: t.clientX, y: t.clientY });
-    }, 470);
-  }
-
-  function onBubbleTouchMove(e: React.TouchEvent) {
-    const start = touchStartPos.current;
-    const t = e.touches[0];
-    if (!start || !t) return;
-    if (Math.hypot(t.clientX - start.x, t.clientY - start.y) > 10) clearLongPress();
-  }
-
   async function handleSend() {
     if (sendingRef.current) return;
     if (!draft.trim() && attachments.length === 0) return;
@@ -804,6 +890,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           },
         ]);
         setDraft('');
+        try {
+          sessionStorage.removeItem(draftKey(agent.name));
+        } catch {
+          /* ignore */
+        }
         setReplyTarget(null);
         clearAttachments();
         forceScrollRef.current = true;
@@ -897,26 +988,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
                 <div
                   key={msg.id}
                   className={`crew-msg-in group flex items-end gap-2 ${fromAgent ? 'justify-start' : 'justify-end'}`}
-                  onTouchStart={(e) => onBubbleTouchStart(e, msg)}
-                  onTouchMove={onBubbleTouchMove}
-                  onTouchEnd={clearLongPress}
-                  onTouchCancel={clearLongPress}
                 >
                   {fromAgent && (
                     <CrewAvatar name={agent.name} version={agent.avatarVersion} mood="active" size={26} className="mb-4" />
                   )}
-                  {!fromAgent && (
-                    <button
-                      type="button"
-                      data-testid="reply-to"
-                      onClick={() => setReplyTarget(msg)}
-                      aria-label={`Reply to this message from ${msg.from}`}
-                      title="Reply"
-                      className={REPLY_AFFORDANCE_CLASS}
-                    >
-                      <IconArrowBackUp size={14} />
-                    </button>
-                  )}
+                  {!fromAgent && <MessageActions msg={msg} onReply={setReplyTarget} />}
                   <div
                     className={`max-w-[80%] select-none rounded-2xl px-3.5 py-2 text-sm shadow-sm ${
                       fromAgent
@@ -956,18 +1032,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
                       {formatTime(msg.timestamp)}
                     </p>
                   </div>
-                  {fromAgent && (
-                    <button
-                      type="button"
-                      data-testid="reply-to"
-                      onClick={() => setReplyTarget(msg)}
-                      aria-label={`Reply to this message from ${msg.from}`}
-                      title="Reply"
-                      className={REPLY_AFFORDANCE_CLASS}
-                    >
-                      <IconArrowBackUp size={14} />
-                    </button>
-                  )}
+                  {fromAgent && <MessageActions msg={msg} onReply={setReplyTarget} />}
                 </div>
               );
             })}
@@ -1224,43 +1289,6 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
     </button>
   ) : null;
 
-  // The long-press context menu (item 5). Fixed overlay, so a single instance
-  // renders correctly in either layout. Only ever populated on a coarse pointer.
-  const longPressMenu = menuFor ? (
-    <div className="fixed inset-0 z-50" onClick={() => setMenuFor(null)}>
-      <div className="absolute inset-0 bg-black/40" />
-      <div
-        className="crew-menu-in absolute min-w-[160px] rounded-2xl border bg-popover p-1 text-popover-foreground shadow-xl"
-        style={{
-          top: Math.min(menuFor.y, (typeof window !== 'undefined' ? window.innerHeight : 0) - 120),
-          left: Math.min(menuFor.x, (typeof window !== 'undefined' ? window.innerWidth : 0) - 180),
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <button
-          type="button"
-          onClick={() => {
-            setReplyTarget(menuFor.msg);
-            setMenuFor(null);
-          }}
-          className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm hover:bg-muted"
-        >
-          <IconArrowBackUp size={18} /> Reply
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            navigator.clipboard?.writeText(menuFor.msg.text);
-            setMenuFor(null);
-          }}
-          className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm hover:bg-muted"
-        >
-          <IconCopy size={18} /> Copy
-        </button>
-      </div>
-    </div>
-  ) : null;
-
   const upload = (
     <AvatarUpload
       agent={agent.name}
@@ -1336,7 +1364,6 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           {chatBarFloating}
         </div>
 
-        {longPressMenu}
         {upload}
       </div>
     );
@@ -1345,7 +1372,17 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   // Desktop / non-frameless: bordered-panel-free card (Q5 strips the border so
   // the chat sits seamlessly next to the roster rail), header kept intact.
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
+    <div
+      className="flex h-full min-h-0 flex-col overflow-hidden bg-background"
+      onClick={(e) => {
+        // Desktop only: clicking empty chat surface returns focus to the
+        // composer, unless a control was clicked or text is being selected.
+        const hasSelection = !!window.getSelection()?.toString();
+        if (shouldRefocus(e.target as Element, hasSelection, coarseRef.current)) {
+          textareaRef.current?.focus();
+        }
+      }}
+    >
       {/* Companion header */}
       <div className="flex items-center gap-3 border-b bg-muted/20 px-3 py-2.5">
         {onBack && (
@@ -1393,7 +1430,6 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
         {chatBarGrouped}
       </div>
 
-      {longPressMenu}
       {upload}
     </div>
   );
