@@ -221,10 +221,10 @@ export function foldToolRuns(messages: BusMessage[]): ChatRow[] {
  * instead swallow the taps).
  */
 const REPLY_AFFORDANCE_CLASS =
-  "mb-4 flex shrink-0 items-center gap-0.5 rounded-full bg-muted px-1 py-0.5 text-muted-foreground";
+  "mb-4 flex flex-col shrink-0 items-center gap-0.5 rounded-full bg-muted px-0.5 py-1 text-muted-foreground";
 
 const MSG_ACTION_BTN_CLASS =
-  "relative rounded-full p-1 transition-colors hover:text-foreground " +
+  "relative rounded-full p-1.5 transition-colors hover:text-foreground " +
   "after:absolute after:-inset-4 after:content-['']";
 
 // How long the copy button shows its checkmark confirmation before reverting.
@@ -270,7 +270,7 @@ function MessageActions({
         title="Reply"
         className={MSG_ACTION_BTN_CLASS}
       >
-        <IconArrowBackUp size={14} />
+        <IconArrowBackUp size={18} />
       </button>
       <button
         type="button"
@@ -279,7 +279,7 @@ function MessageActions({
         title={copied ? 'Copied' : 'Copy'}
         className={MSG_ACTION_BTN_CLASS}
       >
-        {copied ? <IconCheck size={14} className="text-emerald-500" /> : <IconCopy size={14} />}
+        {copied ? <IconCheck size={18} className="text-emerald-500" /> : <IconCopy size={18} />}
       </button>
     </div>
   );
