@@ -131,6 +131,29 @@ export function copyPayload(msg: Pick<BusMessage, 'text'>): string {
 }
 
 /**
+ * Copy `payload` to the clipboard, returning true ONLY when the write actually
+ * lands. An insecure context has no `navigator.clipboard` at all, so the
+ * caller's `clipboard?.` short-circuits to undefined; `await undefined` resolves
+ * cleanly and would otherwise flash a checkmark for a copy that never happened.
+ * Returns false when the clipboard is absent (no write attempted) or the write
+ * rejects (denied permission). No execCommand fallback — out of scope.
+ *
+ * Pure enough to unit-test with a fake clipboard — exported for that test.
+ */
+export async function performCopy(
+  clipboard: Pick<Clipboard, 'writeText'> | undefined,
+  payload: string,
+): Promise<boolean> {
+  if (!clipboard) return false;
+  try {
+    await clipboard.writeText(payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Reconcile a server fetch against what is already on screen.
  *
  * - Server copies win by id, so an optimistic bubble is replaced rather than
@@ -241,13 +264,10 @@ function MessageActions({
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleCopy = async () => {
-    // Only confirm once the write resolves — a rejected clipboard (insecure
-    // context / denied permission) must never flash a checkmark that lies.
-    try {
-      await navigator.clipboard?.writeText(copyPayload(msg));
-    } catch {
-      return;
-    }
+    // Only confirm once the write actually lands — an absent clipboard (insecure
+    // context) or a rejected one (denied permission) must never flash a
+    // checkmark that lies. performCopy returns false in both cases.
+    if (!(await performCopy(navigator.clipboard, copyPayload(msg)))) return;
     setCopied(true);
     if (copiedTimer.current) clearTimeout(copiedTimer.current);
     copiedTimer.current = setTimeout(() => setCopied(false), COPIED_RESET_MS);
