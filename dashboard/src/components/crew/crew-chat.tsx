@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type Ref } from 'react';
 import { Button } from '@/components/ui/button';
 import {
   IconArrowLeft,
@@ -248,7 +248,33 @@ export function foldToolRuns(messages: BusMessage[]): ChatRow[] {
  * it horizontally pannable. 6px stays inside the padding so it can never cross the edge.
  */
 const REPLY_AFFORDANCE_CLASS =
-  "mb-4 flex flex-col shrink-0 items-center gap-0.5 rounded-full bg-muted px-0.5 py-1 text-muted-foreground";
+  "flex flex-col shrink-0 items-center gap-0.5 rounded-full bg-muted px-0.5 py-1 text-muted-foreground";
+
+/**
+ * Per-row alignment classes for a message row, driven by whether the bubble is
+ * short enough (bubble height <= pill height) to share a vertical center with
+ * the taller action pill.
+ *
+ * The `mb-4` that used to live in REPLY_AFFORDANCE_CLASS moves here so it applies
+ * ONLY in the tall case. On a short bubble a static rule can't center — flexbox
+ * can't branch on which sibling is taller — so the row switches to `items-center`
+ * (pill and bubble share center), the pill drops `mb-4`, and the avatar takes
+ * `self-end` (kept alongside its own `mb-4` in the JSX) so it does NOT move from
+ * its bottom-anchored position. The tall case stays byte-identical to before:
+ * `items-end` row, `mb-4 self-end` pill (self-end is a no-op under items-end),
+ * plain `mb-4` avatar. Pure and exported so the short-vs-tall wiring is testable
+ * without a React render harness (a forbidden new dependency here) — it tests the
+ * class strings, not pixels.
+ */
+export function rowAlignClasses(centered: boolean): {
+  row: string;
+  avatarExtra: string;
+  pill: string;
+} {
+  return centered
+    ? { row: 'items-center', avatarExtra: 'self-end', pill: '' }
+    : { row: 'items-end', avatarExtra: '', pill: 'mb-4 self-end' };
+}
 
 const MSG_ACTION_BTN_CLASS =
   "relative rounded-full p-1.5 transition-colors hover:text-foreground " +
@@ -260,9 +286,15 @@ const COPIED_RESET_MS = 1500;
 function MessageActions({
   msg,
   onReply,
+  pillClass,
+  containerRef,
 }: {
   msg: BusMessage;
   onReply: (msg: BusMessage) => void;
+  /** Alignment classes from rowAlignClasses — same value on both sides. */
+  pillClass: string;
+  /** Set by the row so it can measure the pill height against the bubble. */
+  containerRef: Ref<HTMLDivElement>;
 }) {
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -285,7 +317,7 @@ function MessageActions({
   );
 
   return (
-    <div className={REPLY_AFFORDANCE_CLASS}>
+    <div ref={containerRef} className={`${REPLY_AFFORDANCE_CLASS} ${pillClass}`}>
       <button
         type="button"
         data-testid="reply-to"
@@ -305,6 +337,109 @@ function MessageActions({
       >
         {copied ? <IconCheck size={18} className="text-emerald-500" /> : <IconCopy size={18} />}
       </button>
+    </div>
+  );
+}
+
+/**
+ * One message row: avatar (agent side), action pill, and bubble.
+ *
+ * Extracted from the render map so each row can measure its own bubble against
+ * its own pill and center a short bubble on the pill without moving the avatar
+ * or touching tall rows. A single static CSS rule can't do this — flexbox can't
+ * branch on which sibling is taller — so a per-row layout measurement is used.
+ * Classification is by MEASUREMENT (offsetHeight), never a hardcoded px, because
+ * the button size is coupled to the recent "25% larger" change.
+ */
+function MessageRow({
+  msg,
+  fromAgent,
+  parent,
+  agent,
+  onReply,
+}: {
+  msg: BusMessage;
+  fromAgent: boolean;
+  parent: BusMessage | undefined;
+  agent: CrewChatAgent;
+  onReply: (msg: BusMessage) => void;
+}) {
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  const pillRef = useRef<HTMLDivElement>(null);
+  // Short = bubble no taller than the pill. Starts false (tall layout); the
+  // layout effect corrects it before paint, so there is no visible flash.
+  const [centered, setCentered] = useState(false);
+  useIsomorphicLayoutEffect(() => {
+    const bubble = bubbleRef.current;
+    const pill = pillRef.current;
+    if (!bubble || !pill) return;
+    // Batch the reads, then one write — no interleaving to avoid layout thrash.
+    const bubbleH = bubble.offsetHeight;
+    const pillH = pill.offsetHeight;
+    setCentered(bubbleH <= pillH);
+  }, [msg.text, parent, msg.media_type]);
+
+  const align = rowAlignClasses(centered);
+
+  return (
+    <div
+      className={`crew-msg-in group flex gap-2 ${align.row} ${fromAgent ? 'justify-start' : 'justify-end'}`}
+    >
+      {fromAgent && (
+        <CrewAvatar
+          name={agent.name}
+          version={agent.avatarVersion}
+          mood="active"
+          size={26}
+          className={`mb-4 ${align.avatarExtra}`}
+        />
+      )}
+      {!fromAgent && (
+        <MessageActions msg={msg} onReply={onReply} pillClass={align.pill} containerRef={pillRef} />
+      )}
+      <div
+        ref={bubbleRef}
+        className={`max-w-[80%] select-none rounded-2xl px-3.5 py-2 text-sm shadow-sm ${
+          fromAgent
+            ? 'rounded-bl-md border border-border/60 bg-muted/50'
+            : 'rounded-br-md bg-primary text-primary-foreground'
+        }`}
+      >
+        {parent && (
+          <span
+            data-testid="reply-parent"
+            className={`mb-1 block truncate border-l-2 pl-1.5 text-[11px] ${
+              fromAgent
+                ? 'border-border text-muted-foreground'
+                : 'border-primary-foreground/40 text-primary-foreground/70'
+            }`}
+          >
+            {parent.from}: {parent.text}
+          </span>
+        )}
+        {msg.media_type === 'voice' && (
+          <span
+            className={`mb-0.5 flex items-center gap-1 text-[10px] ${
+              fromAgent ? 'text-muted-foreground' : 'text-primary-foreground/70'
+            }`}
+          >
+            <IconMicrophone size={11} aria-hidden /> voice
+          </span>
+        )}
+        <span data-msg-text className="select-text">
+          <MessageContent text={msg.text} />
+        </span>
+        <p
+          className={`mt-0.5 text-right text-[10px] ${
+            fromAgent ? 'text-muted-foreground' : 'text-primary-foreground/70'
+          }`}
+        >
+          {formatTime(msg.timestamp)}
+        </p>
+      </div>
+      {fromAgent && (
+        <MessageActions msg={msg} onReply={onReply} pillClass={align.pill} containerRef={pillRef} />
+      )}
     </div>
   );
 }
@@ -773,6 +908,12 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   useIsomorphicLayoutEffect(() => {
     const container = scrollRef.current;
     if (!container) return;
+    // While loading, the body renders <ChatSkeleton/>, not the messages. Running
+    // now would spend forceScrollRef against the skeleton's height, so the force
+    // is gone by the time real messages arrive and landing at bottom is not
+    // guaranteed. Preserve it until real messages render; `loading` is a dep so
+    // this re-runs at the loading->false transition.
+    if (loading) return;
     if (forceScrollRef.current || pinnedRef.current) {
       container.scrollTop = container.scrollHeight;
       if (forceScrollRef.current) {
@@ -780,7 +921,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
         pinnedRef.current = true;
       }
     }
-  }, [messages, replyTarget, attachments.length, draft]);
+  }, [messages, replyTarget, attachments.length, draft, loading]);
 
   // Toggle the scroll-to-bottom button as the user scrolls away from newest.
   // (Item 4.) Re-bound on `loading` like the other scroll listeners, since the
@@ -798,6 +939,23 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
     return () => container.removeEventListener('scroll', onScroll);
   }, [loading]);
 
+  // Lazy inline images grow scrollHeight after commit, with nothing re-pinning.
+  // Re-pin to bottom as each finishes loading, but ONLY while the user is still
+  // pinned (never yank someone who scrolled up). `load` does not bubble, so the
+  // listener must be capture-phase. Bound on the stable container and re-bound on
+  // `loading` like the other scroll listeners.
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+    function onLoad() {
+      if (container && pinnedRef.current) {
+        container.scrollTop = container.scrollHeight;
+      }
+    }
+    container.addEventListener('load', onLoad, true);
+    return () => container.removeEventListener('load', onLoad, true);
+  }, [loading]);
+
   // Coarse-pointer detection — mount-only. Gates swipe-dismiss and desktop refocus.
   useEffect(() => {
     coarseRef.current =
@@ -805,11 +963,19 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   }, []);
 
   // Collapse the textarea back to one line once the draft is cleared. (Item 1.)
+  // A programmatic setDraft (restoring a per-agent draft on switch/return) fires
+  // no input event, so autoGrow never runs and a multi-line draft would render at
+  // one-line height with its text hidden. Recompute height from the restored
+  // draft here; autoGrow is idempotent, so the extra call on keystrokes is a
+  // no-op. (Item B4.)
   useEffect(() => {
     const el = textareaRef.current;
-    if (el && draft === '') {
+    if (!el) return;
+    if (draft === '') {
       el.style.height = 'auto';
       el.style.overflowY = 'hidden';
+    } else {
+      autoGrow(el);
     }
   }, [draft]);
 
@@ -1062,55 +1228,14 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
               const fromAgent = msg.from === agent.name;
               const parent = msg.reply_to ? messagesById.get(msg.reply_to) : undefined;
               return (
-                <div
+                <MessageRow
                   key={msg.id}
-                  className={`crew-msg-in group flex items-end gap-2 ${fromAgent ? 'justify-start' : 'justify-end'}`}
-                >
-                  {fromAgent && (
-                    <CrewAvatar name={agent.name} version={agent.avatarVersion} mood="active" size={26} className="mb-4" />
-                  )}
-                  {!fromAgent && <MessageActions msg={msg} onReply={setReplyTarget} />}
-                  <div
-                    className={`max-w-[80%] select-none rounded-2xl px-3.5 py-2 text-sm shadow-sm ${
-                      fromAgent
-                        ? 'rounded-bl-md border border-border/60 bg-muted/50'
-                        : 'rounded-br-md bg-primary text-primary-foreground'
-                    }`}
-                  >
-                    {parent && (
-                      <span
-                        data-testid="reply-parent"
-                        className={`mb-1 block truncate border-l-2 pl-1.5 text-[11px] ${
-                          fromAgent
-                            ? 'border-border text-muted-foreground'
-                            : 'border-primary-foreground/40 text-primary-foreground/70'
-                        }`}
-                      >
-                        {parent.from}: {parent.text}
-                      </span>
-                    )}
-                    {msg.media_type === 'voice' && (
-                      <span
-                        className={`mb-0.5 flex items-center gap-1 text-[10px] ${
-                          fromAgent ? 'text-muted-foreground' : 'text-primary-foreground/70'
-                        }`}
-                      >
-                        <IconMicrophone size={11} aria-hidden /> voice
-                      </span>
-                    )}
-                    <span data-msg-text className="select-text">
-                      <MessageContent text={msg.text} />
-                    </span>
-                    <p
-                      className={`mt-0.5 text-right text-[10px] ${
-                        fromAgent ? 'text-muted-foreground' : 'text-primary-foreground/70'
-                      }`}
-                    >
-                      {formatTime(msg.timestamp)}
-                    </p>
-                  </div>
-                  {fromAgent && <MessageActions msg={msg} onReply={setReplyTarget} />}
-                </div>
+                  msg={msg}
+                  fromAgent={fromAgent}
+                  parent={parent}
+                  agent={agent}
+                  onReply={setReplyTarget}
+                />
               );
             })}
             {typing && (
