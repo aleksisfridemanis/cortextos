@@ -1210,6 +1210,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
             variant="ghost"
             size="sm"
             className="shrink-0 self-end"
+            onPointerDown={(e) => e.preventDefault()}
             onClick={() => fileInputRef.current?.click()}
             title="Attach image"
             aria-label="Attach image"
@@ -1270,6 +1271,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           variant="ghost"
           size="icon"
           className={composerPillClass}
+          onPointerDown={(e) => e.preventDefault()}
           onClick={() => fileInputRef.current?.click()}
           title="Attach image"
           aria-label="Attach image"
