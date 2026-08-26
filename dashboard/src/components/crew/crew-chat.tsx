@@ -13,6 +13,7 @@ import {
   IconVolumeOff,
   IconChevronDown,
   IconCopy,
+  IconCheck,
   IconX,
 } from '@tabler/icons-react';
 import { CrewAvatar } from './crew-avatar';
@@ -226,6 +227,9 @@ const MSG_ACTION_BTN_CLASS =
   "relative rounded-full p-1 transition-colors hover:text-foreground " +
   "after:absolute after:-inset-4 after:content-['']";
 
+// How long the copy button shows its checkmark confirmation before reverting.
+const COPIED_RESET_MS = 1500;
+
 function MessageActions({
   msg,
   onReply,
@@ -233,6 +237,29 @@ function MessageActions({
   msg: BusMessage;
   onReply: (msg: BusMessage) => void;
 }) {
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleCopy = async () => {
+    // Only confirm once the write resolves — a rejected clipboard (insecure
+    // context / denied permission) must never flash a checkmark that lies.
+    try {
+      await navigator.clipboard?.writeText(copyPayload(msg));
+    } catch {
+      return;
+    }
+    setCopied(true);
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(false), COPIED_RESET_MS);
+  };
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
   return (
     <div className={REPLY_AFFORDANCE_CLASS}>
       <button
@@ -247,12 +274,12 @@ function MessageActions({
       </button>
       <button
         type="button"
-        onClick={() => navigator.clipboard?.writeText(copyPayload(msg))}
-        aria-label="Copy message text"
-        title="Copy"
+        onClick={handleCopy}
+        aria-label={copied ? 'Copied' : 'Copy message text'}
+        title={copied ? 'Copied' : 'Copy'}
         className={MSG_ACTION_BTN_CLASS}
       >
-        <IconCopy size={14} />
+        {copied ? <IconCheck size={14} className="text-emerald-500" /> : <IconCopy size={14} />}
       </button>
     </div>
   );
