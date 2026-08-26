@@ -59,6 +59,28 @@ export function formatChatTimestamp(iso: string | null): string {
   return d.toLocaleDateString([], { month: 'numeric', day: 'numeric' });
 }
 
+// Placeholder rows for a cold roster load, matching the 'list' row geometry
+// (avatar circle + name bar + preview bar) so the switch to real rows does not
+// jump. `crew-skeleton` carries the pulse and is stilled under
+// prefers-reduced-motion (crew.css).
+const ROSTER_SKELETON_WIDTHS = ['w-24', 'w-20', 'w-28', 'w-16', 'w-24'];
+
+export function RosterSkeleton() {
+  return (
+    <div className="crew-skeleton" aria-hidden>
+      {ROSTER_SKELETON_WIDTHS.map((nameWidth, i) => (
+        <div key={i} className="flex w-full items-center gap-3 border-b border-border/60 px-3 py-2.5">
+          <div className="h-[52px] w-[52px] shrink-0 animate-pulse rounded-full bg-muted" />
+          <div className="min-w-0 flex-1 space-y-2">
+            <div className={`h-3.5 animate-pulse rounded bg-muted ${nameWidth}`} />
+            <div className="h-3 w-3/4 animate-pulse rounded bg-muted" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function StatusDot({ mood }: { mood: CrewMood }) {
   const color =
     mood === 'typing'

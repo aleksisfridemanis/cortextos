@@ -401,6 +401,32 @@ function ToolRunRow({ run }: { run: ToolRunRowData }) {
   );
 }
 
+// Placeholder rows for a cold, uncached first paint — shown only on a true cold
+// load (the in-memory roomCache suppresses `loading` on an SPA room switch, so a
+// return to a warm room never flashes this). Reuses the bubble geometry so the
+// skeleton occupies the same shape the real messages will. `crew-skeleton`
+// carries the pulse and is stilled under prefers-reduced-motion (crew.css).
+const CHAT_SKELETON_ROWS: { fromAgent: boolean; width: string }[] = [
+  { fromAgent: true, width: 'w-40' },
+  { fromAgent: false, width: 'w-28' },
+  { fromAgent: true, width: 'w-52' },
+  { fromAgent: false, width: 'w-36' },
+  { fromAgent: true, width: 'w-24' },
+  { fromAgent: false, width: 'w-44' },
+];
+
+function ChatSkeleton() {
+  return (
+    <div className="crew-skeleton space-y-2.5" aria-hidden>
+      {CHAT_SKELETON_ROWS.map((row, i) => (
+        <div key={i} className={`flex ${row.fromAgent ? 'justify-start' : 'justify-end'}`}>
+          <div className={`h-9 max-w-[80%] animate-pulse rounded-2xl bg-muted ${row.width}`} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export interface CrewChatAgent {
   name: string;
   tagline: string;
@@ -1013,7 +1039,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   const messageBody = (
     <>
       {loading ? (
-          <div className="py-8 text-center text-sm text-muted-foreground">Loading…</div>
+          <ChatSkeleton />
         ) : messages.length === 0 && !typing ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
             <div className="h-28 w-28">

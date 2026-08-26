@@ -2,7 +2,7 @@
 
 import { Suspense, useCallback, useRef } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { CrewRoster } from '@/components/crew/crew-roster';
+import { CrewRoster, RosterSkeleton } from '@/components/crew/crew-roster';
 import { CrewChat, warmRoomCache } from '@/components/crew/crew-chat';
 import { useCrew, shouldTriggerPullRefresh } from '@/components/crew/use-crew';
 import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
@@ -79,8 +79,8 @@ function CrewAppInner() {
       />
 
       {loading ? (
-        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-          Waking the crew…
+        <div className="min-h-0 flex-1 px-4 pt-6">
+          <RosterSkeleton />
         </div>
       ) : selectedAgent ? (
         <div className="relative min-h-0 flex-1">

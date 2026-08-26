@@ -93,7 +93,9 @@
   .crew-ring-typing,
   .crew-msg-in,
   .crew-menu-in,
-  .crew-scroll-down {
+  .crew-scroll-down,
+  .crew-skeleton,
+  .crew-skeleton * {
     animation: none;
   }
 }

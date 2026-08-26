@@ -2,7 +2,7 @@
 
 import { Suspense, useCallback, useEffect, useRef } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { CrewRoster } from '@/components/crew/crew-roster';
+import { CrewRoster, RosterSkeleton } from '@/components/crew/crew-roster';
 import { CrewChat, warmRoomCache } from '@/components/crew/crew-chat';
 import { useCrew, resolveInitialSelection, shouldTriggerPullRefresh } from '@/components/crew/use-crew';
 import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
@@ -84,7 +84,11 @@ function CrewPageInner() {
   }
 
   if (loading) {
-    return <div className="py-12 text-center text-sm text-muted-foreground">Waking the crew…</div>;
+    return (
+      <div className="md:max-w-[290px]">
+        <RosterSkeleton />
+      </div>
+    );
   }
 
   return (
