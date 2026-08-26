@@ -238,17 +238,21 @@ export function foldToolRuns(messages: BusMessage[]): ChatRow[] {
  * hover, so a hover-only affordance did not exist at all on the primary form factor.
  * A gray pill next to the bubble reads as tappable and is always present.
  *
- * `after:-inset-4` on each button grows the hit area from 14px to ~46px, past the 44px
- * platform minimum, WITHOUT affecting layout — it sits on the button so its own clicks
- * still resolve to that button (an enlarged overlay on the non-interactive pill would
- * instead swallow the taps).
+ * The `after:` pseudo on each button grows the hit area WITHOUT affecting layout —
+ * it sits on the button so its own clicks still resolve to that button (an enlarged
+ * overlay on the non-interactive pill would instead swallow the taps). The vertical
+ * inset stays generous (`-inset-y-4`, ~46px tall, past the 44px platform minimum for
+ * the stacked pill), but the horizontal inset is trimmed to 6px (`-inset-x-1.5`): an
+ * isotropic `-inset-4` reached 16px past the row's content edge — wider than the px-3
+ * (12px) container padding — enlarging the scroll container's overflow rect and making
+ * it horizontally pannable. 6px stays inside the padding so it can never cross the edge.
  */
 const REPLY_AFFORDANCE_CLASS =
   "mb-4 flex flex-col shrink-0 items-center gap-0.5 rounded-full bg-muted px-0.5 py-1 text-muted-foreground";
 
 const MSG_ACTION_BTN_CLASS =
   "relative rounded-full p-1.5 transition-colors hover:text-foreground " +
-  "after:absolute after:-inset-4 after:content-['']";
+  "after:absolute after:-inset-y-4 after:-inset-x-1.5 after:content-['']";
 
 // How long the copy button shows its checkmark confirmation before reverting.
 const COPIED_RESET_MS = 1500;
@@ -1366,7 +1370,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   if (frameless) {
     return (
       <div className="relative h-full min-h-0 overflow-hidden bg-background">
-        <div ref={scrollRef} className="absolute inset-0 space-y-2.5 overflow-y-auto px-3 pb-28 pt-16">
+        <div ref={scrollRef} className="absolute inset-0 space-y-2.5 overflow-y-auto overflow-x-clip px-3 pb-28 pt-16">
           {messageBody}
         </div>
 
@@ -1468,7 +1472,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
 
       {/* Messages */}
       <div className="relative flex-1 min-h-0">
-        <div ref={scrollRef} className="h-full space-y-2.5 overflow-y-auto px-3 py-3">
+        <div ref={scrollRef} className="h-full space-y-2.5 overflow-y-auto overflow-x-clip px-3 py-3">
           {messageBody}
         </div>
         {scrollDownButton && <div className="absolute bottom-3 right-4">{scrollDownButton}</div>}
