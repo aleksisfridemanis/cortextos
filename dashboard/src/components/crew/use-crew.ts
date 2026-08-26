@@ -11,9 +11,9 @@ import type { RosterEntry } from './crew-roster';
 // Same window as the Active-now strip on /agents.
 const ACTIVE_WINDOW_MS = 90_000;
 const PRESENCE_POLL_MS = 7000;
-// The roster (names, taglines, avatars, last-activity) changes far less often
-// than presence, so it polls on a gentler cadence.
-const CREW_POLL_MS = 15000;
+// The roster carries each agent's last-activity/preview, which must track the
+// open chat in near-real-time, so it polls on the same 5s cadence as the chat.
+const CREW_POLL_MS = 5000;
 
 /**
  * A mobile pull-to-refresh gesture fires when the list is already scrolled to

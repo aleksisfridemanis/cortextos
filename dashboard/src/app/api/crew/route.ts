@@ -1,8 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { getCTXRoot } from '@/lib/config';
-import { resolveIdentity, buildPairKey } from '@/lib/comms-identity';
-import { readRoomTail } from '@/lib/rooms';
+import { resolveIdentity } from '@/lib/comms-identity';
+import { readPairSummary } from '@/lib/rooms';
 import { findAvatarFile } from '@/lib/crew-avatars';
 
 export const dynamic = 'force-dynamic';
@@ -86,10 +86,11 @@ export async function GET() {
         }
       }
 
-      // Last-message time + preview from the DM room-log tail (cheap: only the
-      // tail bytes are read). readRoomTail swallows a missing log to {null,null}.
-      const pair = buildPairKey(name, identity.canonicalUser, identity);
-      const tail = readRoomTail(ctxRoot, `dm-${pair}`);
+      // Last-message time + preview unioned across every source the chat view
+      // reads (room-log tail + bus queues + Telegram outbound log), so the
+      // roster summary cannot lag behind the open chat. Tail/stat-bounded;
+      // missing sources swallow to {null,null}.
+      const tail = readPairSummary(ctxRoot, name, identity.canonicalUser, identity);
 
       agents.push({
         name,

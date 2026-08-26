@@ -13,6 +13,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { buildPairKey, type CommsIdentity } from './comms-identity';
 
 export interface RoomMessage {
   id: string;
@@ -160,4 +161,175 @@ export function readRoomLog(ctxRoot: string, roomId: string): RoomMessage[] {
     }
   }
   return messages;
+}
+
+/**
+ * Read at most the last `maxBytes` of a JSONL file and return the parsed
+ * objects, dropping the first (partial) line when the read began mid-file.
+ * An absent/unreadable file gives null; an empty file gives []. Same
+ * tail/stat discipline as readRoomTail — never parses the whole file.
+ */
+function readJsonlTail(
+  filePath: string,
+  maxBytes = TAIL_BYTES,
+): Record<string, unknown>[] | null {
+  let fd: number;
+  let size: number;
+  try {
+    size = fs.statSync(filePath).size;
+    fd = fs.openSync(filePath, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    if (size === 0) return [];
+    const readLen = Math.min(size, maxBytes);
+    const start = size - readLen;
+    const buf = Buffer.alloc(readLen);
+    fs.readSync(fd, buf, 0, readLen, start);
+    const parts = buf.toString('utf-8').split('\n');
+    const lines = start > 0 && parts.length > 1 ? parts.slice(1) : parts;
+    const out: Record<string, unknown>[] = [];
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        out.push(JSON.parse(t));
+      } catch {
+        /* skip corrupt line */
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Bus queue envelope filename: '<priority>-<epochMs>-from-<sender>-<rand>.json'.
+// The sender may itself contain dashes (e.g. codex-worker); the random suffix
+// is the final dash segment and never does. Greedy sender capture takes the
+// rest.
+const QUEUE_FILE_PATTERN = /^\d+-(\d+)-from-(.+)-[a-z0-9]+\.json$/;
+
+/**
+ * Last-activity summary for one agent↔user conversation, unioning the live
+ * sources the chat channel route reads so the roster and the open chat cannot
+ * disagree:
+ *
+ *   1. the canonical room-log tail (readRoomTail),
+ *   2. the newest ordinary message in the bus queues (inbox/inflight/processed)
+ *      for the pair — scanned on BOTH members' queue dirs, because an agent→user
+ *      reply sent over the bus lands in the USER's inbox (from-<agent>), never
+ *      the agent's own dir,
+ *   3. the tails of the agent's Telegram logs (logs/<agent>/{inbound,outbound}-
+ *      messages.jsonl) — inbound is user→agent, outbound is agent→user; both
+ *      belong to this pair.
+ *
+ * The channel route's fourth source, the legacy logs/message-history.jsonl, is
+ * intentionally omitted: it has no remaining writer (dead source), so a
+ * whole-file scan of it would add cost without ever winning the newest slot.
+ *
+ * Returns the newest ORDINARY (non-`kind`) message across those sources. Ties
+ * in timestamp resolve to the higher-precedence source (room log > queue >
+ * Telegram log), mirroring the channel route where the room-log copy claims the
+ * id first. Every source is tail/stat-bounded — no whole-file parse.
+ *
+ * An agent with no message anywhere gives {null, null} (roster falls back to
+ * the tagline).
+ */
+export function readPairSummary(
+  ctxRoot: string,
+  agent: string,
+  user: string,
+  identity: CommsIdentity,
+  previewChars = 140,
+): RoomTail {
+  const pair = buildPairKey(agent, user, identity);
+  // Accumulator held on an object so the closure's assignment does not defeat
+  // control-flow narrowing of the final read.
+  const acc: { best: { timestamp: string; text: string } | null } = { best: null };
+
+  // Strictly-greater replacement means an equal-timestamp candidate from a
+  // later (lower-precedence) source cannot displace an earlier one.
+  const consider = (timestamp: string, text: string): void => {
+    if (!timestamp || !text) return;
+    if (!acc.best || timestamp.localeCompare(acc.best.timestamp) > 0) {
+      acc.best = { timestamp, text };
+    }
+  };
+
+  // 1. Room-log tail (highest precedence).
+  const room = readRoomTail(ctxRoot, `dm-${pair}`, previewChars);
+  if (room.lastActivity && room.lastPreview) consider(room.lastActivity, room.lastPreview);
+
+  // 2. Bus queues — newest ordinary pair message. Filenames carry the sender and
+  // an epoch-ms ordering key, so candidates are ranked WITHOUT reading; only the
+  // newest matching envelope per direction is opened.
+  const otherByOwner: Array<{ owner: string; other: string }> = [
+    { owner: user, other: agent },
+    { owner: agent, other: user },
+  ];
+  const candidates: Array<{ ms: number; full: string }> = [];
+  for (const queue of ['inbox', 'inflight', 'processed']) {
+    for (const { owner, other } of otherByOwner) {
+      const dir = path.join(ctxRoot, queue, owner);
+      let files: string[];
+      try {
+        files = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const f of files) {
+        const m = QUEUE_FILE_PATTERN.exec(f);
+        if (!m) continue;
+        if (m[2].toLowerCase() !== other.toLowerCase()) continue; // sender must be the counterpart
+        candidates.push({ ms: Number(m[1]), full: path.join(dir, f) });
+      }
+    }
+  }
+  // Rank by the filename epoch (assumed ~= the message `timestamp`); only the
+  // newest-by-filename ordinary envelope is opened and then compared by its real
+  // timestamp. Clock skew or a re-enqueue could reorder the two by a few ms — an
+  // accepted rare bound, since the room-log/Telegram sources cover the same
+  // message and reading every envelope to sort by true timestamp is the cost
+  // this tail-bounded path exists to avoid.
+  candidates.sort((x, y) => y.ms - x.ms);
+  for (const c of candidates) {
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(fs.readFileSync(c.full, 'utf-8'));
+    } catch {
+      continue;
+    }
+    if (msg.kind) continue; // tool-run marker, never a chat bubble
+    const text = typeof msg.text === 'string' ? msg.text : '';
+    const timestamp = typeof msg.timestamp === 'string' ? msg.timestamp : '';
+    if (!text || !timestamp) continue;
+    if (buildPairKey(String(msg.from ?? ''), String(msg.to ?? ''), identity) !== pair) continue;
+    consider(timestamp, text);
+    break; // newest ordinary pair envelope found; older ones cannot win
+  }
+
+  // 3. Agent's Telegram logs — inbound (user→agent) and outbound (agent→user).
+  // Every entry in either file belongs to this pair, so no pair filter is
+  // needed. text may live under `text` or `transcript` (voice notes).
+  for (const logFile of ['inbound-messages.jsonl', 'outbound-messages.jsonl']) {
+    const entries = readJsonlTail(path.join(ctxRoot, 'logs', agent, logFile));
+    if (!entries) continue;
+    for (const obj of entries) {
+      const text =
+        typeof obj.text === 'string' && obj.text
+          ? obj.text
+          : typeof obj.transcript === 'string'
+            ? obj.transcript
+            : '';
+      const timestamp = typeof obj.timestamp === 'string' ? obj.timestamp : '';
+      consider(timestamp, text);
+    }
+  }
+
+  if (!acc.best) return { lastActivity: null, lastPreview: null };
+  return { lastActivity: acc.best.timestamp, lastPreview: previewText(acc.best.text, previewChars) };
 }
