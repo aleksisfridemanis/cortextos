@@ -51,6 +51,31 @@ describe('extractTail', () => {
     expect(extractTail(lines, false).lastPreview).toBe('good one');
   });
 
+  it('picks the newest by timestamp even when it is not last in the file', () => {
+    // Out-of-order append: the higher-timestamp line sits EARLIER in the array
+    // than a lower-timestamp line. Position-based selection would return the
+    // stale one; timestamp-based selection returns the newer one.
+    const lines = [
+      line({ ...base, id: 'new', timestamp: '2026-08-19T12:00:00Z', text: 'newer' }),
+      line({ ...base, id: 'old', timestamp: '2026-08-19T11:00:00Z', text: 'older' }),
+    ];
+    expect(extractTail(lines, false)).toEqual({
+      lastActivity: '2026-08-19T12:00:00Z',
+      lastPreview: 'newer',
+    });
+  });
+
+  it('skips a kind record that appears after the newest ordinary message', () => {
+    const lines = [
+      line({ ...base, id: 'msg', timestamp: '2026-08-19T12:00:00Z', text: 'real message' }),
+      line({ ...base, id: 'run', timestamp: '2026-08-19T13:00:00Z', kind: 'tool_run', text: 'tool run' }),
+    ];
+    expect(extractTail(lines, false)).toEqual({
+      lastActivity: '2026-08-19T12:00:00Z',
+      lastPreview: 'real message',
+    });
+  });
+
   it('collapses whitespace and truncates the preview', () => {
     const lines = [line({ ...base, text: 'a\n\n  b   c' })];
     expect(extractTail(lines, false).lastPreview).toBe('a b c');

@@ -58,10 +58,17 @@ function previewText(text: string, max: number): string {
 /**
  * Derive a room's last-activity summary from the tail lines of its log.
  *
- * Walks backwards to the newest ORDINARY message — `kind`-bearing tool-run
+ * Selects the newest ORDINARY message by timestamp — `kind`-bearing tool-run
  * markers are skipped so the preview matches the last bubble the chat renders.
+ * File/append order can diverge from timestamp order (DM logs are recorded at
+ * delivery by independent per-direction inbox checkers), so this picks the
+ * greatest `timestamp` (ISO strings compare lexically), tie-breaking on later
+ * file position. This matches the chat view, which sorts by timestamp.
  * `startedMidFile` means the first element is a partial line (the read began
  * inside the file) and must be dropped.
+ *
+ * Bounded to the last TAIL_BYTES (16 KiB) window: a message displaced by more
+ * than that much later appends is still missed. That bound is unchanged here.
  *
  * Pure: the file IO lives in readRoomTail. Exported for its own unit test.
  */
@@ -71,7 +78,8 @@ export function extractTail(
   previewChars = 140,
 ): RoomTail {
   const work = startedMidFile && lines.length > 1 ? lines.slice(1) : lines;
-  for (let i = work.length - 1; i >= 0; i--) {
+  let best: RoomMessage | null = null;
+  for (let i = 0; i < work.length; i++) {
     const line = work[i].trim();
     if (!line) continue;
     let msg: RoomMessage;
@@ -81,9 +89,12 @@ export function extractTail(
       continue;
     }
     if (!msg.id || !msg.from || !msg.timestamp || msg.kind) continue;
-    return { lastActivity: msg.timestamp, lastPreview: previewText(msg.text ?? '', previewChars) };
+    // Later file position wins ties (>=), so iterating forward keeps the newest
+    // append at an equal timestamp.
+    if (!best || msg.timestamp.localeCompare(best.timestamp) >= 0) best = msg;
   }
-  return { lastActivity: null, lastPreview: null };
+  if (!best) return { lastActivity: null, lastPreview: null };
+  return { lastActivity: best.timestamp, lastPreview: previewText(best.text ?? '', previewChars) };
 }
 
 /**
