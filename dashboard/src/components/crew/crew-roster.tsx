@@ -143,7 +143,7 @@ export function CrewRoster({ agents, selected, onSelect, variant, onPrefetch }: 
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-medium leading-tight">{a.name}</p>
-              <p className="truncate text-xs text-muted-foreground">{a.tagline}</p>
+              <p className="truncate text-xs text-muted-foreground">{a.lastPreview ?? a.tagline}</p>
             </div>
             {a.mood === 'typing' && (
               <span className="shrink-0 text-[10px] font-medium text-emerald-500">working…</span>

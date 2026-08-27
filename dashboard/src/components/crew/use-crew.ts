@@ -113,13 +113,14 @@ export function useCrew(): CrewState {
       if (cancelledRef.current) return;
       setUser(data.user ?? 'user');
       setAgents(Array.isArray(data.agents) ? data.agents : []);
-    } catch {
-      /* keep last snapshot */
-    } finally {
-      if (!cancelledRef.current && !loadedRef.current) {
+      // Clear the skeleton only after a successful load — a failed/pending
+      // first fetch keeps loading=true so the poll retries under the skeleton.
+      if (!loadedRef.current) {
         loadedRef.current = true;
         setLoading(false);
       }
+    } catch {
+      /* keep last snapshot */
     }
   }, []);
 
