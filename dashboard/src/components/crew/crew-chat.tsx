@@ -1088,6 +1088,15 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
     }
   }
 
+  // Item 9: desktop drag-drop images into the composer (addAttachments filters to images).
+  function handleDrop(e: React.DragEvent<HTMLDivElement>) {
+    const files = e.dataTransfer?.files ? Array.from(e.dataTransfer.files) : [];
+    if (files.length > 0) {
+      e.preventDefault();
+      addAttachments(files);
+    }
+  }
+
   async function handleSend() {
     if (sendingRef.current) return;
     if (!draft.trim() && attachments.length === 0) return;
@@ -1596,6 +1605,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           textareaRef.current?.focus();
         }
       }}
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={handleDrop}
     >
       {/* Companion header */}
       <div className="flex items-center gap-3 border-b bg-muted/20 px-3 py-2.5">
