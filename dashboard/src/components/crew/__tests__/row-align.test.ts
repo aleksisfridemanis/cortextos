@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { rowAlignClasses } from '../crew-chat';
+import { rowAlignClasses, isCentered } from '../crew-chat';
 
 // Tests WIRING (the class strings the row/avatar/pill get), not pixels. The
 // short-vs-tall decision is a runtime offsetHeight measurement; this only pins
@@ -26,5 +26,24 @@ describe('rowAlignClasses', () => {
     // bottom-anchored. If the branch were inverted this fails.
     expect(rowAlignClasses(false).pill).toContain('mb-4');
     expect(rowAlignClasses(true).pill).not.toContain('mb-4');
+  });
+});
+
+// The short-vs-tall decision itself (the runtime measurement `bubbleH <= pillH`),
+// extracted pure so a flipped operator is caught here instead of shipping silent.
+describe('isCentered', () => {
+  it('centers a short bubble (shorter than the pill)', () => {
+    expect(isCentered(20, 40)).toBe(true);
+  });
+
+  it('does not center a tall bubble (taller than the pill)', () => {
+    expect(isCentered(80, 40)).toBe(false);
+  });
+
+  it('centers at the boundary (equal heights) — matches the real `<=`', () => {
+    // The live code uses `<=`, so equal heights count as short. An inverted
+    // comparison (`>=`) would flip both this and the short case above, failing
+    // the test — proving it is a real control, not decoration.
+    expect(isCentered(40, 40)).toBe(true);
   });
 });

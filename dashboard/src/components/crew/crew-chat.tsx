@@ -276,6 +276,15 @@ export function rowAlignClasses(centered: boolean): {
     : { row: 'items-end', avatarExtra: '', pill: 'mb-4 self-end' };
 }
 
+/**
+ * The short-vs-tall decision, extracted pure so a flipped operator can be caught
+ * by a test rather than shipping silently. Short = bubble no taller than the pill
+ * (`<=`), which centers the row; a taller bubble stays bottom-anchored.
+ */
+export function isCentered(bubbleH: number, pillH: number): boolean {
+  return bubbleH <= pillH;
+}
+
 const MSG_ACTION_BTN_CLASS =
   "relative rounded-full p-1.5 transition-colors hover:text-foreground " +
   "after:absolute after:-inset-y-4 after:-inset-x-1.5 after:content-['']";
@@ -376,7 +385,7 @@ function MessageRow({
     // Batch the reads, then one write — no interleaving to avoid layout thrash.
     const bubbleH = bubble.offsetHeight;
     const pillH = pill.offsetHeight;
-    setCentered(bubbleH <= pillH);
+    setCentered(isCentered(bubbleH, pillH));
   }, [msg.text, parent, msg.media_type]);
 
   const align = rowAlignClasses(centered);
@@ -924,8 +933,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
   }, [messages, replyTarget, attachments.length, draft, loading]);
 
   // Toggle the scroll-to-bottom button as the user scrolls away from newest.
-  // (Item 4.) Re-bound on `loading` like the other scroll listeners, since the
-  // scroll container remounts across the loading boundary.
+  // (Item 4.) Re-bound on `loading` like the other scroll listeners: the scroll
+  // container stays mounted across the loading boundary — only its children swap
+  // between skeleton and messages.
   useEffect(() => {
     const container = scrollRef.current;
     if (!container) return;
