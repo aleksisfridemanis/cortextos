@@ -7,7 +7,7 @@
  * signed bus path could set it. These tests are the reason opening it to HTTP
  * is safe: the value is constrained to a message-id shape at the edge.
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
