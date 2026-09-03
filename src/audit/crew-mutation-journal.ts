@@ -27,6 +27,7 @@ import {
 import { withFileLockSync } from '../utils/lock.js';
 import { readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession } from '../work-sessions/registry.js';
 import { captureProcessIdentity, probeProcessIdentity } from '../utils/process-identity.js';
+import { appendRoomMessage, readRoomLog } from '../rooms/log.js';
 
 export type CrewMutationStage =
   | 'prepared'
@@ -619,11 +620,13 @@ function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): R
     if (receipt.mutation_id !== entry.mutation_id || receipt.delivered !== true || typeof record.room_id !== 'string') return null;
     if (entry.state_digest !== afterDigest) return null;
     try {
-      const lines = readFileSync(join(ctxRoot, 'rooms', record.room_id, 'log.jsonl'), 'utf8').split('\n');
-      if (!lines.some(line => {
-        try { return JSON.parse(line)?.id === entry.mutation_id; } catch { return false; }
-      })) return null;
-    } catch { return null; }
+      const message = readRoomLog(ctxRoot, record.room_id).find(item => item.id === entry.mutation_id);
+      if (!message) return null;
+      if (message.delivery_state !== 'delivered') {
+        appendRoomMessage(ctxRoot, { ...message, delivery_state: 'delivered' });
+      }
+      if (readRoomLog(ctxRoot, record.room_id).find(item => item.id === entry.mutation_id)?.delivery_state !== 'delivered') return 'pending';
+    } catch { return 'pending'; }
     return { result: 'success', after_digest: afterDigest };
   }
   if (entry.action === 'promote') {

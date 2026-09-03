@@ -19,8 +19,39 @@ import { digestCrewAuditValue } from '../../../src/audit/crew-lifecycle-audit.js
 import { createWorkSessionRecord, readWorkSessions, transitionWorkSession } from '../../../src/work-sessions/registry.js';
 import { upsertRoom } from '../../../src/rooms/registry.js';
 import { captureProcessIdentity } from '../../../src/utils/process-identity.js';
+import { appendRoomMessage, readRoomLog } from '../../../src/rooms/log.js';
 
 describe('Crew mutation journal', () => {
+  it('repairs a delivered message projection before finalizing crash recovery', () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-message-projection-'));
+    const cwd = join(root, 'project');
+    mkdirSync(cwd);
+    try {
+      const createId = '01111111-1111-4111-8111-111111111111';
+      const mutationId = '02222222-2222-4222-8222-222222222222';
+      const record = createWorkSessionRecord(root, {
+        id: `ws-${createId}`, display_name: 'Messages', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd,
+        room_id: `work-${createId}`, mutation_id: createId, created_by: 'owner:1',
+      });
+      const stateDigest = digestCrewAuditValue({ ...record, resume_handle: null });
+      prepareCrewMutation(root, {
+        mutation_id: mutationId, idempotency_key: mutationId, actor: 'owner:1', target: { kind: 'work_session', id: record.id }, action: 'message',
+        request_digest: '1'.repeat(64), before_digest: stateDigest, intended_after_digest: stateDigest,
+      });
+      appendRoomMessage(root, {
+        id: mutationId, room_id: record.room_id, from: 'owner:1', to: record.id, timestamp: '2026-09-03T00:00:00.000Z',
+        text: 'already delivered', reply_to: null, thread_id: mutationId, source: 'bus', attachments: [], delivery_state: 'pending',
+      });
+      commitCrewMutationState(root, mutationId, stateDigest);
+      startCrewMutationEffect(root, mutationId);
+      recordCrewMutationEffect(root, mutationId, { mutation_id: mutationId, delivered: true });
+
+      expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 1, pending: 0 });
+      expect(readRoomLog(root, record.room_id).find(message => message.id === mutationId))
+        .toMatchObject({ delivery_state: 'delivered' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('atomically rejects a second pending mutation for the same target', () => {
     const root = mkdtempSync(join(tmpdir(), 'crew-journal-target-'));
     try {
