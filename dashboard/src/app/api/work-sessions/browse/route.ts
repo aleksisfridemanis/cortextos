@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 import { browseHostDirectory } from '@/lib/host-paths';
 import { checkCrewRateLimit } from '@/lib/rate-limit';
+import { publicApplicationError } from '@/lib/application-error';
 
 export const dynamic = 'force-dynamic';
 
@@ -22,8 +23,7 @@ export async function GET(request: NextRequest) {
     });
     return Response.json(result);
   } catch (error) {
-    const code = (error as Error).message;
-    const status = ['PATH_UNAVAILABLE', 'PATH_UNREADABLE'].includes(code) ? 404 : 400;
-    return Response.json({ error: 'Directory cannot be browsed', code }, { status });
+    const mapped = publicApplicationError(error instanceof Error ? error.message : undefined);
+    return Response.json({ error: 'Directory cannot be browsed', code: mapped.code }, { status: mapped.status });
   }
 }

@@ -77,6 +77,17 @@ describe('composeEmployeeContext', () => {
     })).toThrow(/CONTEXT_BUDGET_EXCEEDED/);
   });
 
+  it('never includes a missing private source path in the public error code', () => {
+    rmSync(join(frameworkRoot, 'templates', 'context', 'employee-core.md'));
+    let thrown: unknown;
+    try {
+      composeEmployeeContext({ frameworkRoot, agentDir, agentName, ctxRoot: join(root, 'ctx'), mode: 'fresh' });
+    } catch (error) { thrown = error; }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe('CONTEXT_SOURCE_UNAVAILABLE');
+    expect((thrown as Error).message).not.toContain(root);
+  });
+
   it('refreshes framework bytes while preserving instance bytes and bounds one continuation handoff', () => {
     const before = composeEmployeeContext({ frameworkRoot, agentDir, agentName, ctxRoot: join(root, 'ctx'), mode: 'fresh' });
     writeFileSync(join(frameworkRoot, 'templates', 'context', 'employee-core.md'), 'REFRESHED CORE\n');

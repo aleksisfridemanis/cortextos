@@ -3,6 +3,7 @@ import { IPCClient } from '@/lib/ipc-client';
 import { checkCrewRateLimit } from '@/lib/rate-limit';
 import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 import { publicWorkSession } from '@/lib/public-work-session';
+import { publicApplicationError } from '@/lib/application-error';
 export { publicWorkSession } from '@/lib/public-work-session';
 
 export const dynamic = 'force-dynamic';
@@ -30,22 +31,14 @@ export async function readBoundedJson(request: NextRequest): Promise<Record<stri
   return value as Record<string, unknown>;
 }
 
-function statusFor(code?: string): number {
-  if (code === 'CONTEXT_BUDGET_EXCEEDED') return 413;
-  if (code === 'NOT_FOUND' || code === 'CWD_NOT_FOUND') return 404;
-  if (code === 'CWD_NOT_DIRECTORY' || code === 'CWD_UNREADABLE') return 400;
-  if (code === 'FORBIDDEN') return 403;
-  if (code === 'CWD_LEASE_CONFLICT' || code === 'INVALID_TRANSITION' || code === 'RESUME_HANDLE_MISSING') return 409;
-  if (['REGISTRY_CORRUPT', 'RECOVERY_REQUIRED', 'MUTATION_PENDING', 'CREW_RECOVERY_REQUIRED', 'MUTATION_OUTCOME_UNKNOWN'].includes(code ?? '')) return 503;
-  if (code?.endsWith('_FAILED') || code === 'RESUME_HANDLE_UNAVAILABLE') return 500;
-  return 400;
-}
-
 export async function GET(request?: NextRequest) {
   try {
     const owner = await actor(request);
     const response = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard', data: { actor: owner } });
-    if (!response.success) throw new RouteError(response.code ?? 'LIST_FAILED', statusFor(response.code), 'Unable to list Work Sessions');
+    if (!response.success) {
+      const mapped = publicApplicationError(response.code);
+      throw new RouteError(mapped.code, mapped.status, 'Unable to list Work Sessions');
+    }
     return Response.json({ sessions: Array.isArray(response.data) ? response.data.map(publicWorkSession) : [] });
   } catch (error) {
     const route = error instanceof RouteError ? error : new RouteError('LIST_FAILED', 500, 'Unable to list Work Sessions');
@@ -67,7 +60,10 @@ export async function POST(request: NextRequest) {
       type: 'create-work-session', source: 'dashboard', mutation_id: mutationId,
       data: { display_name: body.display_name, org: body.org, harness: body.harness, requested_cwd: body.requested_cwd, model: body.model, initial_request: body.initial_request, actor: owner },
     });
-    if (!response.success) throw new RouteError(response.code ?? 'CREATE_FAILED', statusFor(response.code), 'Unable to create Work Session', mutationId);
+    if (!response.success) {
+      const mapped = publicApplicationError(response.code, 'CREATE_FAILED');
+      throw new RouteError(mapped.code, mapped.status, 'Unable to create Work Session', mutationId);
+    }
     const data = response.data as { session?: unknown };
     return Response.json({ ...data, session: publicWorkSession(data?.session) }, { status: 201 });
   } catch (error) {

@@ -3,6 +3,7 @@ import { IPCClient } from '@/lib/ipc-client';
 import { checkCrewRateLimit } from '@/lib/rate-limit';
 import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 import { publicWorkSession, readBoundedJson, RouteError } from '../route';
+import { publicApplicationError } from '@/lib/application-error';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ID = /^[a-z0-9_-]{1,128}$/;
@@ -30,12 +31,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       : undefined;
     const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type, source: 'dashboard', mutation_id: mutationId, data: { id, actor: owner, employee } });
     if (!result.success) {
-      const status = result.code === 'NOT_FOUND' ? 404
-        : result.code === 'FORBIDDEN' ? 403
-        : ['INVALID_TRANSITION', 'RESUME_HANDLE_MISSING'].includes(result.code ?? '') ? 409
-          : ['REGISTRY_CORRUPT', 'RECOVERY_REQUIRED', 'MUTATION_PENDING', 'CREW_RECOVERY_REQUIRED', 'MUTATION_OUTCOME_UNKNOWN'].includes(result.code ?? '') ? 503
-            : 400;
-      return Response.json({ error: 'Work Session operation rejected', code: result.code }, { status });
+      const mapped = publicApplicationError(result.code);
+      return Response.json({ error: 'Work Session operation rejected', code: mapped.code }, { status: mapped.status });
     }
     return Response.json({ session: publicWorkSession(result.data) });
   } catch (error) {

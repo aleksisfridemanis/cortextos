@@ -145,6 +145,16 @@ describe('Work Session routes', () => {
     expect(await response.json()).toMatchObject({ code, mutation_id: '11111111-1111-4111-8111-111111111111' });
   });
 
+  it('maps missing organizations to 404 and redacts unknown daemon codes', async () => {
+    const { POST } = await import('../route');
+    sendMock.mockResolvedValueOnce({ success: false, code: 'ORG_NOT_FOUND' } as never);
+    expect((await POST(request({ display_name: 'missing', org: 'missing', harness: 'codex-app-server', requested_cwd: root }))).status).toBe(404);
+    sendMock.mockResolvedValueOnce({ success: false, code: `CONTEXT_SOURCE_UNAVAILABLE: ${root}/secret.md` } as never);
+    const response = await POST(request({ display_name: 'redacted', org: 'platform', harness: 'codex-app-server', requested_cwd: root }));
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({ code: 'CREATE_FAILED' });
+  });
+
   it('maps a file-path cwd rejection to a client error', async () => {
     const { POST } = await import('../route');
     const file = join(root, 'not-a-directory');

@@ -24,6 +24,7 @@ import type {
 } from './types.js';
 import { composeWorkSessionContext, WORK_SESSION_CONTEXT_MAX_BYTES } from '../context/composer.js';
 import { promotionEmployeeMutationId } from './promotion.js';
+import { closedApplicationErrorCode } from '../utils/application-error.js';
 import { probeProcessIdentity } from '../utils/process-identity.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -375,7 +376,8 @@ export class WorkSessionManager {
       if ((error as Error).message.includes('CONTEXT_BUDGET_EXCEEDED')) {
         throw new WorkSessionRegistryError('CONTEXT_BUDGET_EXCEEDED', 'Work Session context exceeds the allowed budget');
       }
-      throw error;
+      const code = closedApplicationErrorCode(error, 'CONTEXT_SOURCE_UNAVAILABLE');
+      throw new WorkSessionRegistryError(code, 'Work Session context is unavailable');
     }
     const id = safeId(mutationId);
     const roomId = `work-${id.slice(3)}`;

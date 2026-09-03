@@ -10,6 +10,7 @@ import { nextFireFromCron } from './cron-scheduler.js';
 import { parseDurationMs } from '../bus/cron-state.js';
 import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
 import { createEmployee, CrewServiceError, type CreateEmployeeInput } from '../agents/create-employee.js';
+import { closedApplicationErrorCode } from '../utils/application-error.js';
 import { homedir } from 'os';
 import { applyContextOwnerDecision, getContextOwnershipReview, resolveEmployeeContextPaths } from '../context/owner-controls.js';
 import { WorkSessionRegistryError } from '../work-sessions/registry.js';
@@ -599,7 +600,7 @@ export class IPCServer {
             const session = await this.agentManager.workSessions.create(request.data as unknown as CreateWorkSessionInput, request.mutation_id);
             response = { success: true, data: { session } };
           } catch (error) {
-            const code = error instanceof WorkSessionRegistryError ? error.code : (error as Error).message;
+            const code = closedApplicationErrorCode(error, 'CREATE_FAILED');
             response = { success: false, error: 'Work Session creation failed', code };
           }
           break;
@@ -628,7 +629,7 @@ export class IPCServer {
             }
             response = { success: true, data };
           } catch (error) {
-            const code = error instanceof WorkSessionRegistryError ? error.code : (error as Error).message;
+            const code = closedApplicationErrorCode(error, 'INTERNAL_ERROR');
             response = { success: false, error: 'Work Session operation failed', code };
           }
           break;
@@ -650,7 +651,8 @@ export class IPCServer {
             const ruleId = String(request.data?.rule_id ?? 'employee-core');
             response = { success: true, data: getContextOwnershipReview(resolveEmployeeContextPaths(ctxRoot, frameworkRoot, agentName, ruleId)) };
           } catch (error) {
-            response = { success: false, error: (error as Error).message === 'EMPLOYEE_NOT_FOUND' ? 'Employee not found' : 'Context review unavailable', code: (error as Error).message };
+            const code = closedApplicationErrorCode(error, 'CONTEXT_SOURCE_UNAVAILABLE');
+            response = { success: false, error: code === 'EMPLOYEE_NOT_FOUND' ? 'Employee not found' : 'Context review unavailable', code };
           }
           break;
         }
@@ -671,7 +673,7 @@ export class IPCServer {
               mutation_id: request.mutation_id ?? '',
             }) };
           } catch (error) {
-            const code = (error as Error).message;
+            const code = closedApplicationErrorCode(error, 'INTERNAL_ERROR');
             response = { success: false, error: code === 'STALE_PROPOSAL' ? 'Context proposal changed; review again' : code === 'MUTATION_PENDING' ? 'Context decision requires recovery' : 'Context decision rejected', code };
           }
           break;
@@ -695,7 +697,7 @@ export class IPCServer {
             response = { success: true, data: result };
           } catch (error) {
             if (error instanceof CrewServiceError) {
-              response = { success: false, error: error.message, code: error.code };
+              response = { success: false, error: 'Employee creation failed', code: closedApplicationErrorCode(error, 'CREATE_FAILED') };
             } else {
               response = { success: false, error: 'Employee creation failed', code: 'CREATE_FAILED' };
             }
@@ -731,7 +733,7 @@ export class IPCServer {
               name, org, agent_dir: dir, mutation_id: mutationId,
             }) };
           } catch (error) {
-            response = { success: false, error: 'Employee runtime did not become ready', code: (error as Error).message };
+            response = { success: false, error: 'Employee runtime did not become ready', code: closedApplicationErrorCode(error, 'EMPLOYEE_START_FAILED') };
           }
           break;
         }

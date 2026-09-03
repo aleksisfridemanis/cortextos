@@ -28,7 +28,7 @@ export interface ComposeWorkSessionContextOptions {
 
 function readRequired(sourceRef: string): string {
   try { return readFileSync(sourceRef, 'utf8'); } catch {
-    throw new Error(`CONTEXT_SOURCE_UNAVAILABLE: ${sourceRef}`);
+    throw new Error('CONTEXT_SOURCE_UNAVAILABLE');
   }
 }
 

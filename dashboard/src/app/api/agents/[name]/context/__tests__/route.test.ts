@@ -58,4 +58,12 @@ describe('Employee context ownership route', () => {
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ code, mutation_id: '0a660181-a4fe-467a-a2f7-11299a7fb28a' });
   });
+
+  it('maps context source failure to 503 without echoing daemon error text', async () => {
+    mockAuth.mockResolvedValue({ user: { id: '7' } });
+    mockSend.mockResolvedValueOnce({ success: false, code: 'CONTEXT_SOURCE_UNAVAILABLE', error: '/private/host/template.md' });
+    const response = await route.GET(request('GET'), { params: Promise.resolve({ name: 'ada' }) });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ code: 'CONTEXT_SOURCE_UNAVAILABLE', error: 'Context review unavailable' });
+  });
 });

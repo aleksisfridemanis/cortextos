@@ -1,16 +1,10 @@
 import { NextRequest } from 'next/server';
 import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 import { IPCClient } from '@/lib/ipc-client';
+import { publicApplicationError } from '@/lib/application-error';
 
 export const dynamic = 'force-dynamic';
 const BODY_MAX = 131_072;
-
-function statusFor(code?: string): number {
-  if (code === 'EMPLOYEE_NOT_FOUND') return 404;
-  if (code === 'STALE_PROPOSAL' || code === 'IDEMPOTENCY_CONFLICT') return 409;
-  if (['MUTATION_PENDING', 'MUTATION_OUTCOME_UNKNOWN', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED'].includes(code ?? '')) return 503;
-  return 400;
-}
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ name: string }> }) {
   const owner = await authenticatedWorkSessionOwner(request);
@@ -21,7 +15,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     type: 'context-review',
     data: { agentName: decodeURIComponent(name), rule_id: 'employee-core', actor: owner },
   });
-  if (!response.success) return Response.json({ error: response.error ?? 'Context review unavailable', code: response.code }, { status: statusFor(response.code) });
+  if (!response.success) {
+    const mapped = publicApplicationError(response.code, 'CONTEXT_SOURCE_UNAVAILABLE');
+    return Response.json({ error: 'Context review unavailable', code: mapped.code }, { status: mapped.status });
+  }
   return Response.json(response.data);
 }
 
@@ -61,9 +58,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       replacement: body.replacement,
     },
   });
-  if (!response.success) return Response.json({
-    error: response.error ?? 'Context decision rejected', code: response.code,
+  if (!response.success) {
+    const mapped = publicApplicationError(response.code);
+    return Response.json({
+    error: 'Context decision rejected', code: mapped.code,
     mutation_id: request.headers.get('x-cortext-mutation-id') ?? '',
-  }, { status: statusFor(response.code) });
+    }, { status: mapped.status });
+  }
   return Response.json(response.data);
 }
