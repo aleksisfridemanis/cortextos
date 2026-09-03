@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, parsePersistedSendIntent, promotionMutationKey, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionIntentStorageKey, workSessionLifecycleAction } from '../crew-chat';
+import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, parsePersistedSendIntent, promotionMutationKey, restoredLifecycleActionLabel, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionIntentStorageKey, workSessionLifecycleAction } from '../crew-chat';
 import { shouldTriggerPullRefresh, resolveInitialSelection } from '../use-crew';
 import { prefetchTargets } from '../crew-roster';
 import type { RosterEntry } from '../crew-roster';
@@ -97,6 +97,10 @@ describe('Work Session message identity and delivery state', () => {
     expect(parsePersistedSendIntent(raw, 'owner:alice', 'ws-one')).toEqual(send);
     expect(parsePersistedSendIntent(raw, 'owner:bob', 'ws-one')).toBeNull();
     expect(parsePersistedSendIntent(raw, 'owner:alice', 'ws-two')).toBeNull();
+  });
+  it('keeps restored lifecycle actions explicitly actionable after lifecycle changes', () => {
+    expect(restoredLifecycleActionLabel('stop')).toBe('Resume pending stop');
+    expect(restoredLifecycleActionLabel('promote')).toBe('Resume pending promote');
   });
 });
 

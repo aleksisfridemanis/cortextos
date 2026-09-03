@@ -177,6 +177,10 @@ interface PersistedLifecycleIntent {
   employee?: Record<string, unknown>;
 }
 
+export function restoredLifecycleActionLabel(action: PersistedLifecycleIntent['action']): string {
+  return `Resume pending ${action}`;
+}
+
 export function workSessionIntentStorageKey(principal: string, target: string): string {
   return `crew:work-session-intents:v1:${encodeURIComponent(principal)}:${encodeURIComponent(target)}`;
 }
@@ -772,6 +776,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
   const terminalSendRef = useRef<PersistedSendIntent | null>(null);
   const [retryAnywayAvailable, setRetryAnywayAvailable] = useState(false);
   const [restoredIntentNotice, setRestoredIntentNotice] = useState('');
+  const [restoredLifecycleIntents, setRestoredLifecycleIntents] = useState<PersistedLifecycleIntent[]>([]);
   const pendingLifecycleRef = useRef<Map<string, PersistedLifecycleIntent>>(new Map());
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -804,6 +809,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     pendingLifecycleRef.current = new Map();
     setRetryAnywayAvailable(false);
     setRestoredIntentNotice('');
+    setRestoredLifecycleIntents([]);
     if (typeof window === 'undefined' || agent.kind !== 'work_session') return;
     try {
       const raw = sessionStorage.getItem(workSessionIntentStorageKey(user, agent.targetId));
@@ -817,6 +823,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
           pendingLifecycleRef.current.set(item.requestDigest, item);
         }
       }
+      setRestoredLifecycleIntents([...pendingLifecycleRef.current.values()]);
       if (send || pendingLifecycleRef.current.size) {
         setRestoredIntentNotice(`Restored pending operation ${send?.id ?? [...pendingLifecycleRef.current.values()][0]?.id}`);
       }
@@ -1369,9 +1376,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     }).catch(() => undefined);
   }
 
-  async function runSessionAction(action: 'stop' | 'resume' | 'promote') {
+  async function runSessionAction(action: 'stop' | 'resume' | 'promote', exactIntent?: PersistedLifecycleIntent) {
     if (agent.kind !== 'work_session') return;
-    const restoredLifecycle = [...pendingLifecycleRef.current.values()].find(item => item.action === action);
+    const restoredLifecycle = exactIntent ?? [...pendingLifecycleRef.current.values()].find(item => item.action === action);
     let employee: Record<string, unknown> | undefined = restoredLifecycle?.employee;
     if (action === 'promote') {
       if (!employee) {
@@ -1387,26 +1394,33 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     const priorLifecycle = pendingLifecycleRef.current.get(mutationKey) ?? restoredLifecycle;
     const mutationId = priorLifecycle?.id ?? crypto.randomUUID();
     pendingLifecycleRef.current.set(mutationKey, { version: 1, principal: user, target: agent.targetId, id: mutationId, action, requestDigest: mutationKey, employee });
+    setRestoredLifecycleIntents([...pendingLifecycleRef.current.values()]);
     persistIntents();
     setRestoredIntentNotice(`Pending operation ${mutationId}`);
-    const response = await fetch(`/api/work-sessions/${encodeURIComponent(agent.targetId)}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-cortext-intent': `${action}-work-session`, 'x-cortext-mutation-id': mutationId },
-      body: JSON.stringify({ action, employee }),
-    });
-    if (!response.ok) {
-      const value = await response.json().catch(() => ({}));
-      if (!['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED'].includes(value.code ?? '')) {
-        pendingLifecycleRef.current.delete(mutationKey);
-        persistIntents();
+    try {
+      const response = await fetch(`/api/work-sessions/${encodeURIComponent(agent.targetId)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-cortext-intent': `${action}-work-session`, 'x-cortext-mutation-id': mutationId },
+        body: JSON.stringify({ action, employee }),
+      });
+      if (!response.ok) {
+        const value = await response.json().catch(() => ({}));
+        if (!['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED'].includes(value.code ?? '')) {
+          pendingLifecycleRef.current.delete(mutationKey);
+          setRestoredLifecycleIntents([...pendingLifecycleRef.current.values()]);
+          persistIntents();
+        }
+        setSendError(value.error ?? 'Work Session operation failed');
+        return;
       }
-      setSendError(value.error ?? 'Work Session operation failed');
-      return;
+      pendingLifecycleRef.current.delete(mutationKey);
+      setRestoredLifecycleIntents([...pendingLifecycleRef.current.values()]);
+      persistIntents();
+      setRestoredIntentNotice('');
+      onLifecycleChanged?.();
+    } catch {
+      setSendError(`Network error; pending ${action} ${mutationId} can be resumed`);
     }
-    pendingLifecycleRef.current.delete(mutationKey);
-    persistIntents();
-    setRestoredIntentNotice('');
-    onLifecycleChanged?.();
   }
 
   async function sendVoice() {
@@ -1533,6 +1547,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       <span>{sendError || recorder.error || restoredIntentNotice}</span>
       {pendingSendRef.current && <Button type="button" size="sm" variant="outline" onClick={() => void handleSend({ resumePersisted: true })}>Resume pending</Button>}
       {retryAnywayAvailable && <Button type="button" size="sm" variant="outline" onClick={() => void handleSend({ retryAnyway: true })}>Retry anyway</Button>}
+      {restoredLifecycleIntents.map(intent => (
+        <Button key={intent.id} type="button" size="sm" variant="outline" onClick={() => void runSessionAction(intent.action, intent)}>
+          {restoredLifecycleActionLabel(intent.action)}
+        </Button>
+      ))}
     </div>
   ) : null;
 
