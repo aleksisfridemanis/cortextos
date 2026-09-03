@@ -39,13 +39,17 @@ function compareEntry(a: HostPathEntry, b: HostPathEntry): number {
   return an < bn ? -1 : an > bn ? 1 : 0;
 }
 
+export function hostPathAccessMode(kind: 'directory' | 'file'): number {
+  return kind === 'directory' ? fs.constants.R_OK | fs.constants.X_OK : fs.constants.R_OK;
+}
+
 export function browseHostDirectory(requestedPath: string, options: { limit?: number; cursor?: string; secret: string }) {
   if (!path.isAbsolute(requestedPath)) throw new Error('PATH_NOT_ABSOLUTE');
   let canonical: string;
   let stat: fs.Stats;
   try { canonical = fs.realpathSync(requestedPath); stat = fs.statSync(canonical); } catch { throw new Error('PATH_UNAVAILABLE'); }
   if (!stat.isDirectory()) throw new Error('PATH_NOT_DIRECTORY');
-  try { fs.accessSync(canonical, fs.constants.R_OK); } catch { throw new Error('PATH_UNREADABLE'); }
+  try { fs.accessSync(canonical, hostPathAccessMode('directory')); } catch { throw new Error('PATH_UNREADABLE'); }
   const limit = Math.min(200, Math.max(1, Number.isFinite(options.limit) ? Math.floor(options.limit!) : 100));
   let after: CursorPayload | null = null;
   if (options.cursor) {
@@ -58,7 +62,12 @@ export function browseHostDirectory(requestedPath: string, options: { limit?: nu
     let real: string | null = null;
     let target: fs.Stats | null = null;
     let readable = false;
-    try { real = fs.realpathSync(lexical); target = fs.statSync(real); fs.accessSync(real, fs.constants.R_OK); readable = true; } catch {}
+    try {
+      real = fs.realpathSync(lexical);
+      target = fs.statSync(real);
+      fs.accessSync(real, hostPathAccessMode(target.isDirectory() ? 'directory' : 'file'));
+      readable = true;
+    } catch {}
     const kind: HostPathEntry['kind'] = target?.isDirectory() ? 'directory' : target?.isFile() ? 'file' : 'other';
     const warning: HostPathEntry['warning'] = symlink ? (real ? 'symlink' : 'broken_symlink') : null;
     return {

@@ -1,9 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import fs, { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
-import { browseHostDirectory } from '@/lib/host-paths';
+import { browseHostDirectory, hostPathAccessMode } from '@/lib/host-paths';
 import { SignJWT } from 'jose';
 
 const authMock = vi.fn(async () => ({ user: { id: '42' } }));
@@ -234,5 +234,11 @@ describe('metadata-only host browsing', () => {
   it('requires an absolute readable directory', () => {
     expect(() => browseHostDirectory('relative', { secret: 'x' })).toThrow('PATH_NOT_ABSOLUTE');
     expect(() => browseHostDirectory(join(root, 'missing'), { secret: 'x' })).toThrow('PATH_UNAVAILABLE');
+  });
+
+  it('requires search permission for browsed directories and directory entries', () => {
+    expect(hostPathAccessMode('directory') & fs.constants.R_OK).toBe(fs.constants.R_OK);
+    expect(hostPathAccessMode('directory') & fs.constants.X_OK).toBe(fs.constants.X_OK);
+    expect(hostPathAccessMode('file')).toBe(fs.constants.R_OK);
   });
 });
