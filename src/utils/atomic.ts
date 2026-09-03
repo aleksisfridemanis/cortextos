@@ -1,4 +1,7 @@
-import { writeFileSync, renameSync, mkdirSync, existsSync, copyFileSync } from 'fs';
+import {
+  closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync,
+  renameSync, unlinkSync, writeSync,
+} from 'fs';
 import { dirname, join } from 'path';
 import { randomBytes } from 'crypto';
 
@@ -26,17 +29,19 @@ export function atomicWriteSync(filePath: string, data: string, keepBak = false)
   }
 
   const tmpPath = join(dir, `.tmp.${randomBytes(6).toString('hex')}`);
+  let fd: number | null = null;
   try {
-    writeFileSync(tmpPath, data + '\n', { encoding: 'utf-8', mode: 0o600 });
+    fd = openSync(tmpPath, 'wx', 0o600);
+    writeSync(fd, data + '\n', undefined, 'utf8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
     renameSync(tmpPath, filePath);
+    const dirFd = openSync(dir, 'r');
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   } catch (err) {
-    // Clean up temp file on failure
-    try {
-      const { unlinkSync } = require('fs');
-      unlinkSync(tmpPath);
-    } catch {
-      // Ignore cleanup errors
-    }
+    if (fd !== null) try { closeSync(fd); } catch { /* already closed */ }
+    try { unlinkSync(tmpPath); } catch { /* already absent */ }
     throw err;
   }
 }

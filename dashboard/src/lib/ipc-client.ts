@@ -75,6 +75,7 @@ export interface IPCRequest {
     | 'resume-work-session'
     | 'inject-work-session'
     | 'promote-work-session'
+    | 'start-employee-mutation'
     | 'start-agent'
     | 'stop-agent'
     | 'restart-agent'

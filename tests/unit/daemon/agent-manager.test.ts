@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildReplyContext } from '../../../src/daemon/agent-manager.js';
+import { captureProcessIdentity } from '../../../src/utils/process-identity.js';
 
 // Mock the PTY layer so we don't load native bindings or spawn real processes.
 // AgentManager → AgentProcess → AgentPTY → node-pty. We mock at AgentProcess.
@@ -72,15 +73,21 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
       mutation_id: '11111111-1111-4111-8111-111111111111',
     })).rejects.toThrow('EMPLOYEE_START_NOT_READY');
 
+    const identity = captureProcessIdentity(process.pid)!;
     vi.spyOn(am, 'getAgentStatus')
       .mockReturnValueOnce(null)
       .mockReturnValue({
-        name: 'alice', status: 'running', pid: 4242, sessionStart: '2026-09-03T00:00:00.000Z', crashCount: 0,
+        name: 'alice', status: 'running', pid: identity.pid, sessionStart: '2026-09-03T00:00:00.000Z', crashCount: 0,
       });
-    await expect(am.startEmployeeForMutation({
+    const request = {
       name: 'alice', org: 'acme', agent_dir: join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'),
       mutation_id: '22222222-2222-4222-8222-222222222222',
-    })).resolves.toMatchObject({ started: true, pid: 4242, process_started_at: '2026-09-03T00:00:00.000Z' });
+    };
+    await expect(am.startEmployeeForMutation(request)).resolves.toMatchObject({ started: true, pid: identity.pid, process_started_at: identity.started_at, disposition: 'running' });
+    const restarted = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    await expect(restarted.queryEmployeeStart(request)).resolves.toMatchObject({
+      mutation_id: request.mutation_id, pid: identity.pid, process_started_at: identity.started_at,
+    });
   });
 
   it('returns stable unresolved recovery reasons instead of declaring startup safe', async () => {

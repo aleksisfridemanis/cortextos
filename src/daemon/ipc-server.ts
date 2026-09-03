@@ -717,6 +717,25 @@ export class IPCServer {
           };
           break;
 
+        case 'start-employee-mutation': {
+          const mutationId = request.mutation_id ?? '';
+          const name = request.agent ?? '';
+          const dir = String(request.data?.dir ?? '');
+          const org = String(request.data?.org ?? '');
+          if (!mutationId || !name || !dir || !org) {
+            response = { success: false, error: 'Employee start request is incomplete', code: 'INVALID_INPUT' };
+            break;
+          }
+          try {
+            response = { success: true, data: await this.agentManager.startEmployeeForMutation({
+              name, org, agent_dir: dir, mutation_id: mutationId,
+            }) };
+          } catch (error) {
+            response = { success: false, error: 'Employee runtime did not become ready', code: (error as Error).message };
+          }
+          break;
+        }
+
         case 'start-agent':
           if (!request.agent) {
             response = { success: false, error: 'Agent name required', code: 'INVALID_INPUT' };

@@ -17,7 +17,6 @@ import {
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
-import { execFileSync } from 'child_process';
 import {
   appendCrewLifecycleAuditEvent,
   digestCrewAuditValue,
@@ -27,6 +26,7 @@ import {
 } from './crew-lifecycle-audit.js';
 import { withFileLockSync } from '../utils/lock.js';
 import { readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession } from '../work-sessions/registry.js';
+import { captureProcessIdentity, probeProcessIdentity } from '../utils/process-identity.js';
 
 export type CrewMutationStage =
   | 'prepared'
@@ -82,25 +82,8 @@ export type PrepareCrewMutationInput = Pick<CrewMutationJournalEntry,
 
 const MUTATION_LEASE_MS = 30_000;
 
-function processStartedAt(pid: number): string | null {
-  try {
-    const value = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
-      encoding: 'utf8', timeout: 1_000, stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    return value || null;
-  } catch { return null; }
-}
-
-function processExists(pid: number): boolean | null {
-  try { process.kill(pid, 0); return true; } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
-    if ((error as NodeJS.ErrnoException).code === 'EPERM') return true;
-    return null;
-  }
-}
-
 function mutationLease(now = Date.now()): NonNullable<CrewMutationJournalEntry['lease']> {
-  const identity = processStartedAt(process.pid);
+  const identity = captureProcessIdentity(process.pid)?.started_at;
   if (!identity) throw new Error('Crew mutation process identity is unavailable');
   return {
     owner_pid: process.pid,
@@ -112,11 +95,9 @@ function mutationLease(now = Date.now()): NonNullable<CrewMutationJournalEntry['
 function heldByAnotherLiveProcess(entry: CrewMutationJournalEntry): boolean {
   const lease = entry.lease;
   if (!lease) return false;
-  const exists = processExists(lease.owner_pid);
-  if (exists === false) return false;
-  const observed = processStartedAt(lease.owner_pid);
-  if (observed === lease.owner_process_started_at) return lease.owner_pid !== process.pid;
-  if (observed === null && Date.parse(lease.expires_at) > Date.now()) return lease.owner_pid !== process.pid;
+  const state = probeProcessIdentity({ pid: lease.owner_pid, started_at: lease.owner_process_started_at });
+  if (state === 'alive') return lease.owner_pid !== process.pid;
+  if (state === 'unknown') return lease.owner_pid !== process.pid;
   return false;
 }
 
@@ -216,6 +197,12 @@ export function prepareCrewMutation(
     const existing = entries.find(item => item.mutation_id === input.mutation_id);
     if (existing) {
       if (!sameBinding(existing, input)) throw new Error('Crew mutation idempotency conflict');
+      if (heldByAnotherLiveProcess(existing)) throw new Error('MUTATION_PENDING');
+      if (existing.stage !== 'finalized') {
+        existing.lease = mutationLease();
+        existing.updated_at = now();
+        durableWrite(journalPath(ctxRoot), entries);
+      }
       return { entry: existing, reused: true };
     }
     const timestamp = now();
@@ -258,6 +245,8 @@ function updateEntry(
   return locked(ctxRoot, entries => {
     const entry = entries.find(item => item.mutation_id === mutationId);
     if (!entry) throw new Error(`Unknown Crew mutation ${mutationId}`);
+    if (heldByAnotherLiveProcess(entry)) throw new Error('MUTATION_PENDING');
+    if (entry.stage !== 'finalized') entry.lease = mutationLease();
     update(entry);
     entry.updated_at = new Date().toISOString();
     if (entry.stage === 'finalized') delete entry.lease;
@@ -266,6 +255,10 @@ function updateEntry(
     durableWrite(journalPath(ctxRoot), entries);
     return entry;
   });
+}
+
+export function claimCrewMutationLease(ctxRoot: string, mutationId: string): CrewMutationJournalEntry {
+  return updateEntry(ctxRoot, mutationId, () => {});
 }
 
 export function getCrewMutation(ctxRoot: string, mutationId: string): CrewMutationJournalEntry | null {
@@ -381,9 +374,31 @@ function certifyEmployeeCreate(
     if (entry.stage === 'prepared') commitCrewMutationState(ctxRoot, entry.mutation_id, entry.intended_after_digest);
     if (entry.stage !== 'effect_recorded') return 'pending';
     const receipt = entry.effect_receipt;
-    if (receipt?.mutation_id !== entry.mutation_id || typeof receipt.started !== 'boolean'
-      || receipt.receipt_digest !== digestCrewAuditValue({ mutation_id: entry.mutation_id, started: receipt.started })) return null;
-    return { result: 'success', after_digest: entry.intended_after_digest };
+    const canonical = {
+      mutation_id: receipt?.mutation_id,
+      name: receipt?.name,
+      started: receipt?.started,
+      pid: receipt?.pid,
+      process_started_at: receipt?.process_started_at,
+      disposition: receipt?.disposition,
+    };
+    if (receipt?.mutation_id !== entry.mutation_id || receipt.name !== entry.target.id
+      || receipt.receipt_digest !== digestCrewAuditValue(canonical)) return null;
+    if (receipt.started === true && receipt.disposition === 'running'
+      && Number.isSafeInteger(receipt.pid) && typeof receipt.process_started_at === 'string') {
+      if (probeProcessIdentity({ pid: receipt.pid as number, started_at: receipt.process_started_at }) !== 'alive') return 'pending';
+      return { result: 'success', after_digest: entry.intended_after_digest };
+    }
+    if (receipt.started === false && receipt.disposition === 'configured'
+      && receipt.pid === null && receipt.process_started_at === null) {
+      return { result: 'indeterminate', after_digest: entry.intended_after_digest, error_code: 'EMPLOYEE_NOT_STARTED', sanitized_error: 'Employee configured but runtime not started' };
+    }
+    if (receipt.started === false && receipt.disposition === 'exited'
+      && Number.isSafeInteger(receipt.pid) && typeof receipt.process_started_at === 'string'
+      && probeProcessIdentity({ pid: receipt.pid as number, started_at: receipt.process_started_at }) === 'dead') {
+      return { result: 'failure', after_digest: entry.intended_after_digest, error_code: 'EMPLOYEE_RUNTIME_EXITED', sanitized_error: 'Employee runtime exited before recovery' };
+    }
+    return null;
   } catch { return null; }
 }
 

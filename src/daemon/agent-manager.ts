@@ -33,6 +33,8 @@ import {
 } from '../agents/create-employee.js';
 import { listPendingCrewMutations, readCrewMutationJournal, reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
 import { promotionEmployeeMutationId } from '../work-sessions/promotion.js';
+import { atomicWriteSync } from '../utils/atomic.js';
+import { captureProcessIdentity, probeProcessIdentity } from '../utils/process-identity.js';
 
 type LogFn = (msg: string) => void;
 
@@ -119,7 +121,7 @@ export class AgentManager {
   // idempotent no-op path, and have its start SWALLOWED — so callers MUST keep
   // stop-before-start ordering for coordinated restarts.
   private stoppingAgents: Set<string> = new Set();
-  private employeeStartReceipts = new Map<string, EmployeeStartReceipt & { name: string }>();
+  private employeeStartReceipts = new Map<string, EmployeeStartReceipt>();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -230,35 +232,69 @@ export class AgentManager {
   }
 
   async startEmployeeForMutation(request: EmployeeStartRequest): Promise<EmployeeStartReceipt> {
-    const prior = this.employeeStartReceipts.get(request.mutation_id);
+    const prior = await this.queryEmployeeStart(request);
     if (prior) {
       if (prior.name !== request.name) throw new Error('IDEMPOTENCY_CONFLICT');
       return prior;
     }
     const before = this.getAgentStatus(request.name);
     if (before?.status === 'running') throw new Error('EMPLOYEE_START_OWNERSHIP_UNCONFIRMED');
-    await this.startAgent(request.name, request.agent_dir, undefined, request.org);
+    let spawnedReceipt: EmployeeStartReceipt | null = null;
+    await this.startAgent(request.name, request.agent_dir, undefined, request.org, pid => {
+      const identity = captureProcessIdentity(pid);
+      if (!identity || probeProcessIdentity(identity) !== 'alive') throw new Error('EMPLOYEE_START_NOT_READY');
+      spawnedReceipt = {
+        mutation_id: request.mutation_id,
+        name: request.name,
+        started: true,
+        pid: identity.pid,
+        process_started_at: identity.started_at,
+        disposition: 'running',
+      };
+      atomicWriteSync(this.employeeReceiptPath(request.mutation_id), JSON.stringify(spawnedReceipt, null, 2));
+    });
+    if (spawnedReceipt) {
+      this.employeeStartReceipts.set(request.mutation_id, spawnedReceipt);
+      return spawnedReceipt;
+    }
     const status = this.getAgentStatus(request.name);
-    if (status?.status !== 'running' || !status.pid || !status.sessionStart) {
+    if (status?.status !== 'running' || !status.pid) {
       throw new Error('EMPLOYEE_START_NOT_READY');
     }
+    const identity = captureProcessIdentity(status.pid);
+    if (!identity || probeProcessIdentity(identity) !== 'alive') throw new Error('EMPLOYEE_START_NOT_READY');
     const receipt = {
       mutation_id: request.mutation_id,
-      started: true,
-      pid: status.pid,
-      process_started_at: status.sessionStart,
       name: request.name,
+      started: true,
+      pid: identity.pid,
+      process_started_at: identity.started_at,
+      disposition: 'running',
     } as const;
+    atomicWriteSync(this.employeeReceiptPath(request.mutation_id), JSON.stringify(receipt, null, 2));
     this.employeeStartReceipts.set(request.mutation_id, receipt);
     return receipt;
   }
 
   async queryEmployeeStart(request: EmployeeStartRequest): Promise<EmployeeStartReceipt | null> {
-    const receipt = this.employeeStartReceipts.get(request.mutation_id);
-    if (!receipt || receipt.name !== request.name) return null;
+    let receipt = this.employeeStartReceipts.get(request.mutation_id);
+    if (!receipt) {
+      try { receipt = JSON.parse(readFileSync(this.employeeReceiptPath(request.mutation_id), 'utf8')) as EmployeeStartReceipt; } catch { return null; }
+    }
+    if (!receipt) return null;
+    if (receipt.name !== request.name) throw new Error('IDEMPOTENCY_CONFLICT');
+    if (!receipt.started || receipt.disposition !== 'running' || !receipt.pid || !receipt.process_started_at) return null;
+    const processState = probeProcessIdentity({ pid: receipt.pid, started_at: receipt.process_started_at });
+    if (processState === 'dead') return { ...receipt, started: false, disposition: 'exited' };
+    if (processState !== 'alive') return null;
     const status = this.getAgentStatus(request.name);
-    if (status?.status !== 'running' || status.pid !== receipt.pid || status.sessionStart !== receipt.process_started_at) return null;
+    if (status?.status === 'running' && status.pid !== receipt.pid) return null;
+    this.employeeStartReceipts.set(request.mutation_id, receipt);
     return receipt;
+  }
+
+  private employeeReceiptPath(mutationId: string): string {
+    return join(this.ctxRoot, 'state', 'employee-start-receipts', `${mutationId}.json`);
   }
 
   /**
@@ -487,7 +523,13 @@ export class AgentManager {
     return { ok: true };
   }
 
-  async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
+  async startAgent(
+    name: string,
+    agentDir: string,
+    config?: AgentConfig,
+    org?: string,
+    onRuntimeReady?: (pid: number) => void | Promise<void>,
+  ): Promise<void> {
     if (this.agents.has(name)) {
       // BUG-031: this branch was the workaround for the BUG-011 PTY race
       // (restart-all could send stop+start simultaneously, and the new
@@ -786,7 +828,7 @@ export class AgentManager {
     this.agents.set(name, ownEntry);
 
     // Start agent
-    await agentProcess.start();
+    await agentProcess.start(onRuntimeReady);
 
     // Subtask 2.2: Auto-migrate crons from config.json → crons.json before
     // starting the scheduler, so the scheduler always has a populated crons.json

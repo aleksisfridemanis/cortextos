@@ -20,6 +20,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve } from 'path';
 import { homedir } from 'os';
 import {
+  claimCrewMutationLease,
   commitCrewMutationState,
   finalizeCrewMutationAudit,
   getCrewMutation,
@@ -35,6 +36,7 @@ import { validateAgentName, validateOrgName } from '../utils/validate.js';
 import { withFileLockSync } from '../utils/lock.js';
 import type { Room } from '../types/index.js';
 import { promotionEmployeeMutationId } from '../work-sessions/promotion.js';
+import { probeProcessIdentity } from '../utils/process-identity.js';
 
 export const CREW_BODY_MAX_BYTES = 131_072;
 export const CREW_NAME_MAX_CHARS = 64;
@@ -65,7 +67,7 @@ export interface EmployeeRegistryRecord {
 }
 
 export interface CreateEmployeeResult {
-  status: 'created';
+  status: 'created' | 'configured';
   employee: EmployeeRegistryRecord & { name: string };
   audit: 'finalized';
 }
@@ -79,9 +81,11 @@ export interface EmployeeStartRequest {
 
 export interface EmployeeStartReceipt {
   mutation_id: string;
+  name: string;
   started: boolean;
-  pid?: number;
-  process_started_at?: string;
+  pid: number | null;
+  process_started_at: string | null;
+  disposition: 'running' | 'configured' | 'exited';
 }
 
 export interface CreateEmployeeDependencies {
@@ -251,23 +255,51 @@ async function defaultStart(instanceId: string, request: EmployeeStartRequest): 
   const { IPCClient } = await import('../daemon/ipc-server.js');
   const ipc = new IPCClient(instanceId);
   const response = await ipc.send({
-    type: 'start-agent',
+    type: 'start-employee-mutation',
     agent: request.name,
     source: 'create-employee',
     mutation_id: request.mutation_id,
-    data: { dir: request.agent_dir, mutation_id: request.mutation_id },
+    data: { dir: request.agent_dir, org: request.org, mutation_id: request.mutation_id },
   });
   if (!response.success) {
     if (response.error?.includes('Daemon is not running')) {
-      return { mutation_id: request.mutation_id, started: false };
+      return { mutation_id: request.mutation_id, name: request.name, started: false, pid: null, process_started_at: null, disposition: 'configured' };
     }
     throw new Error(response.code ?? 'DAEMON_START_FAILED');
   }
-  return { mutation_id: request.mutation_id, started: true };
+  return response.data as EmployeeStartReceipt;
 }
 
-function resultFromRegistry(name: string, record: EmployeeRegistryRecord): CreateEmployeeResult {
-  return { status: 'created', employee: { name, ...record }, audit: 'finalized' };
+function resultFromRegistry(name: string, record: EmployeeRegistryRecord, started = true): CreateEmployeeResult {
+  return { status: started ? 'created' : 'configured', employee: { name, ...record }, audit: 'finalized' };
+}
+
+export function employeeStartReceiptDigest(receipt: EmployeeStartReceipt): string {
+  return digestCrewAuditValue({
+    mutation_id: receipt.mutation_id,
+    name: receipt.name,
+    started: receipt.started,
+    pid: receipt.pid,
+    process_started_at: receipt.process_started_at,
+    disposition: receipt.disposition,
+  });
+}
+
+function validateStartReceipt(receipt: EmployeeStartReceipt, request: EmployeeStartRequest): void {
+  const identityMatches = receipt.started
+    && receipt.disposition === 'running'
+    && Number.isSafeInteger(receipt.pid) && (receipt.pid ?? 0) > 0
+    && typeof receipt.process_started_at === 'string' && receipt.process_started_at.length > 0
+    && probeProcessIdentity({ pid: receipt.pid!, started_at: receipt.process_started_at! }) === 'alive';
+  const configured = !receipt.started && receipt.disposition === 'configured'
+    && receipt.pid === null && receipt.process_started_at === null;
+  const exited = !receipt.started && receipt.disposition === 'exited'
+    && Number.isSafeInteger(receipt.pid) && (receipt.pid ?? 0) > 0
+    && typeof receipt.process_started_at === 'string'
+    && probeProcessIdentity({ pid: receipt.pid!, started_at: receipt.process_started_at }) === 'dead';
+  if (receipt.mutation_id !== request.mutation_id || receipt.name !== request.name || (!identityMatches && !configured && !exited)) {
+    throw new Error('Invalid daemon mutation receipt');
+  }
 }
 
 export function createEmployee(
@@ -383,9 +415,21 @@ async function createEmployeeInternal(
     if (!sameRequest) {
       throw new CrewServiceError('IDEMPOTENCY_CONFLICT', 409, 'Mutation id is already bound to another request');
     }
+    if (priorMutation.stage !== 'finalized') {
+      try { claimCrewMutationLease(ctxRoot, mutationId); } catch (error) {
+        if ((error as Error).message === 'MUTATION_PENDING') {
+          throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation is owned by another live process');
+        }
+        throw error;
+      }
+    }
     if (priorMutation.stage === 'finalized' && priorMutation.final_result?.result === 'success') {
       const existing = readObject(enabledPath)[input.name];
       if (existing?.mutation_id === mutationId) return resultFromRegistry(input.name, existing);
+    }
+    if (priorMutation.stage === 'finalized' && priorMutation.final_result?.error_code === 'EMPLOYEE_NOT_STARTED') {
+      const existing = readObject(enabledPath)[input.name];
+      if (existing?.mutation_id === mutationId) return resultFromRegistry(input.name, existing, false);
     }
     if (['state_committed', 'effect_started', 'effect_recorded', 'audit_written'].includes(priorMutation.stage)) {
       const existing = readObject(enabledPath)[input.name];
@@ -414,16 +458,22 @@ async function createEmployeeInternal(
       } else {
         receipt = await dependencies.queryEmployeeStart?.(startRequest) ?? null;
       }
-      if (!receipt || receipt.mutation_id !== mutationId || typeof receipt.started !== 'boolean') {
+      if (!receipt) {
+        throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee start recovery returned an invalid receipt');
+      }
+      try { validateStartReceipt(receipt, startRequest); } catch {
         throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee start recovery returned an invalid receipt');
       }
       recordCrewMutationEffect(ctxRoot, mutationId, {
-        mutation_id: receipt.mutation_id,
-        started: receipt.started,
-        receipt_digest: digestCrewAuditValue(receipt),
+        ...receipt,
+        receipt_digest: employeeStartReceiptDigest(receipt),
       });
-      finalizeCrewMutationAudit(ctxRoot, mutationId, { result: 'success', after_digest: priorMutation.intended_after_digest });
-      return resultFromRegistry(input.name, existing);
+      finalizeCrewMutationAudit(ctxRoot, mutationId, receipt.started
+        ? { result: 'success', after_digest: priorMutation.intended_after_digest }
+        : receipt.disposition === 'exited'
+          ? { result: 'failure', after_digest: priorMutation.intended_after_digest, error_code: 'EMPLOYEE_RUNTIME_EXITED', sanitized_error: 'Employee runtime exited before recovery' }
+          : { result: 'indeterminate', after_digest: priorMutation.intended_after_digest, error_code: 'EMPLOYEE_NOT_STARTED', sanitized_error: 'Employee configured but runtime not started' });
+      return resultFromRegistry(input.name, existing, receipt.started);
     }
     throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
   }
@@ -591,18 +641,22 @@ async function createEmployeeInternal(
       agent_dir: finalDir,
       mutation_id: mutationId,
     });
-    if (receipt.mutation_id !== mutationId || typeof receipt.started !== 'boolean') throw new Error('Invalid daemon mutation receipt');
+    validateStartReceipt(receipt, { name: input.name, org: input.org, agent_dir: finalDir, mutation_id: mutationId });
     recordCrewMutationEffect(ctxRoot, mutationId, {
-      mutation_id: receipt.mutation_id,
-      started: receipt.started,
-      receipt_digest: digestCrewAuditValue(receipt),
+      ...receipt,
+      receipt_digest: employeeStartReceiptDigest(receipt),
     });
     if (dependencies.failAt === 'after-effect') throw new Error('injected after effect');
-    finalizeCrewMutationAudit(ctxRoot, mutationId, {
-      result: 'success',
-      after_digest: intendedAfterDigest,
+    finalizeCrewMutationAudit(ctxRoot, mutationId, receipt.started ? {
+      result: 'success', after_digest: intendedAfterDigest,
+    } : receipt.disposition === 'exited' ? {
+      result: 'failure', after_digest: intendedAfterDigest,
+      error_code: 'EMPLOYEE_RUNTIME_EXITED', sanitized_error: 'Employee runtime exited before recovery',
+    } : {
+      result: 'indeterminate', after_digest: intendedAfterDigest,
+      error_code: 'EMPLOYEE_NOT_STARTED', sanitized_error: 'Employee configured but runtime not started',
     }, { failAfterAppend: dependencies.failAt === 'after-audit' });
-    return resultFromRegistry(input.name, record);
+    return resultFromRegistry(input.name, record, receipt.started);
   } catch (error) {
     if (!stateCommitted && publicationRestored) {
       rmSync(stageDir, { recursive: true, force: true });

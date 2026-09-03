@@ -9,12 +9,14 @@ import {
   createEmployee,
   type CreateEmployeeDependencies,
 } from '../../../src/agents/create-employee.js';
+import { captureProcessIdentity } from '../../../src/utils/process-identity.js';
 
 function writeJson(path: string, value: unknown): void {
   writeFileSync(path, JSON.stringify(value, null, 2), { mode: 0o600 });
 }
 
 describe('createEmployee', () => {
+  const testProcess = captureProcessIdentity(process.pid)!;
   let root: string;
   let frameworkRoot: string;
   let ctxRoot: string;
@@ -42,7 +44,7 @@ describe('createEmployee', () => {
         const registry = JSON.parse(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8'));
         expect(registry[receipt.name]?.mutation_id).toBe(receipt.mutation_id);
         started.push(receipt.mutation_id);
-        return { mutation_id: receipt.mutation_id, started: true };
+        return { mutation_id: receipt.mutation_id, name: receipt.name, started: true, pid: testProcess.pid, process_started_at: testProcess.started_at, disposition: 'running' };
       },
     };
   });
@@ -137,7 +139,7 @@ describe('createEmployee', () => {
     dependencies.failAt = undefined;
     await expect(createEmployee(input, mutationId, dependencies)).rejects.toMatchObject({ code: 'MUTATION_PENDING' });
     expect(started).toEqual([]);
-    dependencies.queryEmployeeStart = async request => ({ mutation_id: request.mutation_id, started: true, pid: 42, process_started_at: '2026-09-03T00:00:01Z' });
+    dependencies.queryEmployeeStart = async request => ({ mutation_id: request.mutation_id, name: request.name, started: true, pid: testProcess.pid, process_started_at: testProcess.started_at, disposition: 'running' });
     await expect(createEmployee(input, mutationId, dependencies)).resolves.toMatchObject({ status: 'created' });
     expect(started).toEqual([]);
     const journal = JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'));
@@ -150,7 +152,7 @@ describe('createEmployee', () => {
     let release!: () => void;
     dependencies.startEmployee = request => new Promise(resolve => {
       started.push(request.mutation_id);
-      release = () => resolve({ mutation_id: request.mutation_id, started: true });
+      release = () => resolve({ mutation_id: request.mutation_id, name: request.name, started: true, pid: testProcess.pid, process_started_at: testProcess.started_at, disposition: 'running' });
     });
     const first = createEmployee(input, mutationId, dependencies);
     const joined = createEmployee(input, mutationId, dependencies);
@@ -160,6 +162,31 @@ describe('createEmployee', () => {
     await vi.waitFor(() => expect(started).toEqual([mutationId]));
     release();
     await expect(first).resolves.toMatchObject({ status: 'created' });
+  });
+
+  it('certifies the canonical full readiness receipt after a post-effect crash', async () => {
+    const mutationId = 'b7ee842e-b948-4cbb-a4e6-e80c6847dc85';
+    dependencies.failAt = 'after-effect';
+    await expect(createEmployee({
+      name: 'ada', org: 'platform', runtime: 'claude-code', telegram_polling: false, actor: 'owner:test',
+    }, mutationId, dependencies)).rejects.toMatchObject({ code: 'MUTATION_PENDING' });
+    expect(JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'))[0])
+      .toMatchObject({ stage: 'effect_recorded', effect_receipt: { name: 'ada', pid: testProcess.pid, disposition: 'running' } });
+    const { reconcileCrewMutationJournal } = await import('../../../src/audit/crew-mutation-journal.js');
+    expect(reconcileCrewMutationJournal(ctxRoot, { frameworkRoot })).toEqual({ finalized: 1, pending: 0 });
+  });
+
+  it('records an offline start as configured and never audits it as started success', async () => {
+    dependencies.startEmployee = async request => ({
+      mutation_id: request.mutation_id, name: request.name, started: false,
+      pid: null, process_started_at: null, disposition: 'configured',
+    });
+    const result = await createEmployee({
+      name: 'offline', org: 'platform', runtime: 'claude-code', telegram_polling: false, actor: 'owner:test',
+    }, 'c7ee842e-b948-4cbb-a4e6-e80c6847dc85', dependencies);
+    expect(result.status).toBe('configured');
+    expect(JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'))[0])
+      .toMatchObject({ stage: 'finalized', final_result: { result: 'indeterminate', error_code: 'EMPLOYEE_NOT_STARTED' } });
   });
 
   it('exports the exact request ceilings', () => {

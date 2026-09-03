@@ -120,7 +120,7 @@ export class AgentProcess {
   /**
    * Start the agent. Spawns Claude Code in a PTY.
    */
-  async start(): Promise<void> {
+  async start(onRuntimeReady?: (pid: number) => void | Promise<void>): Promise<void> {
     if (this.status === 'running') {
       this.log('Already running');
       return;
@@ -227,6 +227,16 @@ export class AgentProcess {
         this.releasePendingHandoffClaim();
         this.log('PTY exited during spawn — handleExit will recover');
         return;
+      }
+      if (onRuntimeReady) {
+        try {
+          const pid = this.pty.getPid();
+          if (!pid) throw new Error('EMPLOYEE_START_NOT_READY');
+          await onRuntimeReady(pid);
+        } catch (error) {
+          await this.stop();
+          throw error;
+        }
       }
       if (this.pendingHandoffClaim) {
         acknowledgeContextHandoff(this.env.ctxRoot, this.name, this.pendingHandoffClaim.token);

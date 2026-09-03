@@ -132,6 +132,7 @@ describe('Crew mutation journal', () => {
       expect(String(chunk)).toContain('ready');
       expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 0, pending: 1 });
       expect(getCrewMutation(root, mutationId)?.stage).toBe('prepared');
+      expect(() => commitCrewMutationState(root, mutationId, '4'.repeat(64))).toThrow('MUTATION_PENDING');
     } finally {
       child.kill('SIGTERM');
       if (child.exitCode === null && child.signalCode === null) {
