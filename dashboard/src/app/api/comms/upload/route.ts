@@ -154,6 +154,9 @@ function uploadLeasePath(uploadDir: string, filename: string): string {
   return path.join(uploadDir, `.upload-lease-${filename.slice(0, 36)}.json`);
 }
 
+const UPLOAD_FILENAME_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})-[A-Za-z0-9_-]{1,50}\.(?:jpg|png|gif|webp)$/i;
+const UPLOAD_LEASE_PATTERN = /^\.upload-lease-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/i;
+
 function durableReferenceExists(ctxRoot: string, url: string): boolean {
   const scan = (root: string): boolean => {
     let entries: fs.Dirent[];
@@ -175,14 +178,22 @@ export function sweepStaleUploads(uploadDir: string, ctxRoot: string, now = Date
   let names: string[];
   try { names = fs.readdirSync(uploadDir); } catch { return removed; }
   for (const name of names) {
-    if (!/^\.upload-lease-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i.test(name)) continue;
+    const leaseNameMatch = name.match(UPLOAD_LEASE_PATTERN);
+    if (!leaseNameMatch) continue;
     const leasePath = path.join(uploadDir, name);
     try {
       const lease = JSON.parse(fs.readFileSync(leasePath, 'utf8')) as { version?: unknown; filename?: unknown; url?: unknown; expires_at?: unknown };
+      const filenameMatch = typeof lease.filename === 'string' ? lease.filename.match(UPLOAD_FILENAME_PATTERN) : null;
+      const expiry = typeof lease.expires_at === 'string' ? Date.parse(lease.expires_at) : Number.NaN;
       if (lease.version !== 1 || typeof lease.filename !== 'string' || typeof lease.url !== 'string'
-        || typeof lease.expires_at !== 'string' || Date.parse(lease.expires_at) > now) continue;
+        || !filenameMatch || filenameMatch[1].toLowerCase() !== leaseNameMatch[1].toLowerCase()
+        || lease.url !== `/api/media/media/dashboard-uploads/${lease.filename}`
+        || !Number.isFinite(expiry) || expiry > now) continue;
+      const resolvedUploadDir = path.resolve(uploadDir);
+      const target = path.resolve(resolvedUploadDir, lease.filename);
+      if (!target.startsWith(`${resolvedUploadDir}${path.sep}`)) continue;
       if (!durableReferenceExists(ctxRoot, lease.url)) {
-        try { fs.unlinkSync(path.join(uploadDir, lease.filename)); removed += 1; } catch { /* already absent */ }
+        try { fs.unlinkSync(target); removed += 1; } catch { /* already absent */ }
       }
       fs.unlinkSync(leasePath);
     } catch { /* corrupt leases remain fail-closed for operator recovery */ }

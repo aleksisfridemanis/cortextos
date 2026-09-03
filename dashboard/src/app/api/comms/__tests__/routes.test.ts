@@ -681,6 +681,29 @@ describe('POST /api/comms/upload', () => {
     expect(fs.existsSync(path.join(rootTmp, second.path))).toBe(true);
   });
 
+  it('leaves malformed upload leases untouched and cannot traverse outside the upload directory', async () => {
+    const uploaded = await (await upload.POST(uploadRequest(new File(['one'], 'one.png', { type: 'image/png' })))).json();
+    const dir = path.join(rootTmp, 'media', 'dashboard-uploads');
+    const uuid = uploaded.filename.slice(0, 36);
+    const leasePath = path.join(dir, `.upload-lease-${uuid}.json`);
+    const original = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
+    const outside = path.join(rootTmp, 'must-remain.txt');
+    fs.writeFileSync(outside, 'keep');
+
+    for (const corrupt of [
+      { ...original, filename: `../${path.basename(outside)}` },
+      { ...original, filename: `11111111-1111-4111-8111-111111111111-one.png` },
+      { ...original, url: '/api/media/media/dashboard-uploads/not-the-file.png' },
+      { ...original, expires_at: 'not-a-date' },
+    ]) {
+      fs.writeFileSync(leasePath, JSON.stringify(corrupt));
+      expect(upload.sweepStaleUploads(dir, rootTmp, Date.now() + 2 * 60 * 60 * 1000)).toBe(0);
+      expect(fs.existsSync(leasePath)).toBe(true);
+      expect(fs.existsSync(outside)).toBe(true);
+      expect(fs.existsSync(path.join(rootTmp, uploaded.path))).toBe(true);
+    }
+  });
+
   it('sweeps only old validated upload temp identities', () => {
     const dir = path.join(rootTmp, 'media', 'dashboard-uploads');
     fs.mkdirSync(dir, { recursive: true });
