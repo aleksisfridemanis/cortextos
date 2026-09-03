@@ -10,7 +10,7 @@ type Action = 'stop' | 'resume' | 'promote';
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const owner = await authenticatedWorkSessionOwner();
+    const owner = await authenticatedWorkSessionOwner(request);
     if (!owner) return Response.json({ error: 'Authentication required', code: 'UNAUTHENTICATED' }, { status: 401 });
     const rate = checkCrewRateLimit(owner, 'lifecycle');
     if (!rate.allowed) return Response.json({ error: 'Rate limit exceeded', code: 'RATE_LIMITED' }, { status: 429, headers: { 'Retry-After': String(rate.retryAfter ?? 60) } });
@@ -33,7 +33,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       const status = result.code === 'NOT_FOUND' ? 404
         : result.code === 'FORBIDDEN' ? 403
         : ['INVALID_TRANSITION', 'RESUME_HANDLE_MISSING'].includes(result.code ?? '') ? 409
-          : ['REGISTRY_CORRUPT', 'RECOVERY_REQUIRED', 'MUTATION_PENDING'].includes(result.code ?? '') ? 503
+          : ['REGISTRY_CORRUPT', 'RECOVERY_REQUIRED', 'MUTATION_PENDING', 'CREW_RECOVERY_REQUIRED', 'MUTATION_OUTCOME_UNKNOWN'].includes(result.code ?? '') ? 503
             : 400;
       return Response.json({ error: 'Work Session operation rejected', code: result.code }, { status });
     }

@@ -5,8 +5,8 @@
 
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
-import { jwtVerify } from 'jose';
 import { getToken } from 'next-auth/jwt';
+import { verifiedBearerUserId } from '@/lib/request-principal';
 
 // Allowed CORS origins - localhost dev + configured deployment URL + mobile app
 // Built once at module load: env-derived origins are validated via `new URL()`,
@@ -154,13 +154,7 @@ export async function middleware(request: NextRequest) {
         res.headers.set('Vary', 'Origin');
         return res;
       }
-      try {
-        const secret = new TextEncoder().encode(authSecret);
-        await jwtVerify(token, secret);
-        hasBearerToken = true;
-      } catch {
-        hasBearerToken = false;
-      }
+      hasBearerToken = (await verifiedBearerUserId(request)) !== null;
     }
   }
 

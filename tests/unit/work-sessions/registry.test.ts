@@ -73,4 +73,15 @@ describe('Work Session registry', () => {
     writeFileSync(join(ctxRoot, 'config', 'work-sessions.json'), '{');
     expect(() => readWorkSessions(ctxRoot)).toThrow(WorkSessionRegistryError);
   });
+
+  it('rejects a regular file before creating a cwd lease', () => {
+    const { root, ctxRoot } = fixture();
+    const file = join(root, 'not-a-directory');
+    writeFileSync(file, 'private');
+    expect(() => createWorkSessionRecord(ctxRoot, {
+      id: 'ws-file', display_name: 'File', org: 'platform', harness: 'codex-app-server', requested_cwd: file,
+      room_id: 'room-file', mutation_id: '99999999-9999-4999-8999-999999999999', created_by: 'owner:test',
+    })).toThrowError(expect.objectContaining({ code: 'CWD_NOT_DIRECTORY' }));
+    expect(readWorkSessions(ctxRoot)).toEqual([]);
+  });
 });

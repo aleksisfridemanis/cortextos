@@ -4,6 +4,7 @@ import { join } from 'path';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 import { browseHostDirectory } from '@/lib/host-paths';
+import { SignJWT } from 'jose';
 
 const authMock = vi.fn(async () => ({ user: { id: '42' } }));
 const sendMock = vi.fn(async () => ({ success: true, data: { session: { id: 'ws-one' } } }));
@@ -13,6 +14,7 @@ vi.mock('@/lib/rate-limit', () => ({ checkCrewRateLimit: () => ({ allowed: true 
 
 const root = mkdtempSync(join(tmpdir(), 'cortext-browse-route-'));
 process.env.CTX_ROOT = root;
+process.env.AUTH_SECRET = 'route-test-secret-route-test-secret';
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 function request(body: unknown, headers: Record<string, string> = {}) {
@@ -71,6 +73,14 @@ describe('Work Session routes', () => {
     }));
   });
 
+  it('derives the same owner from a verified Bearer subject', async () => {
+    const token = await new SignJWT({}).setProtectedHeader({ alg: 'HS256' }).setSubject('mobile-7')
+      .sign(new TextEncoder().encode(process.env.AUTH_SECRET));
+    const { GET } = await import('../route');
+    expect((await GET(new NextRequest('http://localhost/api/work-sessions', { headers: { authorization: `Bearer ${token}` } }))).status).toBe(200);
+    expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({ data: { actor: 'owner:mobile-7' } }));
+  });
+
   it('rejects unauthenticated and oversized create requests', async () => {
     const { POST } = await import('../route');
     authMock.mockResolvedValueOnce(null as never);
@@ -103,6 +113,22 @@ describe('Work Session routes', () => {
     expect(await response.json()).toMatchObject({ code });
   });
 
+  it.each(['MUTATION_PENDING', 'CREW_RECOVERY_REQUIRED', 'MUTATION_OUTCOME_UNKNOWN'])('maps %s create recovery to 503', async code => {
+    const { POST } = await import('../route');
+    sendMock.mockResolvedValueOnce({ success: false, code } as never);
+    expect((await POST(request({ display_name: 'x', org: 'platform', harness: 'codex-app-server', requested_cwd: root }))).status).toBe(503);
+  });
+
+  it('maps a file-path cwd rejection to a client error', async () => {
+    const { POST } = await import('../route');
+    const file = join(root, 'not-a-directory');
+    writeFileSync(file, 'private');
+    sendMock.mockResolvedValueOnce({ success: false, code: 'CWD_NOT_DIRECTORY' } as never);
+    const response = await POST(request({ display_name: 'x', org: 'platform', harness: 'codex-app-server', requested_cwd: file }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'CWD_NOT_DIRECTORY' });
+  });
+
   it('maps cross-owner lifecycle rejection to 403', async () => {
     const { POST } = await import('../[id]/route');
     sendMock.mockResolvedValueOnce({ success: false, code: 'FORBIDDEN' } as never);
@@ -114,6 +140,14 @@ describe('Work Session routes', () => {
 });
 
 describe('Work Session message route', () => {
+  it.each([null, [], 'text', 42, true])('rejects JSON primitive %j as a client error', async value => {
+    const { POST } = await import('../../messages/send/route');
+    const response = await POST(new NextRequest('http://localhost/api/messages/send', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value),
+    }));
+    expect(response.status).toBe(400);
+  });
+
   it('accepts 65,536 UTF-8 bytes, rejects 65,537, and surfaces archived conflict', async () => {
     const { POST } = await import('../../messages/send/route');
     const send = (text: string) => new NextRequest('http://localhost/api/messages/send', {

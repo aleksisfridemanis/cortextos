@@ -113,6 +113,10 @@ function getIpcPath(instanceId: string = 'default'): string {
   return join(homedir(), '.cortextos', instanceId, 'daemon.sock');
 }
 
+export function ipcRequestDeadline(request: IPCRequest): number {
+  return request.mutation_id ? 70_000 : 5_000;
+}
+
 export class IPCClient {
   private socketPath: string;
 
@@ -120,7 +124,7 @@ export class IPCClient {
     this.socketPath = getIpcPath(instanceId);
   }
 
-  async send(request: IPCRequest): Promise<IPCResponse> {
+  async send(request: IPCRequest, timeoutMs?: number): Promise<IPCResponse> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.socketPath, () => {
         socket.write(JSON.stringify(request));
@@ -150,9 +154,15 @@ export class IPCClient {
         }
       });
 
-      socket.setTimeout(5000, () => {
+      const deadline = timeoutMs ?? ipcRequestDeadline(request);
+      socket.setTimeout(deadline, () => {
+        resolve({
+          success: false,
+          error: 'Mutation outcome is not yet known; retry with the same mutation id',
+          code: request.mutation_id ? 'MUTATION_OUTCOME_UNKNOWN' : 'IPC_TIMEOUT',
+          ...(request.mutation_id ? { data: { mutation_id: request.mutation_id } } : {}),
+        });
         socket.destroy();
-        reject(new Error('IPC request timed out'));
       });
     });
   }

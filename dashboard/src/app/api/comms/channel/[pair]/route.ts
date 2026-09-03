@@ -4,6 +4,7 @@ import path from 'path';
 import { getCTXRoot } from '@/lib/config';
 import { resolveIdentity, buildPairKey } from '@/lib/comms-identity';
 import { readRoomLog } from '@/lib/rooms';
+import { authenticatedWorkSessionOwner, ownsWorkSessionRoom } from '@/lib/work-session-owner';
 
 export const dynamic = 'force-dynamic';
 
@@ -25,6 +26,7 @@ interface BusMessage {
   media_type?: string;
   /** Path to the recorded audio, for voice messages sent from the dashboard. */
   local_file?: string;
+  delivery_state?: 'pending' | 'delivered' | 'indeterminate';
 }
 
 /**
@@ -80,6 +82,13 @@ export async function GET(
   if (requestedRoomId !== null && (!/^work-[a-z0-9-]{1,123}$/.test(requestedRoomId) || pair !== `room--${requestedRoomId}`)) {
     return Response.json({ error: 'Invalid Work Session room' }, { status: 400 });
   }
+  if (requestedRoomId !== null) {
+    const principal = await authenticatedWorkSessionOwner(request);
+    if (!principal) return Response.json({ error: 'Authentication required' }, { status: 401 });
+    if (!ownsWorkSessionRoom(ctxRoot, requestedRoomId, principal)) {
+      return Response.json({ error: 'Work Session room not found' }, { status: 404 });
+    }
+  }
 
   // Resolve user identity so inbound and outbound Telegram messages
   // land in the same channel as bus messages for the same conversation.
@@ -103,6 +112,7 @@ export async function GET(
       reply_to: msg.reply_to,
       thread_id: msg.thread_id,
       ...(msg.kind ? { kind: msg.kind } : {}),
+      ...(msg.delivery_state ? { delivery_state: msg.delivery_state } : {}),
     };
     byId.set(msg.id, rendered);
     messages.push(rendered);

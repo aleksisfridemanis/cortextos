@@ -59,8 +59,8 @@ const DEFAULT_TAGLINES: Record<string, string> = {
  * version. Disabled agents are omitted: a companion you cannot wake is
  * just confusing on this surface.
  */
-export async function GET() {
-  const owner = await authenticatedWorkSessionOwner();
+export async function GET(request?: Request) {
+  const owner = await authenticatedWorkSessionOwner(request);
   if (!owner) return Response.json({ error: 'Authentication required', code: 'UNAUTHENTICATED' }, { status: 401 });
   const ctxRoot = getCTXRoot();
   const identity = resolveIdentity(ctxRoot);

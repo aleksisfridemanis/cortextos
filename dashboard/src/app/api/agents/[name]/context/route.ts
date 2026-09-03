@@ -1,14 +1,9 @@
 import { NextRequest } from 'next/server';
-import { auth } from '@/lib/auth';
+import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 import { IPCClient } from '@/lib/ipc-client';
 
 export const dynamic = 'force-dynamic';
 const BODY_MAX = 131_072;
-
-async function actor(): Promise<string | null> {
-  const session = await auth();
-  return session?.user?.id ? `owner:${session.user.id}` : null;
-}
 
 function statusFor(code?: string): number {
   if (code === 'EMPLOYEE_NOT_FOUND') return 404;
@@ -17,8 +12,8 @@ function statusFor(code?: string): number {
   return 400;
 }
 
-export async function GET(_request: NextRequest, { params }: { params: Promise<{ name: string }> }) {
-  const owner = await actor();
+export async function GET(request: NextRequest, { params }: { params: Promise<{ name: string }> }) {
+  const owner = await authenticatedWorkSessionOwner(request);
   if (!owner) return Response.json({ error: 'Authentication required' }, { status: 401 });
   const { name } = await params;
   const ipc = new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default');
@@ -31,7 +26,7 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
 }
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ name: string }> }) {
-  const owner = await actor();
+  const owner = await authenticatedWorkSessionOwner(request);
   if (!owner) return Response.json({ error: 'Authentication required' }, { status: 401 });
   if (request.headers.get('x-cortext-intent') !== 'context-owner-decision') {
     return Response.json({ error: 'Invalid context decision intent' }, { status: 400 });

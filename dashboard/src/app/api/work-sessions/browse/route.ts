@@ -1,14 +1,13 @@
 import { NextRequest } from 'next/server';
-import { auth } from '@/lib/auth';
+import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 import { browseHostDirectory } from '@/lib/host-paths';
 import { checkCrewRateLimit } from '@/lib/rate-limit';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET(request: NextRequest) {
-  const session = await auth();
-  if (!session?.user?.id) return Response.json({ error: 'Authentication required', code: 'UNAUTHENTICATED' }, { status: 401 });
-  const actor = `owner:${session.user.id}`;
+  const actor = await authenticatedWorkSessionOwner(request);
+  if (!actor) return Response.json({ error: 'Authentication required', code: 'UNAUTHENTICATED' }, { status: 401 });
   const rate = checkCrewRateLimit(actor, 'browse');
   if (!rate.allowed) return Response.json({ error: 'Rate limit exceeded', code: 'RATE_LIMITED' }, { status: 429, headers: { 'Retry-After': String(rate.retryAfter ?? 60) } });
   const secret = process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET;

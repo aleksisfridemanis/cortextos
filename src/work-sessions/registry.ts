@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import {
-  chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync,
-  realpathSync, renameSync, unlinkSync, writeSync,
+  accessSync, chmodSync, closeSync, constants, existsSync, fsyncSync, mkdirSync, openSync, readFileSync,
+  realpathSync, renameSync, statSync, unlinkSync, writeSync,
 } from 'fs';
 import { dirname, isAbsolute, join } from 'path';
 import { withFileLockSync } from '../utils/lock.js';
@@ -94,6 +94,12 @@ export function createWorkSessionRecord(
   try { canonical = realpathSync(input.requested_cwd); } catch {
     throw new WorkSessionRegistryError('CWD_NOT_FOUND', 'Working directory does not exist');
   }
+  if (!statSync(canonical).isDirectory()) {
+    throw new WorkSessionRegistryError('CWD_NOT_DIRECTORY', 'Working directory must be a directory');
+  }
+  try { accessSync(canonical, constants.R_OK | constants.X_OK); } catch {
+    throw new WorkSessionRegistryError('CWD_UNREADABLE', 'Working directory is not readable and searchable');
+  }
   return locked(ctxRoot, records => {
     const sameMutation = records.find(row => row.mutation_id === input.mutation_id);
     if (sameMutation) {
@@ -135,6 +141,19 @@ export function transitionWorkSession(
     if (!record) throw new WorkSessionRegistryError('NOT_FOUND', 'Work Session not found');
     if (!from.includes(record.lifecycle)) throw new WorkSessionRegistryError('INVALID_TRANSITION', `Cannot transition Work Session from ${record.lifecycle}`);
     Object.assign(record, patch, { lifecycle: to, mutation_id: mutationId, updated_at: new Date().toISOString() });
+    assertRecord(record);
+    durableWrite(ctxRoot, records);
+    return record;
+  });
+}
+
+/** Persist a recovery diagnostic without changing lifecycle mutation ownership. */
+export function updateWorkSessionError(ctxRoot: string, id: string, lastError: string): WorkSessionRecord {
+  return locked(ctxRoot, records => {
+    const record = records.find(row => row.id === id);
+    if (!record) throw new WorkSessionRegistryError('NOT_FOUND', 'Work Session not found');
+    record.last_error = lastError;
+    record.updated_at = new Date().toISOString();
     assertRecord(record);
     durableWrite(ctxRoot, records);
     return record;

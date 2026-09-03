@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { auth } from '@/lib/auth';
+import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 import { getAllAgents } from '@/lib/config';
 import { getHeartbeat, getHealthStatus } from '@/lib/data/heartbeats';
 import { IPCClient } from '@/lib/ipc-client';
@@ -56,9 +56,8 @@ export async function POST(request: NextRequest) {
     if (request.headers.get('x-cortext-intent') !== 'create-employee') {
       throw new RouteError('INVALID_INTENT', 400, 'Invalid Employee creation intent');
     }
-    const session = await auth();
-    if (!session?.user?.id) throw new RouteError('UNAUTHENTICATED', 401, 'Authentication required');
-    const actor = `owner:${session.user.id}`;
+    const actor = await authenticatedWorkSessionOwner(request);
+    if (!actor) throw new RouteError('UNAUTHENTICATED', 401, 'Authentication required');
     const rate = checkCrewRateLimit(actor, 'lifecycle');
     if (!rate.allowed) {
       return Response.json(

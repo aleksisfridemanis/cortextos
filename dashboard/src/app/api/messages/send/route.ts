@@ -28,19 +28,23 @@ export const dynamic = 'force-dynamic';
  */
 const REPLY_TO_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 export async function POST(request: NextRequest) {
-  let body: Record<string, unknown>;
+  let parsed: unknown;
   try {
     const declared = Number(request.headers.get('content-length') ?? 0);
     if (Number.isFinite(declared) && declared > 131_072) return Response.json({ error: 'Request body is too large' }, { status: 413 });
     const bytes = new Uint8Array(await request.arrayBuffer());
     if (bytes.byteLength > 131_072) return Response.json({ error: 'Request body is too large' }, { status: 413 });
-    body = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(bytes));
+    parsed = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(bytes));
   } catch {
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return Response.json({ error: 'Request body must be an object' }, { status: 400 });
+  }
+  const body = parsed as Record<string, unknown>;
 
   if (body.target_kind === 'work_session') {
-    const actor = await authenticatedWorkSessionOwner();
+    const actor = await authenticatedWorkSessionOwner(request);
     if (!actor) return Response.json({ error: 'Authentication required' }, { status: 401 });
     const rate = checkCrewRateLimit(actor, 'message');
     if (!rate.allowed) return Response.json({ error: 'Rate limit exceeded' }, { status: 429, headers: { 'Retry-After': String(rate.retryAfter ?? 60) } });
@@ -58,7 +62,8 @@ export async function POST(request: NextRequest) {
       data: { id, text, actor },
     });
     if (!result.success) {
-      const status = result.code === 'NOT_FOUND' ? 404 : result.code === 'FORBIDDEN' ? 403 : result.code === 'INVALID_TRANSITION' ? 409 : result.code === 'REGISTRY_CORRUPT' ? 503 : 500;
+      const status = result.code === 'NOT_FOUND' ? 404 : result.code === 'FORBIDDEN' ? 403 : result.code === 'INVALID_TRANSITION' ? 409
+        : ['REGISTRY_CORRUPT', 'RECOVERY_REQUIRED', 'MUTATION_PENDING', 'CREW_RECOVERY_REQUIRED', 'MUTATION_OUTCOME_UNKNOWN', 'DELIVERY_RETRY_REQUIRED'].includes(result.code ?? '') ? 503 : 500;
       return Response.json({ error: status === 409 ? 'Resume the Work Session before sending' : 'Unable to send Work Session message', code: result.code }, { status });
     }
     return Response.json({ success: true, messageId: mutationId }, { status: 200 });
