@@ -31,7 +31,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       : undefined;
     const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type, source: 'dashboard', mutation_id: mutationId, data: { id, actor: owner, employee } });
     if (!result.success) {
-      const status = result.code === 'NOT_FOUND' ? 404 : ['INVALID_TRANSITION', 'RESUME_HANDLE_MISSING'].includes(result.code ?? '') ? 409 : result.code === 'REGISTRY_CORRUPT' ? 503 : 400;
+      const status = result.code === 'NOT_FOUND' ? 404
+        : ['INVALID_TRANSITION', 'RESUME_HANDLE_MISSING'].includes(result.code ?? '') ? 409
+          : ['REGISTRY_CORRUPT', 'RECOVERY_REQUIRED', 'MUTATION_PENDING'].includes(result.code ?? '') ? 503
+            : 400;
       return Response.json({ error: 'Work Session operation rejected', code: result.code }, { status });
     }
     return Response.json({ session: publicWorkSession(result.data) });

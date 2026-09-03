@@ -84,6 +84,16 @@ describe('Work Session routes', () => {
     });
     expect((await POST(oversized, { params: Promise.resolve({ id: 'ws-one' }) })).status).toBe(413);
   });
+
+  it.each(['RECOVERY_REQUIRED', 'MUTATION_PENDING'])('maps %s lifecycle recovery to 503', async code => {
+    const { POST } = await import('../[id]/route');
+    sendMock.mockResolvedValueOnce({ success: false, code } as never);
+    const response = await POST(request({ action: 'resume' }, {
+      'x-cortext-intent': 'resume-work-session',
+    }), { params: Promise.resolve({ id: 'ws-one' }) });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code });
+  });
 });
 
 describe('Work Session message route', () => {
