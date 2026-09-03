@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -107,6 +107,25 @@ describe('createEmployee', () => {
     expect(JSON.parse(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8'))).toEqual({});
     expect(() => readFileSync(join(frameworkRoot, 'orgs', 'platform', 'agents', 'ada'), 'utf8')).toThrow();
   });
+
+  it.each(['after-directory-publish', 'after-enabled-write'] as const)(
+    'compensates every published artifact when failure occurs %s',
+    async failAt => {
+      dependencies.failAt = failAt;
+      const mutationId = failAt === 'after-directory-publish'
+        ? '77ee842e-b948-4cbb-a4e6-e80c6847dc85'
+        : '87ee842e-b948-4cbb-a4e6-e80c6847dc85';
+      await expect(createEmployee({
+        name: 'ada', org: 'platform', runtime: 'claude-code', telegram_polling: false, actor: 'owner:test',
+      }, mutationId, dependencies)).rejects.toMatchObject({ code: 'CREATE_FAILED' });
+      expect(JSON.parse(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8'))).toEqual({});
+      expect(JSON.parse(readFileSync(join(ctxRoot, 'config', 'rooms.json'), 'utf8'))).toEqual([]);
+      expect(existsSync(join(frameworkRoot, 'orgs', 'platform', 'agents', 'ada'))).toBe(false);
+      const journal = JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'));
+      expect(journal[0]).toMatchObject({ stage: 'finalized', final_result: { result: 'failure' } });
+      expect(journal[0].final_result.after_digest).toBe(journal[0].before_digest);
+    },
+  );
 
   it('exports the exact request ceilings', () => {
     expect(CREW_BODY_MAX_BYTES).toBe(131_072);

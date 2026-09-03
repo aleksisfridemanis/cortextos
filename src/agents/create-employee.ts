@@ -86,7 +86,7 @@ export interface CreateEmployeeDependencies {
   instanceId?: string;
   now?: () => string;
   startEmployee?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt>;
-  failAt?: 'before-state-commit' | 'after-state-commit' | 'after-effect' | 'after-audit';
+  failAt?: 'before-state-commit' | 'after-directory-publish' | 'after-enabled-write' | 'after-state-commit' | 'after-effect' | 'after-audit';
 }
 
 export class CrewServiceError extends Error {
@@ -334,6 +334,7 @@ export async function createEmployee(
   const finalDir = join(agentsDir, input.name);
   const stageDir = join(agentsDir, `.creating-${input.name}-${mutationId}`);
   let stateCommitted = false;
+  let publicationRestored = true;
   let hostSkillLinks: string[] = [];
   try {
     if (existsSync(finalDir)) throw new CrewServiceError('CONFLICT', 409, 'Employee already exists');
@@ -376,22 +377,48 @@ export async function createEmployee(
       if (matchingRoom && (matchingRoom.kind !== 'agent' || matchingRoom.agent !== input.name)) {
         throw new CrewServiceError('ROOM_CONFLICT', 409, 'Room identifier is already in use');
       }
-      renameSync(stageDir, finalDir);
-      registry[input.name] = record;
-      if (!matchingRoom) {
-        rooms.push({
-          id: roomId,
-          kind: 'agent',
-          title: input.name,
-          members: [input.name],
-          agent: input.name,
-          created_at: record.created_at,
-          created_by: input.actor,
-          mutation_id: mutationId,
-        });
+      const registryBefore = structuredClone(registry);
+      const roomsBefore = structuredClone(rooms);
+      let directoryPublished = false;
+      let enabledWriteAttempted = false;
+      let roomsWriteAttempted = false;
+      try {
+        renameSync(stageDir, finalDir);
+        directoryPublished = true;
+        publicationRestored = false;
+        if (dependencies.failAt === 'after-directory-publish') throw new Error('injected after directory publish');
+        registry[input.name] = record;
+        if (!matchingRoom) {
+          rooms.push({
+            id: roomId,
+            kind: 'agent',
+            title: input.name,
+            members: [input.name],
+            agent: input.name,
+            created_at: record.created_at,
+            created_by: input.actor,
+            mutation_id: mutationId,
+          });
+        }
+        enabledWriteAttempted = true;
+        durableWriteJson(enabledPath, registry);
+        if (dependencies.failAt === 'after-enabled-write') throw new Error('injected after enabled registry write');
+        roomsWriteAttempted = true;
+        durableWriteJson(roomsPath, rooms);
+      } catch (publicationError) {
+        let compensationError: unknown = null;
+        try {
+          if (roomsWriteAttempted) durableWriteJson(roomsPath, roomsBefore);
+          if (enabledWriteAttempted) durableWriteJson(enabledPath, registryBefore);
+          if (directoryPublished && existsSync(finalDir)) rmSync(finalDir, { recursive: true, force: true });
+          publicationRestored = true;
+        } catch (error) {
+          compensationError = error;
+          publicationRestored = false;
+        }
+        if (compensationError) throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee publication requires recovery');
+        throw publicationError;
       }
-      durableWriteJson(enabledPath, registry);
-      durableWriteJson(roomsPath, rooms);
     });
     stateCommitted = true;
     commitCrewMutationState(ctxRoot, mutationId, intendedAfterDigest);
@@ -416,7 +443,7 @@ export async function createEmployee(
     }, { failAfterAppend: dependencies.failAt === 'after-audit' });
     return resultFromRegistry(input.name, record);
   } catch (error) {
-    if (!stateCommitted) {
+    if (!stateCommitted && publicationRestored) {
       rmSync(stageDir, { recursive: true, force: true });
       for (const link of hostSkillLinks) {
         try { unlinkSync(link); } catch { /* best effort */ }
