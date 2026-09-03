@@ -156,6 +156,43 @@ export function shouldRetainMutationId(code?: string): boolean {
   return ['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED'].includes(code ?? '');
 }
 
+export interface PersistedSendIntent {
+  version: 1;
+  principal: string;
+  target: string;
+  id: string;
+  intentKey: string;
+  requestDigest: string;
+  messageText: string;
+  state: 'pending' | 'terminal';
+}
+
+interface PersistedLifecycleIntent {
+  version: 1;
+  principal: string;
+  target: string;
+  id: string;
+  action: 'stop' | 'resume' | 'promote';
+  requestDigest: string;
+  employee?: Record<string, unknown>;
+}
+
+export function workSessionIntentStorageKey(principal: string, target: string): string {
+  return `crew:work-session-intents:v1:${encodeURIComponent(principal)}:${encodeURIComponent(target)}`;
+}
+
+export function parsePersistedSendIntent(raw: string | null, principal: string, target: string): PersistedSendIntent | null {
+  if (!raw) return null;
+  try {
+    const envelope = JSON.parse(raw) as { send?: PersistedSendIntent };
+    const value = envelope.send;
+    return value?.version === 1 && value.principal === principal && value.target === target
+      && typeof value.id === 'string' && typeof value.intentKey === 'string'
+      && typeof value.requestDigest === 'string' && typeof value.messageText === 'string'
+      && ['pending', 'terminal'].includes(value.state) ? value : null;
+  } catch { return null; }
+}
+
 /**
  * The clipboard payload for a message — the whole message text block. Pure —
  * exported for its own unit test.
@@ -731,10 +768,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const recorder = useVoiceRecorder();
   const sendingRef = useRef(false);
-  const pendingSendRef = useRef<{ id: string; target: string; intentKey: string; messageText: string } | null>(null);
-  const terminalSendRef = useRef<{ target: string; intentKey: string; messageText: string } | null>(null);
+  const pendingSendRef = useRef<PersistedSendIntent | null>(null);
+  const terminalSendRef = useRef<PersistedSendIntent | null>(null);
   const [retryAnywayAvailable, setRetryAnywayAvailable] = useState(false);
-  const pendingLifecycleRef = useRef<Map<string, string>>(new Map());
+  const [restoredIntentNotice, setRestoredIntentNotice] = useState('');
+  const pendingLifecycleRef = useRef<Map<string, PersistedLifecycleIntent>>(new Map());
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const forceScrollRef = useRef(true);
@@ -748,6 +786,42 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
   const skipDraftPersistRef = useRef(false);
 
   const typing = mood === 'typing';
+
+  const persistIntents = useCallback(() => {
+    if (typeof window === 'undefined' || agent.kind !== 'work_session') return;
+    const key = workSessionIntentStorageKey(user, agent.targetId);
+    const send = pendingSendRef.current ?? terminalSendRef.current;
+    const lifecycle = [...pendingLifecycleRef.current.values()];
+    try {
+      if (!send && lifecycle.length === 0) sessionStorage.removeItem(key);
+      else sessionStorage.setItem(key, JSON.stringify({ version: 1, principal: user, target: agent.targetId, send, lifecycle }));
+    } catch { /* storage unavailable */ }
+  }, [agent.kind, agent.targetId, user]);
+
+  useEffect(() => {
+    pendingSendRef.current = null;
+    terminalSendRef.current = null;
+    pendingLifecycleRef.current = new Map();
+    setRetryAnywayAvailable(false);
+    setRestoredIntentNotice('');
+    if (typeof window === 'undefined' || agent.kind !== 'work_session') return;
+    try {
+      const raw = sessionStorage.getItem(workSessionIntentStorageKey(user, agent.targetId));
+      const send = parsePersistedSendIntent(raw, user, agent.targetId);
+      const envelope = raw ? JSON.parse(raw) as { lifecycle?: PersistedLifecycleIntent[] } : {};
+      if (send?.state === 'pending') pendingSendRef.current = send;
+      if (send?.state === 'terminal') { terminalSendRef.current = send; setRetryAnywayAvailable(true); }
+      for (const item of envelope.lifecycle ?? []) {
+        if (item?.version === 1 && item.principal === user && item.target === agent.targetId
+          && typeof item.id === 'string' && typeof item.requestDigest === 'string') {
+          pendingLifecycleRef.current.set(item.requestDigest, item);
+        }
+      }
+      if (send || pendingLifecycleRef.current.size) {
+        setRestoredIntentNotice(`Restored pending operation ${send?.id ?? [...pendingLifecycleRef.current.values()][0]?.id}`);
+      }
+    } catch { /* malformed or unavailable storage fails closed */ }
+  }, [agent.kind, agent.targetId, user]);
 
   const statusText = agent.kind === 'work_session'
     ? `Work Session · ${agent.lifecycle ?? 'archived'}`
@@ -1156,22 +1230,27 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     }
   }
 
-  async function handleSend(options: { retryAnyway?: boolean } = {}) {
+  async function handleSend(options: { retryAnyway?: boolean; resumePersisted?: boolean } = {}) {
     if (sendingRef.current) return;
-    if (!draft.trim() && attachments.length === 0) return;
+    if (!draft.trim() && attachments.length === 0 && !options.retryAnyway && !options.resumePersisted) return;
     sendingRef.current = true;
     setSending(true);
     setSendError('');
     try {
       const target = agent.targetId;
-      const intentKey = sendIntentKey(target, draft.trim(), attachments.map(item => item.file));
+      const restored = pendingSendRef.current ?? terminalSendRef.current;
+      const intentKey = options.resumePersisted || options.retryAnyway
+        ? restored?.intentKey ?? sendIntentKey(target, draft.trim(), attachments.map(item => item.file))
+        : sendIntentKey(target, draft.trim(), attachments.map(item => item.file));
       const terminal = terminalSendRef.current;
       if (agent.kind === 'work_session' && terminal?.target === target
         && terminal.intentKey === intentKey && !options.retryAnyway) {
         setSendError('Delivery is unknown. Choose Retry anyway to create a new send intent.');
         return;
       }
-      const reusableMessageText = pendingSendRef.current?.target === target && pendingSendRef.current.intentKey === intentKey
+      const reusableMessageText = (options.resumePersisted || options.retryAnyway) && restored?.target === target
+        ? restored.messageText
+        : pendingSendRef.current?.target === target && pendingSendRef.current.intentKey === intentKey
         ? pendingSendRef.current.messageText
         : options.retryAnyway && terminal?.target === target && terminal.intentKey === intentKey
           ? terminal.messageText
@@ -1180,7 +1259,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         terminalSendRef.current = null;
         pendingSendRef.current = null;
         setRetryAnywayAvailable(false);
+        persistIntents();
       }
+      const preassignedMutationId = agent.kind === 'work_session'
+        ? retainedSendMutationId(pendingSendRef.current, target, intentKey, () => crypto.randomUUID())
+        : null;
       let messageText = reusableMessageText ?? draft.trim();
       const uploaded: Array<{ url: string; cleanup_token?: string }> = [];
       if (attachments.length > 0 && reusableMessageText === null) {
@@ -1203,11 +1286,14 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         }
         messageText = buildMessageText(messageText, urls);
       }
-      const pending = pendingSendRef.current;
-      const mutationId = agent.kind === 'work_session'
-        ? retainedSendMutationId(pending, target, intentKey, () => crypto.randomUUID())
-        : null;
-      if (mutationId) pendingSendRef.current = { id: mutationId, target, intentKey, messageText };
+      const requestDigest = JSON.stringify({ target, text: messageText, reply_to: replyTarget?.id ?? null });
+      const mutationId = preassignedMutationId;
+      if (mutationId) {
+        pendingSendRef.current = { version: 1, principal: user, id: mutationId, target, intentKey, requestDigest, messageText, state: 'pending' };
+        terminalSendRef.current = null;
+        persistIntents();
+        setRestoredIntentNotice(`Pending operation ${mutationId}`);
+      }
       const res = await fetch('/api/messages/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(mutationId ? { 'x-cortext-mutation-id': mutationId } : {}) },
@@ -1223,6 +1309,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         pendingSendRef.current = null;
         terminalSendRef.current = null;
         setRetryAnywayAvailable(false);
+        persistIntents();
+        setRestoredIntentNotice('');
         const sent = await res.json().catch(() => ({}));
         const realId = sent.messageId ?? `local-${Date.now()}`;
         localIdsRef.current.add(realId);
@@ -1255,12 +1343,13 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         const data = await res.json().catch(() => ({}));
         if (data.code === 'DELIVERY_RETRY_REQUIRED') {
           pendingSendRef.current = null;
-          terminalSendRef.current = { target, intentKey, messageText };
+          terminalSendRef.current = { version: 1, principal: user, id: mutationId!, target, intentKey, requestDigest, messageText, state: 'terminal' };
           setRetryAnywayAvailable(true);
         } else if (!shouldRetainMutationId(data.code)) {
           pendingSendRef.current = null;
           if (uploaded.length > 0) void cleanupUploads(uploaded);
         }
+        persistIntents();
         setSendError(data.error || 'Failed to send');
       }
     } catch {
@@ -1282,18 +1371,24 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
 
   async function runSessionAction(action: 'stop' | 'resume' | 'promote') {
     if (agent.kind !== 'work_session') return;
-    let employee: Record<string, unknown> | undefined;
+    const restoredLifecycle = [...pendingLifecycleRef.current.values()].find(item => item.action === action);
+    let employee: Record<string, unknown> | undefined = restoredLifecycle?.employee;
     if (action === 'promote') {
-      const name = window.prompt('Employee name');
-      const org = name ? window.prompt('Organization') : null;
-      if (!name || !org) return;
-      employee = { name, org, runtime: agent.harness, model: undefined };
+      if (!employee) {
+        const name = window.prompt('Employee name');
+        const org = name ? window.prompt('Organization') : null;
+        if (!name || !org) return;
+        employee = { name, org, runtime: agent.harness, model: undefined };
+      }
     }
     const mutationKey = action === 'promote' && employee
       ? promotionMutationKey(agent.targetId, employee)
       : `${agent.targetId}:${action}`;
-    const mutationId = pendingLifecycleRef.current.get(mutationKey) ?? crypto.randomUUID();
-    pendingLifecycleRef.current.set(mutationKey, mutationId);
+    const priorLifecycle = pendingLifecycleRef.current.get(mutationKey) ?? restoredLifecycle;
+    const mutationId = priorLifecycle?.id ?? crypto.randomUUID();
+    pendingLifecycleRef.current.set(mutationKey, { version: 1, principal: user, target: agent.targetId, id: mutationId, action, requestDigest: mutationKey, employee });
+    persistIntents();
+    setRestoredIntentNotice(`Pending operation ${mutationId}`);
     const response = await fetch(`/api/work-sessions/${encodeURIComponent(agent.targetId)}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-cortext-intent': `${action}-work-session`, 'x-cortext-mutation-id': mutationId },
@@ -1303,11 +1398,14 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       const value = await response.json().catch(() => ({}));
       if (!['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED'].includes(value.code ?? '')) {
         pendingLifecycleRef.current.delete(mutationKey);
+        persistIntents();
       }
       setSendError(value.error ?? 'Work Session operation failed');
       return;
     }
     pendingLifecycleRef.current.delete(mutationKey);
+    persistIntents();
+    setRestoredIntentNotice('');
     onLifecycleChanged?.();
   }
 
@@ -1430,9 +1528,10 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     />
   );
 
-  const errorLine = (sendError || recorder.error) ? (
+  const errorLine = (sendError || recorder.error || restoredIntentNotice) ? (
     <div className="mb-1 flex items-center gap-2 px-1 text-xs text-destructive">
-      <span>{sendError || recorder.error}</span>
+      <span>{sendError || recorder.error || restoredIntentNotice}</span>
+      {pendingSendRef.current && <Button type="button" size="sm" variant="outline" onClick={() => void handleSend({ resumePersisted: true })}>Resume pending</Button>}
       {retryAnywayAvailable && <Button type="button" size="sm" variant="outline" onClick={() => void handleSend({ retryAnyway: true })}>Retry anyway</Button>}
     </div>
   ) : null;

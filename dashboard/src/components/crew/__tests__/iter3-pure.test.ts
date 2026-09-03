@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, promotionMutationKey, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionLifecycleAction } from '../crew-chat';
+import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, parsePersistedSendIntent, promotionMutationKey, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionIntentStorageKey, workSessionLifecycleAction } from '../crew-chat';
 import { shouldTriggerPullRefresh, resolveInitialSelection } from '../use-crew';
 import { prefetchTargets } from '../crew-roster';
 import type { RosterEntry } from '../crew-roster';
@@ -84,6 +84,19 @@ describe('Work Session message identity and delivery state', () => {
   it('includes the exact promotion Employee payload in the lifecycle binding', () => {
     expect(promotionMutationKey('ws-stable', { name: 'ada', org: 'platform', runtime: 'claude-code' }))
       .not.toBe(promotionMutationKey('ws-stable', { name: 'grace', org: 'platform', runtime: 'claude-code' }));
+  });
+  it('scopes persisted mutation state to the authenticated principal and target', () => {
+    expect(workSessionIntentStorageKey('owner:alice', 'ws-one')).not.toBe(workSessionIntentStorageKey('owner:bob', 'ws-one'));
+    expect(workSessionIntentStorageKey('owner:alice', 'ws-one')).not.toBe(workSessionIntentStorageKey('owner:alice', 'ws-two'));
+    const send = {
+      version: 1 as const, principal: 'owner:alice', target: 'ws-one', id: 'mutation-one',
+      intentKey: 'pre-upload-binding', requestDigest: JSON.stringify({ text: '/api/media/exact-opaque.png' }),
+      messageText: 'inspect\n/api/media/exact-opaque.png', state: 'pending' as const,
+    };
+    const raw = JSON.stringify({ send });
+    expect(parsePersistedSendIntent(raw, 'owner:alice', 'ws-one')).toEqual(send);
+    expect(parsePersistedSendIntent(raw, 'owner:bob', 'ws-one')).toBeNull();
+    expect(parsePersistedSendIntent(raw, 'owner:alice', 'ws-two')).toBeNull();
   });
 });
 
