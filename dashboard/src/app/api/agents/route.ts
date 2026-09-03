@@ -67,8 +67,9 @@ export async function POST(request: NextRequest) {
       );
     }
     const body = await readBoundedJson(request);
-    if (Object.prototype.hasOwnProperty.call(body, 'actor')) {
-      throw new RouteError('FORGED_ACTOR', 400, 'Actor is server-derived');
+    if (Object.prototype.hasOwnProperty.call(body, 'actor')
+      || Object.prototype.hasOwnProperty.call(body, 'source_work_session_id')) {
+      throw new RouteError('FORGED_ACTOR', 400, 'Server-owned field supplied');
     }
     const mutationId = request.headers.get('x-cortext-mutation-id') ?? '';
     const ipc = new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default');

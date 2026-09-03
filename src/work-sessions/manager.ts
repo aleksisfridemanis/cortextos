@@ -316,9 +316,19 @@ export class WorkSessionManager {
     await this.adapter(record).stop();
     record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
     const employeeMutationId = randomUUID();
-    const createEmployee = this.dependencies.createEmployee ?? createEmployeeService;
+    const createEmployee = this.dependencies.createEmployee
+      ?? ((employeeInput, employeeMutationId) => createEmployeeService(employeeInput, employeeMutationId, {
+        ctxRoot: this.dependencies.ctxRoot,
+        frameworkRoot: this.dependencies.frameworkRoot,
+      }));
     try {
-      await createEmployee({ ...input, working_directory: record.canonical_cwd, room_id: record.room_id, telegram_polling: false }, employeeMutationId);
+      await createEmployee({
+        ...input,
+        working_directory: record.canonical_cwd,
+        room_id: record.room_id,
+        source_work_session_id: record.id,
+        telegram_polling: false,
+      }, employeeMutationId);
     } catch (error) {
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: true, employee_created: false, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'failure', after_digest: stateDigest(record), error_code: 'PROMOTION_FAILED', sanitized_error: 'Employee promotion failed' });

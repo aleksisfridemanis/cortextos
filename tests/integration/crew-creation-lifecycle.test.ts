@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -19,7 +19,9 @@ describe('Crew Employee creation lifecycle', () => {
     mkdirSync(join(ctxRoot, 'config'), { recursive: true });
     mkdirSync(join(frameworkRoot, 'orgs', 'platform', 'agents'), { recursive: true });
     mkdirSync(join(frameworkRoot, 'templates', 'agent'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'templates', 'context'), { recursive: true });
     writeFileSync(join(frameworkRoot, 'templates', 'agent', 'config.json'), '{}');
+    writeFileSync(join(frameworkRoot, 'templates', 'context', 'work-session.md'), 'Work safely.');
     writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), '{}');
     writeFileSync(join(ctxRoot, 'config', 'rooms.json'), '[]');
     const mutationId = '1f1438f9-e0b4-43fb-88e0-44b4140393bd';
@@ -73,5 +75,48 @@ describe('Crew Work Session lifecycle', () => {
     expect(result).toMatchObject({ lifecycle: 'active', mutation_id: mutationId });
     expect(readCrewMutationJournal(ctxRoot).find(row => row.mutation_id === mutationId)).toMatchObject({ stage: 'finalized' });
     expect(readCrewLifecycleAuditEvents(ctxRoot).find(row => row.event_id === mutationId)).toMatchObject({ action: 'create', target: { kind: 'work_session' }, result: 'success' });
+  });
+
+  it('promotes through the real Employee service by transferring the durable room in place', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cortext-work-promotion-'));
+    roots.push(root);
+    const ctxRoot = join(root, 'ctx');
+    const cwd = join(root, 'project');
+    const frameworkRoot = join(root, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(cwd);
+    mkdirSync(join(frameworkRoot, 'orgs', 'platform', 'agents'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'templates', 'agent'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'templates', 'context'), { recursive: true });
+    writeFileSync(join(frameworkRoot, 'templates', 'agent', 'config.json'), '{}');
+    writeFileSync(join(frameworkRoot, 'templates', 'context', 'work-session.md'), 'Work safely.');
+    writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), '{}');
+    writeFileSync(join(ctxRoot, 'config', 'rooms.json'), '[]');
+    const adapter = {
+      startFresh: async () => ({ resume_handle: { runtime: 'claude-code' as const, session_id: '66666666-6666-4666-8666-666666666666' } }),
+      resumeExact: async () => undefined,
+      send: async () => undefined,
+      stop: async () => undefined,
+      status: () => ({ running: true, pid: 1, error_code: null }),
+      getResumeHandle: () => null,
+    };
+    const manager = new WorkSessionManager({ ctxRoot, frameworkRoot, adapterFactory: () => adapter });
+    const created = await manager.create({
+      display_name: 'Promote real', org: 'platform', harness: 'claude-code', requested_cwd: cwd, actor: 'owner:test',
+    }, '8f51a223-4111-46fb-b4f2-27870567d55d');
+    mkdirSync(join(ctxRoot, 'rooms', created.room_id), { recursive: true });
+    const logPath = join(ctxRoot, 'rooms', created.room_id, 'log.jsonl');
+    writeFileSync(logPath, '{"id":"history"}\n');
+
+    await manager.promote(created.id, {
+      name: 'release-engineer', org: 'platform', runtime: 'claude-code', actor: 'owner:test',
+    }, '9f51a223-4111-46fb-b4f2-27870567d55d');
+
+    const employee = JSON.parse(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8'))['release-engineer'];
+    const room = JSON.parse(readFileSync(join(ctxRoot, 'config', 'rooms.json'), 'utf8'))[0];
+    expect(employee).toMatchObject({ room_id: created.room_id, working_directory: realpathSync(cwd) });
+    expect(manager.get(created.id)).toMatchObject({ lifecycle: 'archived', promoted_employee: 'release-engineer' });
+    expect(room).toMatchObject({ id: created.room_id, kind: 'agent', agent: 'release-engineer', work_session_id: created.id });
+    expect(readFileSync(logPath, 'utf8')).toBe('{"id":"history"}\n');
   });
 });

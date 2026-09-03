@@ -47,6 +47,8 @@ export interface CreateEmployeeInput {
   working_directory?: string;
   telegram_polling: false;
   room_id?: string;
+  /** Server-owned link used only when promoting a Work Session in-place. */
+  source_work_session_id?: string;
   actor: string;
 }
 
@@ -190,6 +192,10 @@ function validateInput(input: CreateEmployeeInput, frameworkRoot: string): void 
   if (input.room_id !== undefined) {
     try { validateRoomId(input.room_id); } catch { throw new CrewServiceError('INVALID_ROOM', 400, 'Invalid room identifier'); }
   }
+  if (input.source_work_session_id !== undefined
+    && (typeof input.source_work_session_id !== 'string' || !/^[a-z0-9_-]{1,128}$/.test(input.source_work_session_id))) {
+    throw new CrewServiceError('INVALID_INPUT', 400, 'Invalid source Work Session');
+  }
 }
 
 function templateName(runtime: CrewEmployeeRuntime): string {
@@ -286,6 +292,7 @@ export async function createEmployee(
     working_directory: input.working_directory ?? null,
     telegram_polling: false,
     room_id: roomId,
+    source_work_session_id: input.source_work_session_id ?? null,
   });
   const priorMutation = getCrewMutation(ctxRoot, mutationId);
   if (priorMutation) {
@@ -374,7 +381,9 @@ export async function createEmployee(
       if (registry[input.name]) throw new CrewServiceError('CONFLICT', 409, 'Employee already exists');
       const rooms = readRooms(roomsPath);
       const matchingRoom = rooms.find(room => room.id === roomId);
-      if (matchingRoom && (matchingRoom.kind !== 'agent' || matchingRoom.agent !== input.name)) {
+      const sourceRoom = matchingRoom?.kind === 'work_session'
+        && matchingRoom.work_session_id === input.source_work_session_id;
+      if (matchingRoom && !sourceRoom && (matchingRoom.kind !== 'agent' || matchingRoom.agent !== input.name)) {
         throw new CrewServiceError('ROOM_CONFLICT', 409, 'Room identifier is already in use');
       }
       const registryBefore = structuredClone(registry);
@@ -388,7 +397,18 @@ export async function createEmployee(
         publicationRestored = false;
         if (dependencies.failAt === 'after-directory-publish') throw new Error('injected after directory publish');
         registry[input.name] = record;
-        if (!matchingRoom) {
+        if (sourceRoom) {
+          const index = rooms.findIndex(room => room.id === roomId);
+          rooms[index] = {
+            ...matchingRoom,
+            kind: 'agent',
+            title: input.name,
+            members: Array.from(new Set([...matchingRoom.members, input.name])),
+            agent: input.name,
+            work_session_id: input.source_work_session_id,
+            mutation_id: mutationId,
+          };
+        } else if (!matchingRoom) {
           rooms.push({
             id: roomId,
             kind: 'agent',
