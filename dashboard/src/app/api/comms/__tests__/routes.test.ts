@@ -24,6 +24,7 @@ import type { RoomMessage } from '../../../../../../src/types';
 const rootTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'comms-routes-'));
 process.env.CTX_ROOT = rootTmp;
 process.env.ADMIN_USERNAME = 'james';
+process.env.AUTH_SECRET = 'comms-test-cleanup-secret';
 
 // Dynamic imports AFTER env vars are set.
 type FeedRoute = typeof import('../feed/route');
@@ -532,6 +533,18 @@ describe('POST /api/comms/upload', () => {
 
     const absPath = path.join(rootTmp, data.path);
     expect(fs.existsSync(absPath)).toBe(true);
+  });
+
+  it('deletes an unreferenced upload only with its returned cleanup capability', async () => {
+    const png = new File([new Uint8Array([0x89, 0x50, 0x4E, 0x47])], 'orphan.png', { type: 'image/png' });
+    const uploaded = await (await upload.POST(uploadRequest(png))).json();
+    const cleanupRequest = new NextRequest(new URL('http://localhost/api/comms/upload'), {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', 'x-cortext-intent': 'cleanup-chat-uploads' },
+      body: JSON.stringify({ uploads: [{ url: uploaded.url, cleanup_token: uploaded.cleanup_token }] }),
+    });
+    expect((await upload.DELETE(cleanupRequest)).status).toBe(200);
+    expect(fs.existsSync(path.join(rootTmp, uploaded.path))).toBe(false);
   });
 
   it('rejects unsupported MIME types (including SVG)', async () => {

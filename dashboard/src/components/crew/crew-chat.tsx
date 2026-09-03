@@ -136,12 +136,20 @@ export function deliveryStateLabel(state?: BusMessage['delivery_state']): string
 }
 
 export function retainedSendMutationId(
-  pending: { id: string; target: string; text: string } | null,
+  pending: { id: string; target: string; intentKey: string } | null,
   target: string,
-  text: string,
+  intentKey: string,
   create: () => string,
 ): string {
-  return pending?.target === target && pending.text === text ? pending.id : create();
+  return pending?.target === target && pending.intentKey === intentKey ? pending.id : create();
+}
+
+export function sendIntentKey(target: string, text: string, files: Array<Pick<File, 'name' | 'size' | 'type' | 'lastModified'>>): string {
+  return JSON.stringify({ target, text, files: files.map(file => ({ name: file.name, size: file.size, type: file.type, lastModified: file.lastModified })) });
+}
+
+export function promotionMutationKey(target: string, employee: Record<string, unknown>): string {
+  return JSON.stringify({ target, action: 'promote', employee });
 }
 
 export function shouldRetainMutationId(code?: string): boolean {
@@ -723,8 +731,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const recorder = useVoiceRecorder();
   const sendingRef = useRef(false);
-  const pendingSendRef = useRef<{ id: string; target: string; text: string } | null>(null);
-  const terminalSendRef = useRef<{ target: string; text: string } | null>(null);
+  const pendingSendRef = useRef<{ id: string; target: string; intentKey: string; messageText: string } | null>(null);
+  const terminalSendRef = useRef<{ target: string; intentKey: string; messageText: string } | null>(null);
   const [retryAnywayAvailable, setRetryAnywayAvailable] = useState(false);
   const pendingLifecycleRef = useRef<Map<string, string>>(new Map());
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1155,8 +1163,27 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     setSending(true);
     setSendError('');
     try {
-      let messageText = draft.trim();
-      if (attachments.length > 0) {
+      const target = agent.targetId;
+      const intentKey = sendIntentKey(target, draft.trim(), attachments.map(item => item.file));
+      const terminal = terminalSendRef.current;
+      if (agent.kind === 'work_session' && terminal?.target === target
+        && terminal.intentKey === intentKey && !options.retryAnyway) {
+        setSendError('Delivery is unknown. Choose Retry anyway to create a new send intent.');
+        return;
+      }
+      const reusableMessageText = pendingSendRef.current?.target === target && pendingSendRef.current.intentKey === intentKey
+        ? pendingSendRef.current.messageText
+        : options.retryAnyway && terminal?.target === target && terminal.intentKey === intentKey
+          ? terminal.messageText
+          : null;
+      if (options.retryAnyway) {
+        terminalSendRef.current = null;
+        pendingSendRef.current = null;
+        setRetryAnywayAvailable(false);
+      }
+      let messageText = reusableMessageText ?? draft.trim();
+      const uploaded: Array<{ url: string; cleanup_token?: string }> = [];
+      if (attachments.length > 0 && reusableMessageText === null) {
         // Upload each image; abort on the first failure so a message never
         // goes out with a partial set of attachments. (Item 9.)
         const urls: string[] = [];
@@ -1166,31 +1193,21 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
           const uploadRes = await fetch('/api/comms/upload', { method: 'POST', body: formData });
           if (!uploadRes.ok) {
             const data = await uploadRes.json().catch(() => ({}));
+            if (uploaded.length > 0) void cleanupUploads(uploaded);
             setSendError(data.error || 'Upload failed');
             return;
           }
-          const { url } = await uploadRes.json();
+          const { url, cleanup_token } = await uploadRes.json();
           urls.push(url);
+          uploaded.push({ url, cleanup_token });
         }
         messageText = buildMessageText(messageText, urls);
       }
-
-      const target = agent.targetId;
-      if (agent.kind === 'work_session' && terminalSendRef.current?.target === target
-        && terminalSendRef.current.text === messageText && !options.retryAnyway) {
-        setSendError('Delivery is unknown. Choose Retry anyway to create a new send intent.');
-        return;
-      }
-      if (options.retryAnyway) {
-        terminalSendRef.current = null;
-        pendingSendRef.current = null;
-        setRetryAnywayAvailable(false);
-      }
       const pending = pendingSendRef.current;
       const mutationId = agent.kind === 'work_session'
-        ? retainedSendMutationId(pending, target, messageText, () => crypto.randomUUID())
+        ? retainedSendMutationId(pending, target, intentKey, () => crypto.randomUUID())
         : null;
-      if (mutationId) pendingSendRef.current = { id: mutationId, target, text: messageText };
+      if (mutationId) pendingSendRef.current = { id: mutationId, target, intentKey, messageText };
       const res = await fetch('/api/messages/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(mutationId ? { 'x-cortext-mutation-id': mutationId } : {}) },
@@ -1238,10 +1255,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         const data = await res.json().catch(() => ({}));
         if (data.code === 'DELIVERY_RETRY_REQUIRED') {
           pendingSendRef.current = null;
-          terminalSendRef.current = { target, text: messageText };
+          terminalSendRef.current = { target, intentKey, messageText };
           setRetryAnywayAvailable(true);
         } else if (!shouldRetainMutationId(data.code)) {
           pendingSendRef.current = null;
+          if (uploaded.length > 0) void cleanupUploads(uploaded);
         }
         setSendError(data.error || 'Failed to send');
       }
@@ -1253,6 +1271,15 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     }
   }
 
+  async function cleanupUploads(uploads: Array<{ url: string; cleanup_token?: string }>) {
+    const eligible = uploads.filter(item => item.cleanup_token);
+    if (!eligible.length) return;
+    await fetch('/api/comms/upload', {
+      method: 'DELETE', headers: { 'content-type': 'application/json', 'x-cortext-intent': 'cleanup-chat-uploads' },
+      body: JSON.stringify({ uploads: eligible }),
+    }).catch(() => undefined);
+  }
+
   async function runSessionAction(action: 'stop' | 'resume' | 'promote') {
     if (agent.kind !== 'work_session') return;
     let employee: Record<string, unknown> | undefined;
@@ -1262,7 +1289,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       if (!name || !org) return;
       employee = { name, org, runtime: agent.harness, model: undefined };
     }
-    const mutationKey = `${agent.targetId}:${action}`;
+    const mutationKey = action === 'promote' && employee
+      ? promotionMutationKey(agent.targetId, employee)
+      : `${agent.targetId}:${action}`;
     const mutationId = pendingLifecycleRef.current.get(mutationKey) ?? crypto.randomUUID();
     pendingLifecycleRef.current.set(mutationKey, mutationId);
     const response = await fetch(`/api/work-sessions/${encodeURIComponent(agent.targetId)}`, {

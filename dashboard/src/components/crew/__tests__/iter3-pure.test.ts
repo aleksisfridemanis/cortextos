@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, retainedSendMutationId, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionLifecycleAction } from '../crew-chat';
+import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, promotionMutationKey, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionLifecycleAction } from '../crew-chat';
 import { shouldTriggerPullRefresh, resolveInitialSelection } from '../use-crew';
 import { prefetchTargets } from '../crew-roster';
 import type { RosterEntry } from '../crew-roster';
@@ -67,14 +67,23 @@ describe('Work Session message identity and delivery state', () => {
     expect(deliveryStateLabel('delivered')).toBe('');
   });
   it('retains the original mutation id for the same unknown send outcome', () => {
-    const pending = { id: 'original-id', target: 'ws-stable', text: 'hello' };
-    expect(retainedSendMutationId(pending, 'ws-stable', 'hello', () => 'new-id')).toBe('original-id');
+    const pending = { id: 'original-id', target: 'ws-stable', intentKey: 'stable-intent' };
+    expect(retainedSendMutationId(pending, 'ws-stable', 'stable-intent', () => 'new-id')).toBe('original-id');
     expect(retainedSendMutationId(pending, 'ws-stable', 'different', () => 'new-id')).toBe('new-id');
   });
   it('retains only in-progress unknown IDs and requires a new ID after terminal indeterminate delivery', () => {
     expect(shouldRetainMutationId('MUTATION_OUTCOME_UNKNOWN')).toBe(true);
     expect(shouldRetainMutationId('MUTATION_PENDING')).toBe(true);
     expect(shouldRetainMutationId('DELIVERY_RETRY_REQUIRED')).toBe(false);
+  });
+  it('binds attachment sends before timestamped upload URLs can change', () => {
+    const file = { name: 'screen.png', size: 42, type: 'image/png', lastModified: 7 };
+    expect(sendIntentKey('ws-stable', 'inspect', [file])).toBe(sendIntentKey('ws-stable', 'inspect', [{ ...file }]));
+    expect(sendIntentKey('ws-stable', 'inspect', [file])).not.toContain('/api/media/');
+  });
+  it('includes the exact promotion Employee payload in the lifecycle binding', () => {
+    expect(promotionMutationKey('ws-stable', { name: 'ada', org: 'platform', runtime: 'claude-code' }))
+      .not.toBe(promotionMutationKey('ws-stable', { name: 'grace', org: 'platform', runtime: 'claude-code' }));
   });
 });
 
