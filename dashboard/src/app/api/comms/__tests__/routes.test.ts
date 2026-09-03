@@ -650,6 +650,37 @@ describe('POST /api/comms/upload', () => {
     expect(fs.readFileSync(path.join(rootTmp, (await res.json()).path))).toEqual(bytes);
   });
 
+  it('keeps false boundary prefixes as file bytes and caps the whole request', async () => {
+    const boundary = 'probe-boundary';
+    const bytes = Buffer.from(`png\r\n--${boundary}Xstill-data`);
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="probe.png"\r\nContent-Type: image/png\r\n\r\n`),
+      bytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const accepted = await upload.POST(new NextRequest('http://localhost/api/comms/upload', {
+      method: 'POST', headers: { 'content-type': `multipart/form-data; boundary=${boundary}` }, body,
+    }));
+    expect(accepted.status).toBe(200);
+    expect(fs.readFileSync(path.join(rootTmp, (await accepted.json()).path))).toEqual(bytes);
+
+    const oversized = Buffer.concat([body, Buffer.alloc(11 * 1024 * 1024, 0x20)]);
+    const rejected = await upload.POST(new NextRequest('http://localhost/api/comms/upload', {
+      method: 'POST', headers: { 'content-type': `multipart/form-data; boundary=${boundary}` }, body: oversized,
+    }));
+    expect(rejected.status).toBe(400);
+  });
+
+  it('reaps expired unreferenced finals but preserves durable room references', async () => {
+    const first = await (await upload.POST(uploadRequest(new File(['one'], 'one.png', { type: 'image/png' })))).json();
+    const second = await (await upload.POST(uploadRequest(new File(['two'], 'two.png', { type: 'image/png' })))).json();
+    writeRoomLog('room-upload', [{ id: 'm1', room_id: 'room-upload', from: 'ws-one', to: 'owner:test', text: second.url, timestamp: new Date().toISOString() }]);
+    const dir = path.join(rootTmp, 'media', 'dashboard-uploads');
+    expect(upload.sweepStaleUploads(dir, rootTmp, Date.now() + 2 * 60 * 60 * 1000)).toBe(1);
+    expect(fs.existsSync(path.join(rootTmp, first.path))).toBe(false);
+    expect(fs.existsSync(path.join(rootTmp, second.path))).toBe(true);
+  });
+
   it('sweeps only old validated upload temp identities', () => {
     const dir = path.join(rootTmp, 'media', 'dashboard-uploads');
     fs.mkdirSync(dir, { recursive: true });

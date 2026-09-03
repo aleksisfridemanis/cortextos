@@ -9,6 +9,7 @@ export const dynamic = 'force-dynamic';
 const MAX_SIZE = 10 * 1024 * 1024; // 10 MB
 const MAX_MULTIPART_OVERHEAD = 128 * 1024;
 const MAX_HEADER_SIZE = 64 * 1024;
+const UPLOAD_LEASE_MS = 60 * 60 * 1000;
 
 function cleanupSecret(): string | null {
   return process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET ?? null;
@@ -62,7 +63,7 @@ export async function POST(request: NextRequest) {
   let publishedPath: string | null = null;
   try {
     fs.mkdirSync(uploadDir, { recursive: true, mode: 0o700 });
-    sweepStaleUploadTemps(uploadDir);
+    sweepStaleUploads(uploadDir, ctxRoot);
     const parsed = await streamMultipartImage(request, uploadDir);
     tempPath = parsed.tempPath;
 
@@ -105,6 +106,10 @@ export async function POST(request: NextRequest) {
 
     const relativePath = `media/dashboard-uploads/${filename}`;
     const mediaUrl = `/api/media/${relativePath}`;
+    const leasePath = uploadLeasePath(uploadDir, filename);
+    fs.writeFileSync(leasePath, JSON.stringify({
+      version: 1, filename, url: mediaUrl, expires_at: new Date(Date.now() + UPLOAD_LEASE_MS).toISOString(),
+    }), { flag: 'wx', mode: 0o600 });
 
     const response = Response.json({
       success: true,
@@ -145,6 +150,46 @@ export function sweepStaleUploadTemps(uploadDir: string, now = Date.now()): numb
   return removed;
 }
 
+function uploadLeasePath(uploadDir: string, filename: string): string {
+  return path.join(uploadDir, `.upload-lease-${filename.slice(0, 36)}.json`);
+}
+
+function durableReferenceExists(ctxRoot: string, url: string): boolean {
+  const scan = (root: string): boolean => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return false; }
+    for (const entry of entries) {
+      const candidate = path.join(root, entry.name);
+      if (entry.isDirectory()) { if (scan(candidate)) return true; continue; }
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      try { if (fs.readFileSync(candidate, 'utf8').includes(url)) return true; } catch { /* fail closed as unconfirmed */ }
+    }
+    return false;
+  };
+  return scan(path.join(ctxRoot, 'rooms')) || scan(path.join(ctxRoot, 'logs'));
+}
+
+/** Reap both abandoned private temps and expired, durably-unreferenced finals. */
+export function sweepStaleUploads(uploadDir: string, ctxRoot: string, now = Date.now()): number {
+  let removed = sweepStaleUploadTemps(uploadDir, now);
+  let names: string[];
+  try { names = fs.readdirSync(uploadDir); } catch { return removed; }
+  for (const name of names) {
+    if (!/^\.upload-lease-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i.test(name)) continue;
+    const leasePath = path.join(uploadDir, name);
+    try {
+      const lease = JSON.parse(fs.readFileSync(leasePath, 'utf8')) as { version?: unknown; filename?: unknown; url?: unknown; expires_at?: unknown };
+      if (lease.version !== 1 || typeof lease.filename !== 'string' || typeof lease.url !== 'string'
+        || typeof lease.expires_at !== 'string' || Date.parse(lease.expires_at) > now) continue;
+      if (!durableReferenceExists(ctxRoot, lease.url)) {
+        try { fs.unlinkSync(path.join(uploadDir, lease.filename)); removed += 1; } catch { /* already absent */ }
+      }
+      fs.unlinkSync(leasePath);
+    } catch { /* corrupt leases remain fail-closed for operator recovery */ }
+  }
+  return removed;
+}
+
 interface StreamedUpload { tempPath: string; name: string; type: string; size: number }
 
 /** Stream the single file part to an exclusive temp inode with a hard byte cap. */
@@ -164,6 +209,7 @@ async function streamMultipartImage(request: NextRequest, uploadDir: string): Pr
   let size = 0;
   let headersDone = false;
   let finished = false;
+  let totalBytes = 0;
   const write = (bytes: Buffer) => {
     if (size + bytes.length > MAX_SIZE) throw new Error('FILE_TOO_LARGE');
     if (bytes.length) fs.writeSync(fd, bytes);
@@ -173,6 +219,8 @@ async function streamMultipartImage(request: NextRequest, uploadDir: string): Pr
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_SIZE + MAX_MULTIPART_OVERHEAD) throw new Error('FILE_TOO_LARGE');
       let chunk = Buffer.from(value);
       if (finished) {
         if (chunk.toString('utf8').trim()) throw new Error('INVALID_MULTIPART');
@@ -198,23 +246,34 @@ async function streamMultipartImage(request: NextRequest, uploadDir: string): Pr
         header = Buffer.alloc(0);
         headersDone = true;
       }
-      const combined = Buffer.concat([tail, chunk]);
-      const boundaryAt = combined.indexOf(delimiter);
-      if (boundaryAt >= 0) {
+      let combined = Buffer.concat([tail, chunk]);
+      while (true) {
+        const boundaryAt = combined.indexOf(delimiter);
+        if (boundaryAt < 0) {
+          const retained = Math.min(combined.length, delimiter.length + 2);
+          write(combined.subarray(0, combined.length - retained));
+          tail = combined.subarray(combined.length - retained);
+          break;
+        }
         if (combined.length < boundaryAt + delimiter.length + 2) {
           write(combined.subarray(0, boundaryAt));
           tail = combined.subarray(boundaryAt);
+          break;
+        }
+        const terminator = combined.subarray(boundaryAt + delimiter.length, boundaryAt + delimiter.length + 2).toString('ascii');
+        if (terminator !== '--' && terminator !== '\r\n') {
+          // A boundary prefix followed by any other byte is ordinary file data.
+          write(combined.subarray(0, boundaryAt + 2));
+          combined = combined.subarray(boundaryAt + 2);
           continue;
         }
+        if (terminator !== '--') throw new Error('INVALID_MULTIPART'); // exactly one file part
         write(combined.subarray(0, boundaryAt));
-        const ending = combined.subarray(boundaryAt + delimiter.length).toString('utf8');
-        if (!ending.startsWith('--') || ending.slice(2).trim()) throw new Error('INVALID_MULTIPART');
+        const ending = combined.subarray(boundaryAt + delimiter.length + 2).toString('utf8');
+        if (ending.trim()) throw new Error('INVALID_MULTIPART');
         tail = Buffer.alloc(0);
         finished = true;
-      } else {
-        const retained = Math.min(combined.length, delimiter.length + 4);
-        write(combined.subarray(0, combined.length - retained));
-        tail = combined.subarray(combined.length - retained);
+        break;
       }
     }
     if (!headersDone || !finished) throw new Error(headersDone ? 'INVALID_MULTIPART' : 'NO_FILE');
@@ -240,6 +299,7 @@ export async function DELETE(request: NextRequest) {
   try { body = await request.json(); } catch { return Response.json({ error: 'Invalid cleanup request' }, { status: 400 }); }
   if (!Array.isArray(body.uploads) || body.uploads.length > 10) return Response.json({ error: 'Invalid cleanup request' }, { status: 400 });
   const uploadDir = path.resolve(getCTXRoot(), 'media', 'dashboard-uploads');
+  sweepStaleUploads(uploadDir, getCTXRoot());
   let removed = 0;
   for (const item of body.uploads) {
     if (typeof item.url !== 'string' || typeof item.cleanup_token !== 'string') continue;
@@ -254,6 +314,33 @@ export async function DELETE(request: NextRequest) {
     const target = path.resolve(uploadDir, filename);
     if (!target.startsWith(`${uploadDir}${path.sep}`)) continue;
     try { fs.unlinkSync(target); removed += 1; } catch { /* absent or already retained */ }
+    try { fs.unlinkSync(uploadLeasePath(uploadDir, filename)); } catch { /* absent */ }
   }
   return Response.json({ removed });
+}
+
+/** Confirm that a delivered message owns its upload; only the lease is removed. */
+export async function PUT(request: NextRequest) {
+  if (request.headers.get('x-cortext-intent') !== 'retain-chat-uploads') {
+    return Response.json({ error: 'Invalid retain intent' }, { status: 400 });
+  }
+  const secret = cleanupSecret();
+  if (!secret) return Response.json({ error: 'Upload retention unavailable' }, { status: 503 });
+  let body: { uploads?: Array<{ url?: unknown; cleanup_token?: unknown }> };
+  try { body = await request.json(); } catch { return Response.json({ error: 'Invalid retain request' }, { status: 400 }); }
+  if (!Array.isArray(body.uploads) || body.uploads.length > 10) return Response.json({ error: 'Invalid retain request' }, { status: 400 });
+  const uploadDir = path.resolve(getCTXRoot(), 'media', 'dashboard-uploads');
+  let retained = 0;
+  for (const item of body.uploads) {
+    if (typeof item.url !== 'string' || typeof item.cleanup_token !== 'string') continue;
+    const prefix = '/api/media/media/dashboard-uploads/';
+    if (!item.url.startsWith(prefix)) continue;
+    const filename = item.url.slice(prefix.length);
+    const relativePath = `media/dashboard-uploads/${filename}`;
+    const expected = cleanupToken(relativePath);
+    if (!expected || item.cleanup_token.length !== expected.length
+      || !timingSafeEqual(Buffer.from(item.cleanup_token), Buffer.from(expected))) continue;
+    try { fs.unlinkSync(uploadLeasePath(uploadDir, filename)); retained += 1; } catch { /* already retained */ }
+  }
+  return Response.json({ retained });
 }

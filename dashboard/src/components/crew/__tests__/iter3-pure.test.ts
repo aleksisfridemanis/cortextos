@@ -92,6 +92,7 @@ describe('Work Session message identity and delivery state', () => {
       version: 1 as const, principal: 'owner:alice', target: 'ws-one', id: 'mutation-one',
       intentKey: 'pre-upload-binding', requestDigest: JSON.stringify({ text: '/api/media/exact-opaque.png' }),
       messageText: 'inspect\n/api/media/exact-opaque.png', state: 'pending' as const,
+      uploads: [{ url: '/api/media/exact-opaque.png', cleanup_token: 'secret-capability' }],
     };
     const raw = JSON.stringify({ send });
     expect(parsePersistedSendIntent(raw, 'owner:alice', 'ws-one')).toEqual(send);

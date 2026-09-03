@@ -165,6 +165,7 @@ export interface PersistedSendIntent {
   requestDigest: string;
   messageText: string;
   state: 'pending' | 'terminal';
+  uploads: Array<{ url: string; cleanup_token: string }>;
 }
 
 interface PersistedLifecycleIntent {
@@ -193,6 +194,7 @@ export function parsePersistedSendIntent(raw: string | null, principal: string, 
     return value?.version === 1 && value.principal === principal && value.target === target
       && typeof value.id === 'string' && typeof value.intentKey === 'string'
       && typeof value.requestDigest === 'string' && typeof value.messageText === 'string'
+      && Array.isArray(value.uploads) && value.uploads.every(item => item && typeof item.url === 'string' && typeof item.cleanup_token === 'string')
       && ['pending', 'terminal'].includes(value.state) ? value : null;
   } catch { return null; }
 }
@@ -1245,6 +1247,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     sendingRef.current = true;
     setSending(true);
     setSendError('');
+    let uploaded: Array<{ url: string; cleanup_token: string }> = [];
+    let crossedSendBoundary = false;
     try {
       const target = agent.targetId;
       const restored = pendingSendRef.current ?? terminalSendRef.current;
@@ -1274,7 +1278,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         ? retainedSendMutationId(pendingSendRef.current, target, intentKey, () => crypto.randomUUID())
         : null;
       let messageText = reusableMessageText ?? draft.trim();
-      const uploaded: Array<{ url: string; cleanup_token?: string }> = [];
+      uploaded = reusableMessageText !== null && restored ? [...restored.uploads] : [];
       if (attachments.length > 0 && reusableMessageText === null) {
         // Upload each image; abort on the first failure so a message never
         // goes out with a partial set of attachments. (Item 9.)
@@ -1290,6 +1294,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
             return;
           }
           const { url, cleanup_token } = await uploadRes.json();
+          if (typeof url !== 'string' || typeof cleanup_token !== 'string') throw new Error('UPLOAD_CAPABILITY_MISSING');
           urls.push(url);
           uploaded.push({ url, cleanup_token });
         }
@@ -1298,11 +1303,12 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       const requestDigest = JSON.stringify({ target, text: messageText, reply_to: replyTarget?.id ?? null });
       const mutationId = preassignedMutationId;
       if (mutationId) {
-        pendingSendRef.current = { version: 1, principal: user, id: mutationId, target, intentKey, requestDigest, messageText, state: 'pending' };
+        pendingSendRef.current = { version: 1, principal: user, id: mutationId, target, intentKey, requestDigest, messageText, state: 'pending', uploads: uploaded };
         terminalSendRef.current = null;
         persistIntents();
         setRestoredIntentNotice(`Pending operation ${mutationId}`);
       }
+      crossedSendBoundary = true;
       const res = await fetch('/api/messages/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(mutationId ? { 'x-cortext-mutation-id': mutationId } : {}) },
@@ -1315,6 +1321,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         }),
       });
       if (res.ok) {
+        if (uploaded.length > 0) void retainUploads(uploaded);
         pendingSendRef.current = null;
         terminalSendRef.current = null;
         setRetryAnywayAvailable(false);
@@ -1352,7 +1359,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         const data = await res.json().catch(() => ({}));
         if (data.code === 'DELIVERY_RETRY_REQUIRED') {
           pendingSendRef.current = null;
-          terminalSendRef.current = { version: 1, principal: user, id: mutationId!, target, intentKey, requestDigest, messageText, state: 'terminal' };
+          terminalSendRef.current = { version: 1, principal: user, id: mutationId!, target, intentKey, requestDigest, messageText, state: 'terminal', uploads: uploaded };
           setRetryAnywayAvailable(true);
         } else if (!shouldRetainMutationId(data.code)) {
           pendingSendRef.current = null;
@@ -1362,6 +1369,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         setSendError(data.error || 'Failed to send');
       }
     } catch {
+      if (!crossedSendBoundary && uploaded.length > 0) void cleanupUploads(uploaded);
       setSendError('Network error');
     } finally {
       sendingRef.current = false;
@@ -1369,12 +1377,18 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     }
   }
 
-  async function cleanupUploads(uploads: Array<{ url: string; cleanup_token?: string }>) {
-    const eligible = uploads.filter(item => item.cleanup_token);
-    if (!eligible.length) return;
+  async function cleanupUploads(uploads: Array<{ url: string; cleanup_token: string }>) {
+    if (!uploads.length) return;
     await fetch('/api/comms/upload', {
       method: 'DELETE', headers: { 'content-type': 'application/json', 'x-cortext-intent': 'cleanup-chat-uploads' },
-      body: JSON.stringify({ uploads: eligible }),
+      body: JSON.stringify({ uploads }),
+    }).catch(() => undefined);
+  }
+
+  async function retainUploads(uploads: Array<{ url: string; cleanup_token: string }>) {
+    await fetch('/api/comms/upload', {
+      method: 'PUT', headers: { 'content-type': 'application/json', 'x-cortext-intent': 'retain-chat-uploads' },
+      body: JSON.stringify({ uploads }),
     }).catch(() => undefined);
   }
 
