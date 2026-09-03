@@ -535,6 +535,21 @@ describe('POST /api/comms/upload', () => {
     expect(fs.existsSync(absPath)).toBe(true);
   });
 
+  it('publishes concurrent same-name uploads to distinct exclusive identities', async () => {
+    const bytes = new Uint8Array([0x89, 0x50, 0x4E, 0x47]);
+    const [left, right] = await Promise.all([
+      upload.POST(uploadRequest(new File([bytes], 'same.png', { type: 'image/png' }))),
+      upload.POST(uploadRequest(new File([bytes], 'same.png', { type: 'image/png' }))),
+    ]);
+    expect(left.status).toBe(200);
+    expect(right.status).toBe(200);
+    const [a, b] = await Promise.all([left.json(), right.json()]);
+    expect(a.path).not.toBe(b.path);
+    expect(fs.readFileSync(path.join(rootTmp, a.path))).toEqual(Buffer.from(bytes));
+    expect(fs.readFileSync(path.join(rootTmp, b.path))).toEqual(Buffer.from(bytes));
+    expect(fs.readdirSync(path.join(rootTmp, 'media', 'dashboard-uploads')).some(name => name.endsWith('.tmp'))).toBe(false);
+  });
+
   it('deletes an unreferenced upload only with its returned cleanup capability', async () => {
     const png = new File([new Uint8Array([0x89, 0x50, 0x4E, 0x47])], 'orphan.png', { type: 'image/png' });
     const uploaded = await (await upload.POST(uploadRequest(png))).json();
