@@ -49,6 +49,27 @@ describe('WorkSessionManager', () => {
     );
   });
 
+  it('returns each mutation original terminal result after later lifecycle changes', async () => {
+    const { manager, adapter, cwd } = fixture();
+    const created = await manager.create({ display_name: 'Fix release', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '91111111-1111-4111-8111-111111111111');
+    const stopMutation = '93333333-3333-4333-8333-333333333333';
+    const resumeMutation = '94444444-4444-4444-8444-444444444444';
+    const laterStopMutation = '95555555-5555-4555-8555-555555555555';
+    const stopped = await manager.stop(created.id, 'owner:test', stopMutation);
+    const resumed = await manager.resume(created.id, 'owner:test', resumeMutation);
+    const retriedStop = await manager.stop(created.id, 'owner:test', stopMutation);
+    expect(retriedStop).toEqual(stopped);
+    expect(retriedStop.lifecycle).toBe('archived');
+    expect(manager.get(created.id)?.lifecycle).toBe('active');
+    await manager.stop(created.id, 'owner:test', laterStopMutation);
+    const retriedResume = await manager.resume(created.id, 'owner:test', resumeMutation);
+    expect(retriedResume).toEqual(resumed);
+    expect(retriedResume.lifecycle).toBe('active');
+    expect(manager.get(created.id)?.lifecycle).toBe('archived');
+    expect(adapter.resumeExact).toHaveBeenCalledTimes(1);
+    expect(adapter.stop).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects reuse of a mutation id for different input', async () => {
     const { manager, cwd } = fixture();
     const created = await manager.create({ display_name: 'Fix release', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '11111111-1111-4111-8111-111111111111');

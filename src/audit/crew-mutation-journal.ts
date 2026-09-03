@@ -34,6 +34,7 @@ export interface CrewMutationFinalResult {
   after_digest: string;
   error_code?: string | null;
   sanitized_error?: string | null;
+  result_snapshot?: Record<string, unknown>;
 }
 
 export interface CrewMutationJournalEntry {

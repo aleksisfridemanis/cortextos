@@ -40,6 +40,11 @@ function stateDigest(record: WorkSessionRecord): string {
   return digestCrewAuditValue({ ...record, resume_handle: record.resume_handle ? digestCrewAuditValue(record.resume_handle) : null });
 }
 
+function resultSnapshot(record: WorkSessionRecord): Record<string, unknown> {
+  const { resume_handle: handle, ...snapshot } = record;
+  return { ...snapshot, continuation_digest: handle ? digestCrewAuditValue(handle) : null };
+}
+
 export class WorkSessionManager {
   private readonly adapters = new Map<string, WorkSessionRuntimeAdapter>();
   private readonly now: () => string;
@@ -82,6 +87,16 @@ export class WorkSessionManager {
     if (!sameRequest) throw new WorkSessionRegistryError('IDEMPOTENCY_CONFLICT', 'Mutation id is already bound to another request');
     if (prior.stage === 'finalized' && prior.final_result?.result === 'success') return prior;
     throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session mutation requires reconciliation');
+  }
+
+  private originalResult(prior: NonNullable<ReturnType<typeof getCrewMutation>>): WorkSessionRecord {
+    const snapshot = prior.final_result?.result_snapshot;
+    const current = this.get(prior.target.id);
+    if (!snapshot || !current) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Original Work Session result is unavailable');
+    const { continuation_digest: continuationDigest, ...record } = snapshot;
+    const currentDigest = current.resume_handle ? digestCrewAuditValue(current.resume_handle) : null;
+    if (continuationDigest !== currentDigest) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Original Work Session continuation changed');
+    return { ...record, resume_handle: current.resume_handle } as unknown as WorkSessionRecord;
   }
 
   async create(input: CreateWorkSessionInput, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
@@ -215,11 +230,8 @@ export class WorkSessionManager {
 
   async stop(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
     validateMutationActor(mutationId, actor);
-    if (this.priorMutation(mutationId, actor, 'stop', id, { id })) {
-      const existing = this.get(id);
-      if (!existing) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Finalized Work Session state is missing');
-      return existing;
-    }
+    const prior = this.priorMutation(mutationId, actor, 'stop', id, { id });
+    if (prior) return this.originalResult(prior);
     let record = this.require(id, ['starting', 'active', 'archived']);
     const prepared = this.prepare(record, actor, 'stop', mutationId, { id });
     if (prepared.reused && prepared.entry.stage === 'finalized') return record;
@@ -227,7 +239,9 @@ export class WorkSessionManager {
       commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
       startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: true, already_archived: true, mutation_id: mutationId });
-      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(record) });
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+        result: 'success', after_digest: stateDigest(record), result_snapshot: resultSnapshot(record),
+      });
       return record;
     }
     record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'stopping', {}, mutationId);
@@ -237,7 +251,9 @@ export class WorkSessionManager {
       await this.adapter(record).stop();
       record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: true, mutation_id: mutationId });
-      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(record) });
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+        result: 'success', after_digest: stateDigest(record), result_snapshot: resultSnapshot(record),
+      });
       this.adapters.delete(id);
       return record;
     } catch (error) {
@@ -255,7 +271,8 @@ export class WorkSessionManager {
     const handle = record.resume_handle;
     if (!handle) throw new WorkSessionRegistryError('RESUME_HANDLE_MISSING', 'Exact Work Session resume handle is missing');
     const request = { id, handle_digest: digestCrewAuditValue(handle) };
-    if (this.priorMutation(mutationId, actor, 'resume', id, request)) return record;
+    const prior = this.priorMutation(mutationId, actor, 'resume', id, request);
+    if (prior) return this.originalResult(prior);
     record = this.require(id, ['archived', 'failed']);
     const prepared = this.prepare(record, actor, 'resume', mutationId, request);
     if (prepared.reused && prepared.entry.stage === 'finalized') return record;
@@ -266,7 +283,9 @@ export class WorkSessionManager {
       await this.adapter(record).resumeExact(handle, { id, cwd: record.canonical_cwd, model: record.model ?? undefined });
       record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {}, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { resumed: true, handle_digest: digestCrewAuditValue(handle), mutation_id: mutationId });
-      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(record) });
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+        result: 'success', after_digest: stateDigest(record), result_snapshot: resultSnapshot(record),
+      });
       return record;
     } catch (error) {
       record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'failed', { last_error: 'RESUME_HANDLE_UNAVAILABLE' }, mutationId);
