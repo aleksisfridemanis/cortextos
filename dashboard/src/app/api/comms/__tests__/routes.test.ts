@@ -609,4 +609,34 @@ describe('POST /api/comms/upload', () => {
     const data = await res.json();
     expect(String(data.error).toLowerCase()).toContain('too large');
   });
+
+  it('accepts the same valid multipart upload in one body-sized stream chunk', async () => {
+    const boundary = 'cortext-boundary';
+    const bytes = Buffer.alloc(100 * 1024, 0x61);
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="large.png"\r\nContent-Type: image/png\r\n\r\n`),
+      bytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const res = await upload.POST(new NextRequest('http://localhost/api/comms/upload', {
+      method: 'POST', headers: { 'content-type': `multipart/form-data; boundary=${boundary}` }, body,
+    }));
+    expect(res.status).toBe(200);
+    const saved = await res.json();
+    expect(fs.readFileSync(path.join(rootTmp, saved.path))).toEqual(bytes);
+  });
+
+  it('sweeps only old validated upload temp identities', () => {
+    const dir = path.join(rootTmp, 'media', 'dashboard-uploads');
+    fs.mkdirSync(dir, { recursive: true });
+    const stale = path.join(dir, '.upload-11111111-1111-4111-8111-111111111111.tmp');
+    const unrelated = path.join(dir, '.upload-not-a-uuid.tmp');
+    fs.writeFileSync(stale, 'stale');
+    fs.writeFileSync(unrelated, 'keep');
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    fs.utimesSync(stale, old, old);
+    expect(upload.sweepStaleUploadTemps(dir)).toBe(1);
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(unrelated)).toBe(true);
+  });
 });

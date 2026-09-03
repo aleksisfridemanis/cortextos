@@ -59,8 +59,10 @@ export async function POST(request: NextRequest) {
   }
 
   let tempPath: string | null = null;
+  let publishedPath: string | null = null;
   try {
     fs.mkdirSync(uploadDir, { recursive: true, mode: 0o700 });
+    sweepStaleUploadTemps(uploadDir);
     const parsed = await streamMultipartImage(request, uploadDir);
     tempPath = parsed.tempPath;
 
@@ -97,15 +99,14 @@ export async function POST(request: NextRequest) {
     // collision cannot overwrite another upload. The private temp identity is
     // removed only after the unique final name exists.
     fs.linkSync(parsed.tempPath, filePath);
+    publishedPath = filePath;
+    fs.unlinkSync(parsed.tempPath);
     tempPath = null;
-    try { fs.unlinkSync(parsed.tempPath); } catch {
-      console.error('[api/comms/upload] published upload retained a private temp link');
-    }
 
     const relativePath = `media/dashboard-uploads/${filename}`;
     const mediaUrl = `/api/media/${relativePath}`;
 
-    return Response.json({
+    const response = Response.json({
       success: true,
       path: relativePath,
       url: mediaUrl,
@@ -113,8 +114,11 @@ export async function POST(request: NextRequest) {
       size: parsed.size,
       ...(cleanupToken(relativePath) ? { cleanup_token: cleanupToken(relativePath) } : {}),
     });
+    publishedPath = null;
+    return response;
   } catch (err) {
     if (tempPath) try { fs.unlinkSync(tempPath); } catch { /* already removed */ }
+    if (publishedPath) try { fs.unlinkSync(publishedPath); } catch { /* sweeper handles validated stale temp */ }
     const message = err instanceof Error ? err.message : String(err);
     if (message === 'FILE_TOO_LARGE') return Response.json({ error: 'File too large (max 10 MB)' }, { status: 400 });
     if (message === 'NO_FILE') return Response.json({ error: 'No file provided' }, { status: 400 });
@@ -123,6 +127,22 @@ export async function POST(request: NextRequest) {
     console.error('[api/comms/upload] Error:', message);
     return Response.json({ error: 'Upload failed' }, { status: 500 });
   }
+}
+
+export function sweepStaleUploadTemps(uploadDir: string, now = Date.now()): number {
+  let removed = 0;
+  for (const name of fs.readdirSync(uploadDir)) {
+    if (!/^\.upload-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/i.test(name)) continue;
+    const candidate = path.join(uploadDir, name);
+    try {
+      const stat = fs.lstatSync(candidate);
+      if (stat.isFile() && now - stat.mtimeMs >= 60 * 60 * 1000) {
+        fs.unlinkSync(candidate);
+        removed += 1;
+      }
+    } catch { /* raced cleanup or inaccessible entry */ }
+  }
+  return removed;
 }
 
 interface StreamedUpload { tempPath: string; name: string; type: string; size: number }
@@ -160,9 +180,12 @@ async function streamMultipartImage(request: NextRequest, uploadDir: string): Pr
       }
       if (!headersDone) {
         header = Buffer.concat([header, chunk]);
-        if (header.length > MAX_HEADER_SIZE) throw new Error('INVALID_MULTIPART');
         const end = header.indexOf('\r\n\r\n');
-        if (end < 0) continue;
+        if (end < 0) {
+          if (header.length > MAX_HEADER_SIZE) throw new Error('INVALID_MULTIPART');
+          continue;
+        }
+        if (end > MAX_HEADER_SIZE) throw new Error('INVALID_MULTIPART');
         const raw = header.subarray(0, end).toString('utf8');
         if (!raw.startsWith(`--${boundary}\r\n`)) throw new Error('INVALID_MULTIPART');
         const disposition = /content-disposition:\s*form-data;\s*name="file";\s*filename="([^"]*)"/i.exec(raw);
