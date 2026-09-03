@@ -9,6 +9,7 @@ import type { ExecutionLogStatusFilter } from '../bus/crons.js';
 import { nextFireFromCron } from './cron-scheduler.js';
 import { parseDurationMs } from '../bus/cron-state.js';
 import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
+import { createEmployee, CrewServiceError, type CreateEmployeeInput } from '../agents/create-employee.js';
 
 const WORKER_NAME_REGEX = /^[a-z0-9_-]+$/;
 
@@ -567,7 +568,7 @@ export class IPCServer {
   /**
    * Handle an incoming IPC request.
    */
-  private handleRequest(request: IPCRequest, socket: Socket): void {
+  private async handleRequest(request: IPCRequest, socket: Socket): Promise<void> {
     // BUG-015: log every incoming IPC request with its source so we can
     // trace which CLI command triggered which daemon action. The source
     // field is populated by CLI clients (cortextos enable / disable / stop
@@ -579,6 +580,29 @@ export class IPCServer {
 
     try {
       switch (request.type) {
+        case 'create-employee': {
+          if (!request.mutation_id || !request.data) {
+            response = { success: false, error: 'Employee request and mutation id required', code: 'INVALID_INPUT' };
+            break;
+          }
+          try {
+            const result = await createEmployee(request.data as unknown as CreateEmployeeInput, request.mutation_id, {
+              startEmployee: async start => {
+                await this.agentManager.startAgent(start.name, start.agent_dir, undefined, start.org);
+                return { mutation_id: start.mutation_id, started: true };
+              },
+            });
+            response = { success: true, data: result };
+          } catch (error) {
+            if (error instanceof CrewServiceError) {
+              response = { success: false, error: error.message, code: error.code };
+            } else {
+              response = { success: false, error: 'Employee creation failed', code: 'CREATE_FAILED' };
+            }
+          }
+          break;
+        }
+
         case 'status':
           response = {
             success: true,

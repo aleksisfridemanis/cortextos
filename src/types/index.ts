@@ -51,6 +51,8 @@ export interface Room {
   created_at: string; // ISO 8601
   created_by: string;
   archived?: boolean;
+  /** Mutation that durably created or most recently changed the room. */
+  mutation_id?: string;
 }
 
 export interface RoomAttachment {
@@ -708,6 +710,7 @@ export interface BusPaths {
 
 export type IPCCommandType =
   | 'status'
+  | 'create-employee'
   | 'start-agent'
   | 'stop-agent'
   | 'restart-agent'
@@ -823,6 +826,8 @@ export interface IPCRequest {
   type: IPCCommandType;
   agent?: string;
   data?: Record<string, unknown>;
+  /** Idempotency identity for audited Crew mutations. */
+  mutation_id?: string;
   /**
    * BUG-015: human-readable identifier of the caller (e.g. 'cortextos enable',
    * 'cortextos bus soft-restart-all'). Logged by the daemon on every incoming
@@ -865,7 +870,7 @@ export interface IPCResponse {
    * "agent does not exist" (NOT_FOUND) from "request collapsed against an
    * in-flight identical op" (DEDUPED). See issue #346.
    */
-  code?: 'NOT_FOUND' | 'DEDUPED' | 'INVALID_INPUT' | 'NOT_RUNNING';
+  code?: string;
 }
 
 // Agent Discovery Types

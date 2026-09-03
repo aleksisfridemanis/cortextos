@@ -6,6 +6,7 @@ import { CrewRoster, RosterSkeleton } from '@/components/crew/crew-roster';
 import { CrewChat, warmRoomCache } from '@/components/crew/crew-chat';
 import { useCrew, shouldTriggerPullRefresh } from '@/components/crew/use-crew';
 import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
+import { CreateChatDialog } from '@/components/crew/create-chat-dialog';
 import '@/components/crew/crew.css';
 
 // Pull-down distance (px) past the top that fires a roster refresh on mobile.
@@ -95,13 +96,16 @@ function CrewAppInner() {
         </div>
       ) : (
         <div className="relative flex min-h-0 flex-1 flex-col px-4 pt-6">
-          <div className="mb-4">
-            <h1 className="text-2xl font-bold tracking-tight">{greeting()}</h1>
-            <p className="mt-0.5 text-sm text-muted-foreground">
-              {workingCount > 0
-                ? `${workingCount} of your crew ${workingCount === 1 ? 'is' : 'are'} up and about`
-                : 'the whole crew is resting'}
-            </p>
+          <div className="mb-4 flex items-start justify-between gap-3">
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight">{greeting()}</h1>
+              <p className="mt-0.5 text-sm text-muted-foreground">
+                {workingCount > 0
+                  ? `${workingCount} of your crew ${workingCount === 1 ? 'is' : 'are'} up and about`
+                  : 'the whole crew is resting'}
+              </p>
+            </div>
+            <CreateChatDialog onCreated={(name) => { refresh(); select(name); }} />
           </div>
           <div
             className="min-h-0 flex-1 overflow-y-auto pb-4"

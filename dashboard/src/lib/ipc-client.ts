@@ -65,6 +65,7 @@ export interface CronExecutionLogPage {
 export interface IPCRequest {
   type:
     | 'status'
+    | 'create-employee'
     | 'start-agent'
     | 'stop-agent'
     | 'restart-agent'
@@ -81,12 +82,14 @@ export interface IPCRequest {
     | 'fleet-health';
   agent?: string;
   data?: Record<string, unknown>;
+  mutation_id?: string;
 }
 
 export interface IPCResponse {
   success: boolean;
   data?: unknown;
   error?: string;
+  code?: string;
 }
 
 function getIpcPath(instanceId: string = 'default'): string {

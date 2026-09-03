@@ -12,6 +12,7 @@ import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
+import { composeEmployeeContext } from '../context/composer.js';
 
 type LogFn = (msg: string) => void;
 
@@ -890,7 +891,20 @@ export class AgentProcess {
     const onlineMessage = isHandoffRestart || !shouldPromptTelegram
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    const legacyOperationalPrompt = `You are starting a new session. Current UTC time: ${nowUtc}. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    const contextTemplate = join(this.env.frameworkRoot, 'templates', 'context', 'employee-core.md');
+    if (!existsSync(contextTemplate)) {
+      // Compatibility for pre-context installations and narrow unit fixtures.
+      return `${legacyOperationalPrompt} Read AGENTS.md and all bootstrap files listed there.`;
+    }
+    const packet = composeEmployeeContext({
+      frameworkRoot: this.env.frameworkRoot,
+      agentDir: this.env.agentDir,
+      ctxRoot: this.env.ctxRoot,
+      mode: 'fresh',
+      projectRoot: this.config.working_directory,
+    });
+    return `${packet.text}\n\n${legacyOperationalPrompt}`;
   }
 
   private buildContinuePrompt(): string {

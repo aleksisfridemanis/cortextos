@@ -25,9 +25,9 @@ export function validateInstanceId(instanceId: string): void {
 }
 
 export function validateAgentName(name: string): void {
-  if (!name || !AGENT_NAME_REGEX.test(name)) {
+  if (!name || name.length > 64 || !AGENT_NAME_REGEX.test(name)) {
     throw new Error(
-      `Invalid agent name '${name}'. Must contain only lowercase letters, numbers, underscores, and hyphens.`
+      `Invalid agent name '${name}'. Must contain at most 64 lowercase letters, numbers, underscores, and hyphens.`
     );
   }
 }

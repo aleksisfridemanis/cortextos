@@ -6,6 +6,7 @@ import { CrewRoster, RosterSkeleton } from '@/components/crew/crew-roster';
 import { CrewChat, warmRoomCache } from '@/components/crew/crew-chat';
 import { useCrew, resolveInitialSelection, shouldTriggerPullRefresh } from '@/components/crew/use-crew';
 import { useKeyboardInset } from '@/components/crew/use-keyboard-inset';
+import { CreateChatDialog } from '@/components/crew/create-chat-dialog';
 import '@/components/crew/crew.css';
 
 // Pull-down distance (px) past the top that fires a roster refresh on mobile.
@@ -93,6 +94,10 @@ function CrewPageInner() {
 
   return (
     <div className="flex h-[calc(100dvh-136px)] flex-col gap-3 md:h-[calc(100dvh-86px)]">
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold tracking-tight">All Chats</h1>
+        <CreateChatDialog onCreated={(name) => { refresh(); select(name); }} />
+      </div>
       {/* Desktop: rail + chat side by side. */}
       <div className="hidden min-h-0 flex-1 gap-3 md:grid md:grid-cols-[290px_1fr]">
         <div className="min-h-0 overflow-hidden rounded-xl border bg-muted/10">
