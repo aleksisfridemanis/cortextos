@@ -768,10 +768,12 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const ackPath = join(stateDir, 'claude-session-ack.json');
     this.claudeAckPath = ackPath;
     try { unlinkSync(ackPath); } catch {}
-    const reporter = join(__dirname, '..', 'daemon.js');
+    // tsup emits this reporter as a standalone sibling of daemon.js. Keeping
+    // it out of the daemon bundle guarantees exactly one stdin consumer.
+    const reporter = join(__dirname, 'claude-session-reporter.js');
     const settingsPath = join(stateDir, 'claude-session-settings.json');
     const mcpConfigPath = join(stateDir, 'claude-mcp.json');
-    const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(reporter)} --claude-session-report ${JSON.stringify(sessionId)} ${JSON.stringify(ackPath)}`;
+    const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(reporter)} ${JSON.stringify(sessionId)} ${JSON.stringify(ackPath)}`;
     writeFileSync(settingsPath, `${JSON.stringify(claudeSessionSettings(input.cwd, command), null, 2)}\n`, { mode: 0o600 });
     writeFileSync(mcpConfigPath, `${JSON.stringify({ mcpServers: {} }, null, 2)}\n`, { mode: 0o600 });
     chmodSync(settingsPath, 0o600);
