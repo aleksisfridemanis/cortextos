@@ -13,6 +13,7 @@ export type ContextHarness = 'claude-code' | 'codex-app-server' | 'opencode';
 export interface ComposeEmployeeContextOptions {
   frameworkRoot: string;
   agentDir: string;
+  agentName: string;
   ctxRoot: string;
   mode: 'fresh' | 'continuation';
   projectRoot?: string;
@@ -40,13 +41,18 @@ function digest(text: string): string {
 }
 
 export function composeEmployeeContext(options: ComposeEmployeeContextOptions): EffectiveContextPacket {
+  if (!/^[a-z0-9_-]{1,64}$/.test(options.agentName)) throw new Error('INVALID_AGENT_NAME');
   const contextDir = join(options.frameworkRoot, 'templates', 'context');
   const frameworkCore = block(join(contextDir, 'employee-core.md'), 'framework', 'current Employee runtime and essential safety rules');
   const blocks: EffectiveContextBlock[] = [];
   const overridesPath = join(options.ctxRoot, 'config', 'context-overrides.json');
   let coreOverride: { content?: string | null; disabled?: boolean; mutation_id?: string } | null = null;
   if (existsSync(overridesPath)) {
-    try { coreOverride = JSON.parse(readFileSync(overridesPath, 'utf8'))?.rules?.['employee-core'] ?? null; } catch {
+    try {
+      const state = JSON.parse(readFileSync(overridesPath, 'utf8'));
+      if (state?.schema_version !== 2 || !state?.employees || typeof state.employees !== 'object') throw new Error('invalid');
+      coreOverride = state.employees?.[options.agentName]?.rules?.['employee-core'] ?? null;
+    } catch {
       throw new Error('CONTEXT_OVERRIDES_CORRUPT');
     }
   }

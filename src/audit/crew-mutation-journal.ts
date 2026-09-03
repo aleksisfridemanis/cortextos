@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 import { randomBytes } from 'crypto';
 import {
   appendCrewLifecycleAuditEvent,
+  digestCrewAuditValue,
   type CrewAuditResult,
   type CrewLifecycleAction,
   type CrewTarget,
@@ -283,6 +284,24 @@ export function reconcileCrewMutationJournal(ctxRoot: string): { finalized: numb
     if (entry.stage === 'audit_written' && entry.final_result) {
       updateEntry(ctxRoot, entry.mutation_id, current => { current.stage = 'finalized'; });
       finalized += 1;
+      continue;
+    }
+    if (entry.target.kind === 'employee'
+      && ['approve_merge', 'replace_default', 'disable_default'].includes(entry.action)
+      && ['prepared', 'state_committed'].includes(entry.stage)) {
+      let storedDigest: string | null = null;
+      try {
+        const state = JSON.parse(readFileSync(join(ctxRoot, 'config', 'context-overrides.json'), 'utf8'));
+        const rule = state?.schema_version === 2
+          ? state.employees?.[entry.target.id]?.rules?.['employee-core']
+          : null;
+        if (rule?.mutation_id === entry.mutation_id) storedDigest = digestCrewAuditValue(rule);
+      } catch { /* corrupt or absent state cannot be certified */ }
+      if (storedDigest === entry.intended_after_digest) {
+        if (entry.stage === 'prepared') commitCrewMutationState(ctxRoot, entry.mutation_id, storedDigest);
+        finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, { result: 'success', after_digest: storedDigest });
+        finalized += 1;
+      }
       continue;
     }
     const result: CrewMutationFinalResult = entry.stage === 'prepared'

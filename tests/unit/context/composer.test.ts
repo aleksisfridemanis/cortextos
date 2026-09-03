@@ -15,6 +15,7 @@ describe('composeEmployeeContext', () => {
   let root: string;
   let frameworkRoot: string;
   let agentDir: string;
+  const agentName = 'ada';
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'cortext-context-'));
@@ -35,6 +36,7 @@ describe('composeEmployeeContext', () => {
     const packet = composeEmployeeContext({
       frameworkRoot,
       agentDir,
+      agentName,
       ctxRoot: join(root, 'ctx'),
       mode: 'fresh',
     });
@@ -53,6 +55,7 @@ describe('composeEmployeeContext', () => {
     const packet = composeEmployeeContext({
       frameworkRoot,
       agentDir,
+      agentName,
       ctxRoot: join(root, 'ctx'),
       mode: 'fresh',
     });
@@ -68,31 +71,43 @@ describe('composeEmployeeContext', () => {
     expect(() => composeEmployeeContext({
       frameworkRoot,
       agentDir,
+      agentName,
       ctxRoot: join(root, 'ctx'),
       mode: 'fresh',
     })).toThrow(/CONTEXT_BUDGET_EXCEEDED/);
   });
 
   it('refreshes framework bytes while preserving instance bytes and bounds one continuation handoff', () => {
-    const before = composeEmployeeContext({ frameworkRoot, agentDir, ctxRoot: join(root, 'ctx'), mode: 'fresh' });
+    const before = composeEmployeeContext({ frameworkRoot, agentDir, agentName, ctxRoot: join(root, 'ctx'), mode: 'fresh' });
     writeFileSync(join(frameworkRoot, 'templates', 'context', 'employee-core.md'), 'REFRESHED CORE\n');
     const after = composeEmployeeContext({
-      frameworkRoot, agentDir, ctxRoot: join(root, 'ctx'), mode: 'continuation', handoff: 'next action: verify\n',
+      frameworkRoot, agentDir, agentName, ctxRoot: join(root, 'ctx'), mode: 'continuation', handoff: 'next action: verify\n',
     });
     expect(after.text).toContain('REFRESHED CORE');
     expect(after.blocks.find(item => item.source_ref.endsWith('IDENTITY.md'))?.text)
       .toBe(before.blocks.find(item => item.source_ref.endsWith('IDENTITY.md'))?.text);
     expect(after.blocks.at(-1)?.text).toBe('next action: verify\n');
     expect(() => composeEmployeeContext({
-      frameworkRoot, agentDir, ctxRoot: join(root, 'ctx'), mode: 'continuation', handoff: 'x'.repeat(HANDOFF_MAX_BYTES + 1),
+      frameworkRoot, agentDir, agentName, ctxRoot: join(root, 'ctx'), mode: 'continuation', handoff: 'x'.repeat(HANDOFF_MAX_BYTES + 1),
     })).toThrow(/CONTEXT_BUDGET_EXCEEDED/);
   });
 
   it('materializes one logical packet with semantic parity for all three harnesses', () => {
-    const packet = composeEmployeeContext({ frameworkRoot, agentDir, ctxRoot: join(root, 'ctx'), mode: 'fresh' });
+    const packet = composeEmployeeContext({ frameworkRoot, agentDir, agentName, ctxRoot: join(root, 'ctx'), mode: 'fresh' });
     const outputs = ['claude-code', 'codex-app-server', 'opencode'].map(runtime => materializeContextPacket(packet, runtime as never));
     expect(new Set(outputs.map(output => output.packet_digest)).size).toBe(1);
     expect(outputs.map(output => output.routes)).toEqual([packet.routes, packet.routes, packet.routes]);
+  });
+
+  it('applies an override only to the named Employee', () => {
+    const ctxRoot = join(root, 'ctx');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    writeFileSync(join(ctxRoot, 'config', 'context-overrides.json'), JSON.stringify({
+      schema_version: 2,
+      employees: { ada: { rules: { 'employee-core': { content: 'ADA ONLY\n', disabled: false, mutation_id: 'm-ada' } } } },
+    }));
+    expect(composeEmployeeContext({ frameworkRoot, agentDir, agentName: 'ada', ctxRoot, mode: 'fresh' }).text).toContain('ADA ONLY');
+    expect(composeEmployeeContext({ frameworkRoot, agentDir, agentName: 'grace', ctxRoot, mode: 'fresh' }).text).toContain('CURRENT CORE');
   });
 
   it('builds a tiny Work Session packet without Employee or org context', () => {

@@ -38,7 +38,7 @@ describe('owner context controls', () => {
     });
     expect(result.status).toBe('applied');
     const overrides = JSON.parse(readFileSync(join(ctxRoot, 'config', 'context-overrides.json'), 'utf8'));
-    expect(overrides.rules['employee-core']).toMatchObject({ mutation_id: mutationId, decision: 'approve_merge' });
+    expect(overrides.employees.ada.rules['employee-core']).toMatchObject({ mutation_id: mutationId, decision: 'approve_merge', agent_name: 'ada' });
     expect(readCrewLifecycleAuditEvents(ctxRoot, 'context-override-audit.jsonl')).toEqual([
       expect.objectContaining({ event_id: mutationId, action: 'approve_merge', result: 'success' }),
     ]);
@@ -62,8 +62,24 @@ describe('owner context controls', () => {
       proposal_digest: review.proposal_digest, mutation_id: mutationId, failAt: 'after-state',
     })).toThrow(/MUTATION_PENDING/);
     const overrides = JSON.parse(readFileSync(join(ctxRoot, 'config', 'context-overrides.json'), 'utf8'));
-    expect(overrides.rules['employee-core'].mutation_id).toBe(mutationId);
+    expect(overrides.employees.ada.rules['employee-core'].mutation_id).toBe(mutationId);
     reconcileCrewMutationJournal(ctxRoot);
     expect(readCrewLifecycleAuditEvents(ctxRoot, 'context-override-audit.jsonl')).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'))[0])
+      .toMatchObject({ stage: 'finalized', final_result: { result: 'success' } });
+  });
+
+  it('scopes owner decisions to the reviewed Employee', () => {
+    const graceDir = join(frameworkRoot, 'orgs', 'platform', 'agents', 'grace');
+    mkdirSync(join(graceDir, 'context'), { recursive: true });
+    writeFileSync(join(graceDir, 'context', 'employee-core.md'), 'grace local addition\n');
+    const review = getContextOwnershipReview({ ctxRoot, frameworkRoot, agentDir, agentName: 'ada', rule_id: 'employee-core' });
+    applyContextOwnerDecision({
+      ctxRoot, frameworkRoot, agentDir, agentName: 'ada', actor: 'owner:1', decision: 'disable_default',
+      rule_id: 'employee-core', proposal_digest: review.proposal_digest,
+      mutation_id: '866a6742-b72e-41d3-944e-3fdd54b32d75',
+    });
+    expect(getContextOwnershipReview({ ctxRoot, frameworkRoot, agentDir, agentName: 'ada', rule_id: 'employee-core' }).audit_status).toBe('applied');
+    expect(getContextOwnershipReview({ ctxRoot, frameworkRoot, agentDir: graceDir, agentName: 'grace', rule_id: 'employee-core' }).audit_status).toBe('none');
   });
 });

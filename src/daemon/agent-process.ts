@@ -902,6 +902,7 @@ export class AgentProcess {
     const packet = composeEmployeeContext({
       frameworkRoot: this.env.frameworkRoot,
       agentDir: this.env.agentDir,
+      agentName: this.name,
       ctxRoot: this.env.ctxRoot,
       mode: isHandoffRestart ? 'continuation' : 'fresh',
       projectRoot: this.config.working_directory,
@@ -926,6 +927,7 @@ export class AgentProcess {
     const packet = composeEmployeeContext({
       frameworkRoot: this.env.frameworkRoot,
       agentDir: this.env.agentDir,
+      agentName: this.name,
       ctxRoot: this.env.ctxRoot,
       mode: 'continuation',
       projectRoot: this.config.working_directory,

@@ -25,6 +25,7 @@ import { classifyContextOwnership, proposeContextMerge } from './ownership.js';
 export type ContextOwnerDecision = 'approve_merge' | 'replace_default' | 'disable_default';
 
 interface ContextOverrideRule {
+  agent_name: string;
   rule_id: string;
   decision: ContextOwnerDecision;
   content: string | null;
@@ -38,8 +39,8 @@ interface ContextOverrideRule {
 }
 
 interface ContextOverridesState {
-  schema_version: 1;
-  rules: Record<string, ContextOverrideRule>;
+  schema_version: 2;
+  employees: Record<string, { rules: Record<string, ContextOverrideRule> }>;
 }
 
 export interface ContextOwnershipReview {
@@ -69,10 +70,10 @@ function overridesPath(ctxRoot: string): string {
 
 function readOverrides(ctxRoot: string): ContextOverridesState {
   const path = overridesPath(ctxRoot);
-  if (!existsSync(path)) return { schema_version: 1, rules: {} };
+  if (!existsSync(path)) return { schema_version: 2, employees: {} };
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as ContextOverridesState;
-    if (parsed.schema_version !== 1 || !parsed.rules || typeof parsed.rules !== 'object') throw new Error('invalid');
+    if (parsed.schema_version !== 2 || !parsed.employees || typeof parsed.employees !== 'object') throw new Error('invalid');
     return parsed;
   } catch {
     throw new Error('CONTEXT_OVERRIDES_CORRUPT');
@@ -103,8 +104,17 @@ function assertRuleId(ruleId: string): void {
   if (!/^[a-z0-9_-]{1,64}$/.test(ruleId)) throw new Error('INVALID_RULE_ID');
 }
 
+function assertAgentName(agentName: string): void {
+  if (!/^[a-z0-9_-]{1,64}$/.test(agentName)) throw new Error('INVALID_AGENT_NAME');
+}
+
+function employeeRule(state: ContextOverridesState, agentName: string, ruleId: string): ContextOverrideRule | undefined {
+  return state.employees[agentName]?.rules[ruleId];
+}
+
 export function getContextOwnershipReview(input: ContextOwnerPaths): ContextOwnershipReview {
   assertRuleId(input.rule_id);
+  assertAgentName(input.agentName);
   const frameworkPath = join(input.frameworkRoot, 'templates', 'context', `${input.rule_id}.md`);
   if (!existsSync(frameworkPath)) throw new Error('CONTEXT_RULE_NOT_FOUND');
   const current = readFileSync(frameworkPath, 'utf8');
@@ -122,7 +132,7 @@ export function getContextOwnershipReview(input: ContextOwnerPaths): ContextOwne
   const proposal = preserved === null || classification === 'framework'
     ? { content: current, digest: digestCrewAuditValue(current), explanation: 'Current framework bytes remain effective until an explicit owner decision.' }
     : proposeContextMerge(current, preserved);
-  const applied = readOverrides(input.ctxRoot).rules[input.rule_id];
+  const applied = employeeRule(readOverrides(input.ctxRoot), input.agentName, input.rule_id);
   return {
     rule_id: input.rule_id,
     classification,
@@ -159,14 +169,16 @@ export function applyContextOwnerDecision(input: ContextOwnerPaths & {
       : '';
   const effectiveDigest = digestCrewAuditValue(effectiveContent);
   const requestDigest = digestCrewAuditValue({
+    agent_name: input.agentName,
     decision: input.decision,
     rule_id: input.rule_id,
     proposal_digest: input.proposal_digest,
     replacement_digest: input.replacement ? digestCrewAuditValue(input.replacement) : null,
   });
   const stateBefore = readOverrides(input.ctxRoot);
-  const beforeDigest = digestCrewAuditValue(stateBefore.rules[input.rule_id] ?? null);
+  const beforeDigest = digestCrewAuditValue(employeeRule(stateBefore, input.agentName, input.rule_id) ?? null);
   const record: ContextOverrideRule = {
+    agent_name: input.agentName,
     rule_id: input.rule_id,
     decision: input.decision,
     content: input.decision === 'disable_default' ? null : effectiveContent,
@@ -186,7 +198,7 @@ export function applyContextOwnerDecision(input: ContextOwnerPaths & {
       throw new Error('IDEMPOTENCY_CONFLICT');
     }
     if (priorMutation.stage === 'finalized' && priorMutation.final_result?.result === 'success') {
-      return { status: 'applied' as const, rule: readOverrides(input.ctxRoot).rules[input.rule_id] };
+      return { status: 'applied' as const, rule: employeeRule(readOverrides(input.ctxRoot), input.agentName, input.rule_id) };
     }
     throw new Error('MUTATION_PENDING');
   }
@@ -209,7 +221,9 @@ export function applyContextOwnerDecision(input: ContextOwnerPaths & {
       const freshReview = getContextOwnershipReview(input);
       if (freshReview.proposal_digest !== input.proposal_digest) throw new Error('STALE_PROPOSAL');
       const current = readOverrides(input.ctxRoot);
-      current.rules[input.rule_id] = record;
+      const employee = current.employees[input.agentName] ?? { rules: {} };
+      employee.rules[input.rule_id] = record;
+      current.employees[input.agentName] = employee;
       durableWrite(overridesPath(input.ctxRoot), current);
     });
     stateCommitted = true;
