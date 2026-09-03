@@ -127,6 +127,10 @@ export function messageIsFromCrewTarget(agent: Pick<CrewChatAgent, 'kind' | 'nam
   return from === (agent.kind === 'work_session' ? agent.targetId : agent.name);
 }
 
+export function shouldSpeakMessage(agent: Pick<CrewChatAgent, 'kind' | 'name' | 'targetId'>, from: string): boolean {
+  return messageIsFromCrewTarget(agent, from);
+}
+
 export function deliveryStateLabel(state?: BusMessage['delivery_state']): string {
   return state === 'pending' ? 'sending' : state === 'indeterminate' ? 'delivery unknown' : '';
 }
@@ -138,6 +142,10 @@ export function retainedSendMutationId(
   create: () => string,
 ): string {
   return pending?.target === target && pending.text === text ? pending.id : create();
+}
+
+export function shouldRetainMutationId(code?: string): boolean {
+  return ['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED'].includes(code ?? '');
 }
 
 /**
@@ -716,6 +724,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
   const recorder = useVoiceRecorder();
   const sendingRef = useRef(false);
   const pendingSendRef = useRef<{ id: string; target: string; text: string } | null>(null);
+  const terminalSendRef = useRef<{ target: string; text: string } | null>(null);
+  const [retryAnywayAvailable, setRetryAnywayAvailable] = useState(false);
   const pendingLifecycleRef = useRef<Map<string, string>>(new Map());
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -803,7 +813,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     for (const m of messages) {
       if (spoken.has(m.id)) continue;
       spoken.add(m.id);
-      if (m.from !== agent.name || !synth) continue;
+      if (!shouldSpeakMessage(agent, m.from) || !synth) continue;
       const clean = m.text
         .replace(IMAGE_URL_PATTERN, '')
         .replace(/https?:\/\/\S+/g, 'link')
@@ -813,7 +823,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       if (voiceRef.current) u.voice = voiceRef.current;
       synth.speak(u);
     }
-  }, [messages, ttsOn, loading, agent.name]);
+  }, [messages, ttsOn, loading, agent.kind, agent.name, agent.targetId]);
 
   // Pick the best system voice for spoken replies. iOS only exposes its
   // Siri-quality voices to the web AFTER the user downloads one (Settings →
@@ -1138,7 +1148,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     }
   }
 
-  async function handleSend() {
+  async function handleSend(options: { retryAnyway?: boolean } = {}) {
     if (sendingRef.current) return;
     if (!draft.trim() && attachments.length === 0) return;
     sendingRef.current = true;
@@ -1166,6 +1176,16 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       }
 
       const target = agent.targetId;
+      if (agent.kind === 'work_session' && terminalSendRef.current?.target === target
+        && terminalSendRef.current.text === messageText && !options.retryAnyway) {
+        setSendError('Delivery is unknown. Choose Retry anyway to create a new send intent.');
+        return;
+      }
+      if (options.retryAnyway) {
+        terminalSendRef.current = null;
+        pendingSendRef.current = null;
+        setRetryAnywayAvailable(false);
+      }
       const pending = pendingSendRef.current;
       const mutationId = agent.kind === 'work_session'
         ? retainedSendMutationId(pending, target, messageText, () => crypto.randomUUID())
@@ -1184,6 +1204,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       });
       if (res.ok) {
         pendingSendRef.current = null;
+        terminalSendRef.current = null;
+        setRetryAnywayAvailable(false);
         const sent = await res.json().catch(() => ({}));
         const realId = sent.messageId ?? `local-${Date.now()}`;
         localIdsRef.current.add(realId);
@@ -1214,7 +1236,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         setTimeout(fetchMessages, 500);
       } else {
         const data = await res.json().catch(() => ({}));
-        if (!['MUTATION_OUTCOME_UNKNOWN', 'DELIVERY_RETRY_REQUIRED', 'MUTATION_PENDING', 'RECOVERY_REQUIRED'].includes(data.code ?? '')) {
+        if (data.code === 'DELIVERY_RETRY_REQUIRED') {
+          pendingSendRef.current = null;
+          terminalSendRef.current = { target, text: messageText };
+          setRetryAnywayAvailable(true);
+        } else if (!shouldRetainMutationId(data.code)) {
           pendingSendRef.current = null;
         }
         setSendError(data.error || 'Failed to send');
@@ -1376,7 +1402,10 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
   );
 
   const errorLine = (sendError || recorder.error) ? (
-    <p className="mb-1 px-1 text-xs text-destructive">{sendError || recorder.error}</p>
+    <div className="mb-1 flex items-center gap-2 px-1 text-xs text-destructive">
+      <span>{sendError || recorder.error}</span>
+      {retryAnywayAvailable && <Button type="button" size="sm" variant="outline" onClick={() => void handleSend({ retryAnyway: true })}>Retry anyway</Button>}
+    </div>
   ) : null;
 
   const replyQuote = replyTarget ? (
@@ -1511,7 +1540,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
           <Button
             size="sm"
             className="shrink-0 self-end rounded-full"
-            onClick={handleSend}
+            onClick={() => void handleSend()}
             disabled={sendDisabled}
             aria-label="Send"
           >
@@ -1572,7 +1601,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         <Button
           size="icon"
           className="h-11 w-11 shrink-0 self-end rounded-full shadow-sm"
-          onClick={handleSend}
+          onClick={() => void handleSend()}
           disabled={sendDisabled}
           aria-label="Send"
         >

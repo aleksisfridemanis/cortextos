@@ -81,6 +81,30 @@ describe('Work Session routes', () => {
     expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({ data: { actor: 'owner:mobile-7' } }));
   });
 
+  it('uses the verified Bearer principal for create, send, and lifecycle mutations', async () => {
+    const token = await new SignJWT({}).setProtectedHeader({ alg: 'HS256' }).setSubject('mobile-8')
+      .sign(new TextEncoder().encode(process.env.AUTH_SECRET));
+    const authorization = `Bearer ${token}`;
+    const { POST: create } = await import('../route');
+    expect((await create(request({
+      display_name: 'mobile', org: 'platform', harness: 'codex-app-server', requested_cwd: root,
+    }, { authorization }))).status).toBe(201);
+    expect(sendMock).toHaveBeenLastCalledWith(expect.objectContaining({ data: expect.objectContaining({ actor: 'owner:mobile-8' }) }));
+
+    const { POST: send } = await import('../../messages/send/route');
+    expect((await send(new NextRequest('http://localhost/api/messages/send', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization, 'x-cortext-mutation-id': '22222222-2222-4222-8222-222222222222' },
+      body: JSON.stringify({ target_kind: 'work_session', work_session_id: 'ws-one', text: 'hello' }),
+    }))).status).toBe(200);
+    expect(sendMock).toHaveBeenLastCalledWith(expect.objectContaining({ data: expect.objectContaining({ actor: 'owner:mobile-8' }) }));
+
+    const { POST: lifecycle } = await import('../[id]/route');
+    expect((await lifecycle(request({ action: 'stop' }, {
+      authorization, 'x-cortext-intent': 'stop-work-session',
+    }), { params: Promise.resolve({ id: 'ws-one' }) })).status).toBe(200);
+    expect(sendMock).toHaveBeenLastCalledWith(expect.objectContaining({ data: expect.objectContaining({ actor: 'owner:mobile-8' }) }));
+  });
+
   it('rejects unauthenticated and oversized create requests', async () => {
     const { POST } = await import('../route');
     authMock.mockResolvedValueOnce(null as never);
@@ -116,7 +140,9 @@ describe('Work Session routes', () => {
   it.each(['MUTATION_PENDING', 'CREW_RECOVERY_REQUIRED', 'MUTATION_OUTCOME_UNKNOWN'])('maps %s create recovery to 503', async code => {
     const { POST } = await import('../route');
     sendMock.mockResolvedValueOnce({ success: false, code } as never);
-    expect((await POST(request({ display_name: 'x', org: 'platform', harness: 'codex-app-server', requested_cwd: root }))).status).toBe(503);
+    const response = await POST(request({ display_name: 'x', org: 'platform', harness: 'codex-app-server', requested_cwd: root }));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code, mutation_id: '11111111-1111-4111-8111-111111111111' });
   });
 
   it('maps a file-path cwd rejection to a client error', async () => {

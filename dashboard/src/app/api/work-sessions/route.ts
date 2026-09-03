@@ -9,7 +9,9 @@ export const dynamic = 'force-dynamic';
 const BODY_MAX = 131_072;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export class RouteError extends Error { constructor(readonly code: string, readonly status: number, message: string) { super(message); } }
+export class RouteError extends Error {
+  constructor(readonly code: string, readonly status: number, message: string, readonly mutationId?: string) { super(message); }
+}
 
 async function actor(request?: NextRequest): Promise<string> {
   const principal = await authenticatedWorkSessionOwner(request);
@@ -65,11 +67,13 @@ export async function POST(request: NextRequest) {
       type: 'create-work-session', source: 'dashboard', mutation_id: mutationId,
       data: { display_name: body.display_name, org: body.org, harness: body.harness, requested_cwd: body.requested_cwd, model: body.model, initial_request: body.initial_request, actor: owner },
     });
-    if (!response.success) throw new RouteError(response.code ?? 'CREATE_FAILED', statusFor(response.code), 'Unable to create Work Session');
+    if (!response.success) throw new RouteError(response.code ?? 'CREATE_FAILED', statusFor(response.code), 'Unable to create Work Session', mutationId);
     const data = response.data as { session?: unknown };
     return Response.json({ ...data, session: publicWorkSession(data?.session) }, { status: 201 });
   } catch (error) {
     const route = error instanceof RouteError ? error : new RouteError('CREATE_FAILED', 500, 'Unable to create Work Session');
-    return Response.json({ error: route.message, code: route.code }, { status: route.status });
+    return Response.json({
+      error: route.message, code: route.code, ...(route.mutationId ? { mutation_id: route.mutationId } : {}),
+    }, { status: route.status });
   }
 }

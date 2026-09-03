@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   CREW_EMPLOYEE_HARNESSES,
   buildCreateChatRequest,
+  createChatRequestKey,
   initialCreateChatState,
+  retainedCreateMutationId,
 } from '../create-chat-dialog';
 
 describe('CreateChatDialog contract', () => {
@@ -42,5 +44,13 @@ describe('CreateChatDialog contract', () => {
       headers: { 'content-type': 'application/json', 'x-cortext-intent': 'create-work-session', 'x-cortext-mutation-id': '28d64d6a-b787-46e4-8bb2-a488909a60d2' },
       body: { display_name: 'release', org: 'platform', harness: 'codex-app-server', model: undefined, requested_cwd: '/workspace' },
     });
+  });
+
+  it('retains a creation mutation only while the exact request binding is unchanged', () => {
+    const state = { ...initialCreateChatState(), name: 'ada', org: 'platform' };
+    const key = createChatRequestKey(state);
+    const pending = { mutationId: 'original', requestKey: key };
+    expect(retainedCreateMutationId(pending, key, () => 'new')).toBe('original');
+    expect(retainedCreateMutationId(pending, createChatRequestKey({ ...state, name: 'grace' }), () => 'new')).toBe('new');
   });
 });

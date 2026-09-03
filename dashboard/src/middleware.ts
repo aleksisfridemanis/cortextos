@@ -61,7 +61,7 @@ export async function middleware(request: NextRequest) {
       headers: {
         'Access-Control-Allow-Origin': corsOrigin,
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Cortext-Intent, X-Cortext-Mutation-Id',
         'Access-Control-Max-Age': '86400',
         'Vary': 'Origin',
       },

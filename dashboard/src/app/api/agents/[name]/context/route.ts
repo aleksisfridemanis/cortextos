@@ -8,7 +8,7 @@ const BODY_MAX = 131_072;
 function statusFor(code?: string): number {
   if (code === 'EMPLOYEE_NOT_FOUND') return 404;
   if (code === 'STALE_PROPOSAL' || code === 'IDEMPOTENCY_CONFLICT') return 409;
-  if (code === 'MUTATION_PENDING') return 503;
+  if (['MUTATION_PENDING', 'MUTATION_OUTCOME_UNKNOWN', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED'].includes(code ?? '')) return 503;
   return 400;
 }
 
@@ -61,6 +61,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       replacement: body.replacement,
     },
   });
-  if (!response.success) return Response.json({ error: response.error ?? 'Context decision rejected', code: response.code }, { status: statusFor(response.code) });
+  if (!response.success) return Response.json({
+    error: response.error ?? 'Context decision rejected', code: response.code,
+    mutation_id: request.headers.get('x-cortext-mutation-id') ?? '',
+  }, { status: statusFor(response.code) });
   return Response.json(response.data);
 }

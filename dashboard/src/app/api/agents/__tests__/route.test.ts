@@ -48,4 +48,12 @@ describe('Employee creation route rate limit', () => {
     expect(await response.json()).toEqual({ error: 'Rate limit exceeded', code: 'RATE_LIMITED' });
     expect(mocks.send).not.toHaveBeenCalled();
   });
+
+  it.each(['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED'])('returns retryable %s with the original mutation id', async code => {
+    mocks.send.mockResolvedValueOnce({ success: false, code, error: 'pending' } as never);
+    const { POST } = await import('../route');
+    const response = await POST(request());
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code, mutation_id: '11111111-1111-4111-8111-111111111111' });
+  });
 });

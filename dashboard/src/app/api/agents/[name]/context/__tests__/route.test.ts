@@ -48,4 +48,14 @@ describe('Employee context ownership route', () => {
       data: expect.objectContaining({ agentName: 'ada', actor: 'owner:7' }),
     }));
   });
+
+  it.each(['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED'])('maps %s to retryable status with the request id', async code => {
+    mockAuth.mockResolvedValue({ user: { id: '7' } });
+    mockSend.mockResolvedValueOnce({ success: false, code, error: 'pending' });
+    const response = await route.POST(request('POST', {
+      decision: 'approve_merge', rule_id: 'employee-core', proposal_digest: 'a'.repeat(64),
+    }, { 'x-cortext-intent': 'context-owner-decision', 'x-cortext-mutation-id': '0a660181-a4fe-467a-a2f7-11299a7fb28a' }), { params: Promise.resolve({ name: 'ada' }) });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code, mutation_id: '0a660181-a4fe-467a-a2f7-11299a7fb28a' });
+  });
 });

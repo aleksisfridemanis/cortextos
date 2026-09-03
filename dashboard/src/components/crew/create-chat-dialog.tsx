@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
@@ -59,12 +59,28 @@ export function buildCreateChatRequest(state: CreateChatState, mutationId: strin
   };
 }
 
+export function createChatRequestKey(state: CreateChatState): string {
+  const request = buildCreateChatRequest(state, 'binding');
+  return JSON.stringify({ endpoint: request.endpoint, body: request.body });
+}
+
+export function retainedCreateMutationId(
+  pending: { mutationId: string; requestKey: string } | null,
+  requestKey: string,
+  create: () => string,
+): string {
+  return pending?.requestKey === requestKey ? pending.mutationId : create();
+}
+
+const PENDING_CODES = new Set(['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED']);
+
 export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => void }) {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<CreateChatState>(initialCreateChatState);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [browseEntries, setBrowseEntries] = useState<Array<{ name: string; kind: string; canonical_path: string | null; warning: string | null }>>([]);
+  const pendingCreateRef = useRef<{ mutationId: string; requestKey: string } | null>(null);
   const valid = useMemo(() => state.name.length > 0 && state.org.length > 0
     && (state.kind === 'employee' || state.workingDirectory.length > 0), [state]);
 
@@ -82,10 +98,17 @@ export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => vo
     setSubmitting(true);
     setError(null);
     try {
-      const request = buildCreateChatRequest(state, crypto.randomUUID());
+      const requestKey = createChatRequestKey(state);
+      const mutationId = retainedCreateMutationId(pendingCreateRef.current, requestKey, () => crypto.randomUUID());
+      pendingCreateRef.current = { mutationId, requestKey };
+      const request = buildCreateChatRequest(state, mutationId);
       const response = await fetch(request.endpoint, { method: 'POST', headers: request.headers, body: JSON.stringify(request.body) });
-      const payload = await response.json().catch(() => ({})) as { error?: string; employee?: { name?: string }; session?: { id?: string } };
-      if (!response.ok) throw new Error(payload.error || 'Unable to create chat');
+      const payload = await response.json().catch(() => ({})) as { error?: string; code?: string; employee?: { name?: string }; session?: { id?: string } };
+      if (!response.ok) {
+        if (!PENDING_CODES.has(payload.code ?? '')) pendingCreateRef.current = null;
+        throw new Error(payload.error || 'Unable to create chat');
+      }
+      pendingCreateRef.current = null;
       const id = payload.employee?.name ?? payload.session?.id ?? state.name;
       setOpen(false);
       setState(initialCreateChatState());

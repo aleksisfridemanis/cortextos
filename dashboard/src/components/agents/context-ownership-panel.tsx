@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 
@@ -16,10 +16,25 @@ interface Review {
   audit_status: 'none' | 'applied';
 }
 
+export function contextDecisionKey(review: Pick<Review, 'rule_id' | 'proposal_digest'>, decision: string, replacement?: string): string {
+  return JSON.stringify({ rule_id: review.rule_id, proposal_digest: review.proposal_digest, decision, replacement: replacement ?? null });
+}
+
+export function retainedContextMutationId(
+  pending: { mutationId: string; requestKey: string } | null,
+  requestKey: string,
+  create: () => string,
+): string {
+  return pending?.requestKey === requestKey ? pending.mutationId : create();
+}
+
+const PENDING_CODES = new Set(['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED']);
+
 export function ContextOwnershipPanel({ agentName }: { agentName: string }) {
   const [review, setReview] = useState<Review | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const pendingDecisionRef = useRef<{ mutationId: string; requestKey: string } | null>(null);
   const load = useCallback(async () => {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentName)}/context`, { cache: 'no-store' });
     const body = await response.json();
@@ -31,8 +46,12 @@ export function ContextOwnershipPanel({ agentName }: { agentName: string }) {
 
   async function decide(decision: 'approve_merge' | 'replace_default' | 'disable_default') {
     if (!review || !window.confirm(`Confirm ${decision.replaceAll('_', ' ')} for ${review.rule_id}?`)) return;
-    const replacement = decision === 'replace_default' ? window.prompt('Enter the complete replacement safety content') : undefined;
-    if (decision === 'replace_default' && !replacement) return;
+    const replacementInput = decision === 'replace_default' ? window.prompt('Enter the complete replacement safety content') : undefined;
+    if (decision === 'replace_default' && !replacementInput) return;
+    const replacement = replacementInput ?? undefined;
+    const requestKey = contextDecisionKey(review, decision, replacement);
+    const mutationId = retainedContextMutationId(pendingDecisionRef.current, requestKey, () => crypto.randomUUID());
+    pendingDecisionRef.current = { mutationId, requestKey };
     setBusy(true);
     setError(null);
     try {
@@ -41,12 +60,16 @@ export function ContextOwnershipPanel({ agentName }: { agentName: string }) {
         headers: {
           'content-type': 'application/json',
           'x-cortext-intent': 'context-owner-decision',
-          'x-cortext-mutation-id': crypto.randomUUID(),
+          'x-cortext-mutation-id': mutationId,
         },
         body: JSON.stringify({ decision, rule_id: review.rule_id, proposal_digest: review.proposal_digest, replacement }),
       });
       const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? 'Context decision rejected');
+      if (!response.ok) {
+        if (!PENDING_CODES.has(body.code ?? '')) pendingDecisionRef.current = null;
+        throw new Error(body.error ?? 'Context decision rejected');
+      }
+      pendingDecisionRef.current = null;
       await load();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Context decision rejected');

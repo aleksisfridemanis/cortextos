@@ -114,7 +114,7 @@ function getIpcPath(instanceId: string = 'default'): string {
 }
 
 export function ipcRequestDeadline(request: IPCRequest): number {
-  return request.mutation_id ? 70_000 : 5_000;
+  return request.mutation_id ? 70_000 : request.type === 'reconcile-crew' ? 120_000 : 5_000;
 }
 
 export class IPCClient {

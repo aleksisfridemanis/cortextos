@@ -79,10 +79,12 @@ export async function POST(request: NextRequest) {
     });
     if (!result.success) {
       const status = result.code === 'CONFLICT' || result.code === 'IDEMPOTENCY_CONFLICT' ? 409
-        : result.code === 'ORG_NOT_FOUND' ? 404
-          : result.code === 'MUTATION_PENDING' || result.code === 'REGISTRY_CORRUPT' ? 503
+        : result.code === 'ORG_NOT_FOUND' || result.code === 'CWD_NOT_FOUND' ? 404
+          : ['MUTATION_PENDING', 'MUTATION_OUTCOME_UNKNOWN', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED', 'REGISTRY_CORRUPT'].includes(result.code ?? '') ? 503
             : result.code === 'CREATE_FAILED' ? 500 : 400;
-      throw new RouteError(result.code ?? 'CREATE_FAILED', status, result.error ?? 'Failed to create Employee');
+      return Response.json({
+        error: result.error ?? 'Failed to create Employee', code: result.code ?? 'CREATE_FAILED', mutation_id: mutationId,
+      }, { status });
     }
     return Response.json(result.data, { status: 201 });
   } catch (cause) {

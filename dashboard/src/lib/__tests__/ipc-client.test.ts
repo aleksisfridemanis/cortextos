@@ -17,6 +17,7 @@ describe('IPC request deadlines', () => {
   it('outlives daemon Work Session and Employee mutation bounds', () => {
     expect(ipcRequestDeadline({ type: 'create-work-session', mutation_id: 'mutation' })).toBeGreaterThan(45_000);
     expect(ipcRequestDeadline({ type: 'status' })).toBe(5_000);
+    expect(ipcRequestDeadline({ type: 'reconcile-crew' })).toBeGreaterThan(20_000);
   });
 
   it('returns the original mutation id when a daemon outcome exceeds the client deadline', async () => {
