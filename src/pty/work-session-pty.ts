@@ -294,14 +294,19 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     else if (handle.runtime === 'codex-app-server') await this.startCodex(input, handle.thread_id);
     else await this.startOpenCode(input, handle.session_id);
     this.currentHandle = handle;
-    const owner = this.requireCurrentOwner(input.mutation_id);
-    this.persistRuntimeReceipt(owner, handle);
-    if (this.options.record.harness === 'claude-code' || this.options.record.harness === 'opencode') {
-      await this.send('Reply with OK to confirm runtime readiness.');
+    try {
+      const owner = this.requireCurrentOwner(input.mutation_id);
+      this.persistRuntimeReceipt(owner, handle);
+      if (this.options.record.harness === 'claude-code' || this.options.record.harness === 'opencode') {
+        await this.send('Reply with OK to confirm runtime readiness.');
+      }
+      if (this.options.record.harness === 'opencode' && this.ambientOpenCodeCommands) throw new Error('AMBIENT_CONFIG_DETECTED');
+      this.ready = true;
+      return { runtime_owner: owner };
+    } catch (error) {
+      await this.stop();
+      throw error;
     }
-    if (this.options.record.harness === 'opencode' && this.ambientOpenCodeCommands) throw new Error('AMBIENT_CONFIG_DETECTED');
-    this.ready = true;
-    return { runtime_owner: owner };
   }
 
   async send(text: string): Promise<void> {
