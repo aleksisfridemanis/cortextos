@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { copyPayload, shouldRefocus, draftKey } from '../crew-chat';
+import { copyPayload, shouldRefocus, draftKey, workSessionLifecycleAction } from '../crew-chat';
 import { shouldTriggerPullRefresh, resolveInitialSelection } from '../use-crew';
 import { prefetchTargets } from '../crew-roster';
 import type { RosterEntry } from '../crew-roster';
@@ -86,6 +86,17 @@ describe('shouldRefocus', () => {
 
   it('refocuses when the click target is null', () => {
     expect(shouldRefocus(null, false, false)).toBe(true);
+  });
+});
+
+describe('workSessionLifecycleAction', () => {
+  it('offers only actions the lifecycle API can execute', () => {
+    expect(workSessionLifecycleAction('active', false)).toBe('stop');
+    expect(workSessionLifecycleAction('archived', true)).toBe('resume');
+    expect(workSessionLifecycleAction('failed', true)).toBe('resume');
+    expect(workSessionLifecycleAction('failed', false)).toBeNull();
+    expect(workSessionLifecycleAction('starting', true)).toBeNull();
+    expect(workSessionLifecycleAction('stopping', true)).toBeNull();
   });
 });
 

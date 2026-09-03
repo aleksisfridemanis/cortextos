@@ -56,6 +56,7 @@ export interface CrewMember {
   roomId?: string;
   lifecycle?: 'starting' | 'active' | 'stopping' | 'archived' | 'failed';
   harness?: 'claude-code' | 'codex-app-server' | 'opencode';
+  resumable?: boolean;
 }
 
 /**

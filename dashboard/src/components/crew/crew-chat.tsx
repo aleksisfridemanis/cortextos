@@ -583,6 +583,16 @@ export interface CrewChatAgent {
   roomId?: string;
   lifecycle?: 'starting' | 'active' | 'stopping' | 'archived' | 'failed';
   harness?: 'claude-code' | 'codex-app-server' | 'opencode';
+  resumable?: boolean;
+}
+
+export function workSessionLifecycleAction(
+  lifecycle: CrewChatAgent['lifecycle'],
+  resumable: boolean | undefined,
+): 'stop' | 'resume' | null {
+  if (lifecycle === 'active') return 'stop';
+  if ((lifecycle === 'archived' || lifecycle === 'failed') && resumable) return 'resume';
+  return null;
 }
 
 interface CrewChatProps {
@@ -1568,6 +1578,10 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
 
   const pillClass =
     'pointer-events-auto h-10 w-10 rounded-full border bg-card/80 p-0 text-muted-foreground shadow-sm backdrop-blur';
+  const lifecycleAction = workSessionLifecycleAction(agent.lifecycle, agent.resumable);
+  const lifecycleUnavailable = agent.lifecycle === 'starting' || agent.lifecycle === 'stopping'
+    ? agent.lifecycle
+    : 'Recovery required';
 
   // Frameless: Telegram-style floating layout. The message list runs full-bleed
   // and scrolls behind translucent pill controls that float over the top and
@@ -1593,11 +1607,13 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
               <p className="truncate text-[11px] leading-tight">{status}</p>
             </div>
           </div>
-          {agent.kind === 'work_session' && (
-            <Button variant="ghost" size="sm" className="pointer-events-auto" onClick={() => runSessionAction(agent.lifecycle === 'active' ? 'stop' : 'resume')}>
-              {agent.lifecycle === 'active' ? 'Stop' : 'Resume'}
+          {agent.kind === 'work_session' && (lifecycleAction ? (
+            <Button variant="ghost" size="sm" className="pointer-events-auto" onClick={() => runSessionAction(lifecycleAction)}>
+              {lifecycleAction === 'stop' ? 'Stop' : 'Resume'}
             </Button>
-          )}
+          ) : (
+            <span className="pointer-events-auto px-2 text-[11px] capitalize text-muted-foreground">{lifecycleUnavailable}</span>
+          ))}
           <Button
             variant="ghost"
             size="icon"
@@ -1662,9 +1678,13 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         </div>
         {agent.kind === 'work_session' && (
           <div className="flex gap-1">
-            <Button variant="outline" size="sm" onClick={() => runSessionAction(agent.lifecycle === 'active' ? 'stop' : 'resume')}>
-              {agent.lifecycle === 'active' ? 'Stop' : 'Resume'}
-            </Button>
+            {lifecycleAction ? (
+              <Button variant="outline" size="sm" onClick={() => runSessionAction(lifecycleAction)}>
+                {lifecycleAction === 'stop' ? 'Stop' : 'Resume'}
+              </Button>
+            ) : (
+              <span className="self-center text-xs capitalize text-muted-foreground">{lifecycleUnavailable}</span>
+            )}
             <Button variant="outline" size="sm" disabled={agent.lifecycle !== 'active'} onClick={() => runSessionAction('promote')}>Promote</Button>
           </div>
         )}

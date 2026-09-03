@@ -322,6 +322,7 @@ export interface WorkSession {
   canonical_cwd: string;
   room_id: string;
   lifecycle: WorkSessionLifecycle;
+  resumable: boolean;
   mutation_id: string;
   created_at: string;
   updated_at: string;

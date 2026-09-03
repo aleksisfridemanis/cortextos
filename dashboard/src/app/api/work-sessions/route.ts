@@ -38,7 +38,10 @@ export function publicWorkSession(value: unknown) {
   const row = value as Record<string, unknown>;
   if (!row || typeof row !== 'object') return value;
   const { resume_handle: _resumeHandle, ...safe } = row;
-  return safe;
+  return {
+    ...safe,
+    resumable: ['archived', 'failed'].includes(String(row.lifecycle)) && Boolean(_resumeHandle),
+  };
 }
 
 export async function GET() {

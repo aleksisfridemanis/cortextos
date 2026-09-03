@@ -53,6 +53,16 @@ describe('Work Session routes', () => {
     expect((await POST(request({ display_name: 'x', harness: 'codex', requested_cwd: root, resume_handle: 'forged' }))).status).toBe(400);
   });
 
+  it('exposes resumability without exposing the native continuation handle', async () => {
+    const { publicWorkSession } = await import('../route');
+    expect(publicWorkSession({ lifecycle: 'archived', resume_handle: { thread_id: 'secret-thread' } }))
+      .toEqual({ lifecycle: 'archived', resumable: true });
+    expect(publicWorkSession({ lifecycle: 'failed', resume_handle: null }))
+      .toEqual({ lifecycle: 'failed', resumable: false });
+    expect(publicWorkSession({ lifecycle: 'starting', resume_handle: { thread_id: 'secret-thread' } }))
+      .toEqual({ lifecycle: 'starting', resumable: false });
+  });
+
   it('rejects unauthenticated and oversized create requests', async () => {
     const { POST } = await import('../route');
     authMock.mockResolvedValueOnce(null as never);

@@ -27,6 +27,7 @@ export interface CrewMember {
   roomId?: string;
   lifecycle?: 'starting' | 'active' | 'stopping' | 'archived' | 'failed';
   harness?: 'claude-code' | 'codex-app-server' | 'opencode';
+  resumable?: boolean;
 }
 
 /**
@@ -121,7 +122,7 @@ export async function GET() {
     const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard' });
     if (result.success && Array.isArray(result.data)) {
       for (const value of result.data) {
-        const session = value as { id?: string; display_name?: string; harness?: CrewMember['harness']; lifecycle?: CrewMember['lifecycle']; room_id?: string; org?: string };
+        const session = value as { id?: string; display_name?: string; harness?: CrewMember['harness']; lifecycle?: CrewMember['lifecycle']; room_id?: string; org?: string; resume_handle?: unknown };
         if (!session.id || !session.display_name || !session.room_id || !/^[a-z0-9_-]+$/.test(session.id)) continue;
         const messages = readRoomLog(ctxRoot, session.room_id);
         const last = messages.at(-1);
@@ -130,6 +131,7 @@ export async function GET() {
           tagline: `${session.harness ?? 'native'} Work Session`, avatarVersion: null,
           lastActivity: last?.timestamp ?? null, lastPreview: last?.text ?? null,
           roomId: session.room_id, lifecycle: session.lifecycle, harness: session.harness,
+          resumable: ['archived', 'failed'].includes(session.lifecycle ?? '') && Boolean(session.resume_handle),
         });
       }
     }
