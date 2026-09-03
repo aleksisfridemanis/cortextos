@@ -283,7 +283,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private claudeIsolationError: Error | null = null;
   private readonly claudeTurnResults: Array<true | Error> = [];
   private ambientOpenCodeCommands = false;
-  private readonly codexTurnCompletions: Array<string | Error> = [];
+  private readonly codexTurnCompletions: Array<{ threadId: string; turnId: string } | Error> = [];
   private claudeAckPath: string | null = null;
 
   constructor(private readonly options: NativeWorkSessionOptions) {
@@ -362,11 +362,14 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       }) as { turn?: { id?: string } };
       const turnId = started?.turn?.id;
       if (!turnId) throw new Error('RUNTIME_REQUEST_REJECTED');
-      let completed: string | Error;
+      let completed: { threadId: string; turnId: string } | Error;
+      const exactThreadId = this.currentThreadId;
+      if (!exactThreadId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
       try {
         completed = await waitFor(() => {
           if (!this.pty) return new Error('WORK_SESSION_NOT_RUNNING');
-          const index = this.codexTurnCompletions.findIndex(item => item instanceof Error || item === turnId || item === '*');
+          const index = this.codexTurnCompletions.findIndex(item => item instanceof Error
+            || (item.threadId === exactThreadId && item.turnId === turnId));
           return index < 0 ? undefined : this.codexTurnCompletions.splice(index, 1)[0];
         }, this.turnTimeoutMs, 50, 'RUNTIME_TURN_TIMEOUT');
       } catch (error) {
@@ -600,6 +603,9 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
           this.claudeSessionId = value.session_id;
           if (!claudeInitIsIsolated(value)) this.claudeIsolationError = new Error('AMBIENT_CONFIG_DETECTED');
         }
+        if (value.type === 'assistant' && typeof value.error === 'string') {
+          this.claudeTurnResults.push(new Error(closedRuntimeErrorCode(value, 'claude-code', 'session/prompt')));
+        }
         if (value.type === 'result') {
           this.claudeTurnResults.push(value.is_error === true
             ? new Error(closedRuntimeErrorCode(value, 'claude-code', 'session/prompt'))
@@ -633,9 +639,17 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         if (value.method === 'turn/completed') {
           const params = value.params && typeof value.params === 'object' ? value.params as Record<string, unknown> : {};
           const turn = params.turn && typeof params.turn === 'object' ? params.turn as Record<string, unknown> : {};
-          this.codexTurnCompletions.push(typeof turn.id === 'string' ? turn.id : '*');
+          if (typeof params.threadId !== 'string' || typeof turn.id !== 'string' || typeof turn.status !== 'string') {
+            this.codexTurnCompletions.push(new Error('RUNTIME_REQUEST_REJECTED'));
+          } else if (turn.status === 'completed') {
+            this.codexTurnCompletions.push({ threadId: params.threadId, turnId: turn.id });
+          } else if (params.threadId === this.currentThreadId) {
+            this.codexTurnCompletions.push(new Error(closedRuntimeErrorCode(turn, 'codex-app-server', 'turn/completed')));
+          }
         }
-        if (value.method === 'error') this.codexTurnCompletions.push(new Error('RUNTIME_REQUEST_REJECTED'));
+        if (value.method === 'error') {
+          this.codexTurnCompletions.push(new Error(closedRuntimeErrorCode(value.params ?? value.error ?? value, 'codex-app-server', 'turn/completed')));
+        }
         const output = this.completedOutput(value);
         if (output && this.ready) this.emitOutput(output);
       } catch {
@@ -742,7 +756,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       return { id: typeof item.id === 'string' ? item.id : this.fallbackOutputId(item.text), text: item.text.trim() };
     }
     const message = value.message && typeof value.message === 'object' ? value.message as Record<string, unknown> : null;
-    if (value.type === 'assistant' && Array.isArray(message?.content)) {
+    if (value.type === 'assistant' && typeof value.error !== 'string' && Array.isArray(message?.content)) {
       const text = message.content.flatMap(part => part && typeof part === 'object' && (part as Record<string, unknown>).type === 'text'
         && typeof (part as Record<string, unknown>).text === 'string' ? [(part as Record<string, unknown>).text as string] : []).join('\n').trim();
       if (text) return { id: typeof value.uuid === 'string' ? value.uuid : this.fallbackOutputId(text), text };

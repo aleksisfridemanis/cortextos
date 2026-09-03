@@ -134,6 +134,23 @@ describe('WorkSessionPTY owned lifecycle', () => {
     expect(output).not.toHaveBeenCalled();
   });
 
+  it('correlates Codex completion by exact thread, turn, and successful status', () => {
+    const internals = adapter as unknown as {
+      currentThreadId: string;
+      codexTurnCompletions: Array<{ threadId: string; turnId: string } | Error>;
+      capture(value: string): void;
+    };
+    internals.currentThreadId = 'thread-exact';
+    internals.capture(`${JSON.stringify({ method: 'turn/completed', params: { threadId: 'other', turn: { id: 'turn-exact', status: 'completed' } } })}\n`);
+    expect(internals.codexTurnCompletions).toEqual([{ threadId: 'other', turnId: 'turn-exact' }]);
+    internals.codexTurnCompletions.length = 0;
+    internals.capture(`${JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-exact', turn: { id: 'turn-exact', status: 'failed', error: { code: 'model_not_found' } } } })}\n`);
+    expect(internals.codexTurnCompletions[0]).toMatchObject({ message: 'MODEL_UNSUPPORTED' });
+    internals.codexTurnCompletions.length = 0;
+    internals.capture(`${JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-exact', turn: { id: 'turn-exact' } } })}\n`);
+    expect(internals.codexTurnCompletions[0]).toMatchObject({ message: 'RUNTIME_REQUEST_REJECTED' });
+  });
+
   it('detects an ACP command catalog instead of accepting ambient OpenCode configuration', () => {
     const internals = adapter as unknown as { ambientOpenCodeCommands: boolean; capture(value: string): void };
     internals.capture(`${JSON.stringify({

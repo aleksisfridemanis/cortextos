@@ -15,4 +15,13 @@ describe('closedRuntimeErrorCode', () => {
     expect(closedRuntimeErrorCode({ code: -32000, message: 'model exploded at /secret' }, 'opencode', 'session/prompt'))
       .toBe('RUNTIME_REQUEST_REJECTED');
   });
+
+  it.each([
+    [{ type: 'assistant', error: 'model_not_found' }, 'claude-code', 'MODEL_UNSUPPORTED'],
+    [{ type: 'result', subtype: 'error', error: 'authentication_failed' }, 'claude-code', 'RUNTIME_AUTH_UNAVAILABLE'],
+    [{ turn: { status: 'failed', error: { code: 'sandbox_unavailable' } } }, 'codex-app-server', 'SANDBOX_UNAVAILABLE'],
+    [{ data: { error: { category: 'policy_rejected' } } }, 'opencode', 'POLICY_REJECTED'],
+  ] as const)('maps stable real-shape fields to closed codes', (frame, harness, expected) => {
+    expect(closedRuntimeErrorCode(frame, harness, 'turn/completed')).toBe(expected);
+  });
 });

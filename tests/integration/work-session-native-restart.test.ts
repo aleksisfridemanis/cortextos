@@ -61,7 +61,7 @@ process.stdin.on('data', chunk => {
       process.stdout.write(JSON.stringify({ method: 'item/completed', params: { item: {
         id: 'native-answer', type: 'agentMessage', text: 'native durable answer'
       } } }) + '\\n');
-      process.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'native-thread', turn: { id: 'native-turn' } } }) + '\\n');
+      process.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'native-thread', turn: { id: 'native-turn', status: 'completed' } } }) + '\\n');
     }
   }
 
@@ -172,7 +172,7 @@ setInterval(() => {}, 1000);
     const args = JSON.parse(readFileSync(join(cwd, 'launch-args.json'), 'utf8')) as string[];
     if (harness === 'claude-code') {
       expect(args).toEqual(expect.arrayContaining(['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands']));
-      expect(args).not.toContain('--safe-mode');
+      expect(args).toContain('--safe-mode');
     }
     else expect(args.slice(0, 3)).toEqual(['acp', '--cwd', cwd]);
     if (harness === 'opencode') {

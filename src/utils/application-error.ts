@@ -27,8 +27,15 @@ export function closedRuntimeErrorCode(error: unknown, harness?: string, method?
   const data = value.data && typeof value.data === 'object' && !Array.isArray(value.data)
     ? value.data as Record<string, unknown>
     : {};
-  const safeCategories = [value.code, value.type, data.code, data.type, data.category, data.reason]
-    .filter((candidate): candidate is string => typeof candidate === 'string');
+  const stableFields = ['code', 'type', 'category', 'reason', 'error', 'subtype', 'status'] as const;
+  const safeCategories: string[] = [];
+  const collect = (candidate: unknown, depth = 0): void => {
+    if (depth > 3 || !candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return;
+    const record = candidate as Record<string, unknown>;
+    for (const key of stableFields) if (typeof record[key] === 'string') safeCategories.push(record[key] as string);
+    for (const key of ['data', 'turn', 'result', 'error']) collect(record[key], depth + 1);
+  };
+  collect(value);
   const category = safeCategories.join(' ');
   const isModelMethod = method === 'session/set_config_option' || method === 'thread/start' || method === 'thread/resume';
   const structuredModel = (harness === 'opencode' || harness === 'codex-app-server') && isModelMethod
