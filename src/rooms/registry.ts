@@ -29,6 +29,10 @@ function isRoom(value: unknown): value is Room {
   return !!r && typeof r.id === 'string' && typeof r.kind === 'string';
 }
 
+export class RoomRegistryError extends Error {
+  readonly code = 'REGISTRY_CORRUPT';
+}
+
 /** All known rooms. Absent or corrupt registry => []. Never throws. */
 export function readRooms(ctxRoot: string): Room[] {
   try {
@@ -36,6 +40,19 @@ export function readRooms(ctxRoot: string): Room[] {
     return Array.isArray(parsed) ? parsed.filter(isRoom) : [];
   } catch {
     return [];
+  }
+}
+
+/** Mutating paths must never replace unreadable or structurally invalid state. */
+export function readRoomsStrict(ctxRoot: string): Room[] {
+  const path = registryPath(ctxRoot);
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
+    if (!Array.isArray(parsed) || !parsed.every(isRoom)) throw new Error('invalid');
+    return parsed;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new RoomRegistryError('Room registry requires operator recovery');
   }
 }
 
@@ -51,13 +68,19 @@ export function getRoom(ctxRoot: string, roomId: string): Room | null {
  * inside the lock, so a daemon and N agents upserting concurrently cannot
  * lose each other's entries.
  */
-export function upsertRoom(ctxRoot: string, room: Room): void {
+export function upsertRoom(
+  ctxRoot: string,
+  room: Room,
+  options: { strict?: boolean; alreadyLocked?: boolean } = {},
+): void {
   const dir = registryDir(ctxRoot);
   ensureDir(dir);
-  withFileLockSync(dir, () => {
-    const rooms = readRooms(ctxRoot);
+  const write = () => {
+    const rooms = options.strict ? readRoomsStrict(ctxRoot) : readRooms(ctxRoot);
     if (rooms.some(r => r.id === room.id)) return;
     rooms.push(room);
     atomicWriteSync(registryPath(ctxRoot), JSON.stringify(rooms, null, 2));
-  });
+  };
+  if (options.alreadyLocked) write();
+  else withFileLockSync(dir, write);
 }

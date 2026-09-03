@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -54,6 +54,33 @@ describe('WorkSessionManager', () => {
     const created = await manager.create({ display_name: 'Fix release', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '11111111-1111-4111-8111-111111111111');
     await manager.send(created.id, 'first', 'owner:test', '22222222-2222-4222-8222-222222222222');
     await expect(manager.send(created.id, 'different', 'owner:test', '22222222-2222-4222-8222-222222222222')).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+  });
+
+  it('compensates a record when room publication fails so the cwd lease is released', async () => {
+    const { cwd } = fixture();
+    const root = roots.at(-1)!;
+    const ctxRoot = join(root, 'ctx');
+    const adapter: WorkSessionRuntimeAdapter = {
+      startFresh: vi.fn(async () => ({ resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' } })),
+      resumeExact: vi.fn(async () => undefined), send: vi.fn(async () => undefined), stop: vi.fn(async () => undefined),
+      status: vi.fn(() => ({ running: true, pid: 1, error_code: null })), getResumeHandle: vi.fn(() => null),
+    };
+    const failing = new WorkSessionManager({ ctxRoot, adapterFactory: () => adapter, failAt: 'after-session-record' });
+    await expect(failing.create({ display_name: 'First', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '61111111-1111-4111-8111-111111111111')).rejects.toThrow();
+    expect(failing.list()).toEqual([]);
+    const succeeding = new WorkSessionManager({ ctxRoot, adapterFactory: () => adapter });
+    await expect(succeeding.create({ display_name: 'Second', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '71111111-1111-4111-8111-111111111111')).resolves.toMatchObject({ lifecycle: 'active' });
+  });
+
+  it('fails closed on a corrupt room registry without overwriting it or retaining a cwd lease', async () => {
+    const { manager, cwd } = fixture();
+    const ctxRoot = join(roots.at(-1)!, 'ctx');
+    const roomsPath = join(ctxRoot, 'config', 'rooms.json');
+    writeFileSync(roomsPath, '{corrupt');
+    await expect(manager.create({ display_name: 'Fix release', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '81111111-1111-4111-8111-111111111111'))
+      .rejects.toMatchObject({ code: 'REGISTRY_CORRUPT' });
+    expect(readFileSync(roomsPath, 'utf8')).toBe('{corrupt');
+    expect(manager.list()).toEqual([]);
   });
 
   it('archives before promotion and creates an Employee in the same room and cwd', async () => {

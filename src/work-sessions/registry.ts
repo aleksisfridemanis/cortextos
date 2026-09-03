@@ -134,6 +134,20 @@ export function transitionWorkSession(
   });
 }
 
+/** Compensate a create that failed before its room relation was published. */
+export function removeStartingWorkSessionRecord(ctxRoot: string, id: string, mutationId: string): void {
+  locked(ctxRoot, records => {
+    const index = records.findIndex(row => row.id === id);
+    if (index < 0) return;
+    const record = records[index];
+    if (record.lifecycle !== 'starting' || record.mutation_id !== mutationId) {
+      throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session create compensation requires recovery');
+    }
+    records.splice(index, 1);
+    durableWrite(ctxRoot, records);
+  });
+}
+
 
 export function setWorkSessionResumeHandle(ctxRoot: string, id: string, handle: WorkSessionRecord['resume_handle'], mutationId: string) {
   return transitionWorkSession(ctxRoot, id, ['starting'], 'active', { resume_handle: handle }, mutationId);

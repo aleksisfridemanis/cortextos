@@ -1,15 +1,16 @@
 import { randomUUID } from 'crypto';
 import { isAbsolute, join } from 'path';
-import { existsSync, lstatSync } from 'fs';
+import { existsSync, lstatSync, mkdirSync } from 'fs';
 import { digestCrewAuditValue } from '../audit/crew-lifecycle-audit.js';
 import {
   commitCrewMutationState, finalizeCrewMutationAudit, getCrewMutation, prepareCrewMutation,
   recordCrewMutationEffect, startCrewMutationEffect,
 } from '../audit/crew-mutation-journal.js';
 import { createEmployee as createEmployeeService, type CreateEmployeeInput } from '../agents/create-employee.js';
-import { createWorkSessionRecord, readWorkSessions, transitionWorkSession, WorkSessionRegistryError } from './registry.js';
+import { createWorkSessionRecord, readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession, WorkSessionRegistryError } from './registry.js';
 import { appendRoomMessage } from '../rooms/log.js';
-import { upsertRoom } from '../rooms/registry.js';
+import { RoomRegistryError, upsertRoom } from '../rooms/registry.js';
+import { withFileLockSync } from '../utils/lock.js';
 import type {
   CreateWorkSessionInput, WorkSessionEmployeeInput, WorkSessionRecord,
   WorkSessionResumeHandle, WorkSessionRuntimeAdapter,
@@ -31,6 +32,7 @@ interface Dependencies {
   frameworkRoot?: string;
   createEmployee?: (input: CreateEmployeeInput, mutationId: string) => Promise<unknown>;
   now?: () => string;
+  failAt?: 'after-session-record';
 }
 
 function safeId(mutationId: string): string { return `ws-${mutationId}`; }
@@ -132,14 +134,38 @@ export class WorkSessionManager {
         throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session mutation requires reconciliation');
       }
     }
-    let record = createWorkSessionRecord(this.dependencies.ctxRoot, {
-      id, display_name: input.display_name, org: input.org, harness: input.harness, requested_cwd: input.requested_cwd, model: input.model,
-      room_id: roomId, mutation_id: mutationId, created_by: input.actor,
-    }, this.now);
-    upsertRoom(this.dependencies.ctxRoot, {
-      id: roomId, kind: 'work_session', title: input.display_name, members: [], work_session_id: id,
-      created_at: record.created_at, created_by: input.actor, mutation_id: mutationId,
-    });
+    let record: WorkSessionRecord;
+    const configDir = join(this.dependencies.ctxRoot, 'config');
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    try {
+      record = withFileLockSync(configDir, () => {
+        const created = createWorkSessionRecord(this.dependencies.ctxRoot, {
+          id, display_name: input.display_name, org: input.org, harness: input.harness, requested_cwd: input.requested_cwd, model: input.model,
+          room_id: roomId, mutation_id: mutationId, created_by: input.actor,
+        }, this.now);
+        try {
+          if (this.dependencies.failAt === 'after-session-record') throw new Error('injected after Work Session record');
+          upsertRoom(this.dependencies.ctxRoot, {
+            id: roomId, kind: 'work_session', title: input.display_name, members: [], work_session_id: id,
+            created_at: created.created_at, created_by: input.actor, mutation_id: mutationId,
+          }, { strict: true, alreadyLocked: true });
+          return created;
+        } catch (error) {
+          removeStartingWorkSessionRecord(this.dependencies.ctxRoot, id, mutationId);
+          throw error;
+        }
+      });
+    } catch (error) {
+      const registryError = error instanceof RoomRegistryError
+        ? new WorkSessionRegistryError('REGISTRY_CORRUPT', error.message)
+        : error;
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+        result: 'failure', after_digest: digestCrewAuditValue(null),
+        error_code: registryError instanceof WorkSessionRegistryError ? registryError.code : 'CREATE_FAILED',
+        sanitized_error: 'Work Session publication failed',
+      });
+      throw registryError;
+    }
     commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
     try {
       startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
