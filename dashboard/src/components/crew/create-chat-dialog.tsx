@@ -23,10 +23,11 @@ export interface CreateChatState {
   harness: EmployeeHarness;
   model: string;
   workingDirectory: string;
+  initialRequest: string;
 }
 
 export function initialCreateChatState(): CreateChatState {
-  return { kind: 'employee', name: '', org: '', harness: 'claude-code', model: '', workingDirectory: '' };
+  return { kind: 'employee', name: '', org: '', harness: 'claude-code', model: '', workingDirectory: '', initialRequest: '' };
 }
 
 export function buildCreateChatRequest(state: CreateChatState, mutationId: string) {
@@ -53,6 +54,7 @@ export function buildCreateChatRequest(state: CreateChatState, mutationId: strin
       harness: state.harness,
       model: state.model || undefined,
       requested_cwd: state.workingDirectory,
+      ...(state.initialRequest ? { initial_request: state.initialRequest } : {}),
     },
   };
 }
@@ -62,8 +64,17 @@ export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => vo
   const [state, setState] = useState<CreateChatState>(initialCreateChatState);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [browseEntries, setBrowseEntries] = useState<Array<{ name: string; kind: string; canonical_path: string | null; warning: string | null }>>([]);
   const valid = useMemo(() => state.name.length > 0 && state.org.length > 0
     && (state.kind === 'employee' || state.workingDirectory.length > 0), [state]);
+
+  async function browse() {
+    const response = await fetch(`/api/work-sessions/browse?path=${encodeURIComponent(state.workingDirectory || '/')}`);
+    const value = await response.json().catch(() => ({}));
+    if (!response.ok) { setError(value.error ?? 'Unable to browse host'); return; }
+    setState(current => ({ ...current, workingDirectory: value.canonical_path }));
+    setBrowseEntries(Array.isArray(value.entries) ? value.entries : []);
+  }
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -110,8 +121,13 @@ export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => vo
               {CREW_EMPLOYEE_HARNESSES.map(harness => <option key={harness.value} value={harness.value}>{harness.label}</option>)}
             </select>
           </div>
+          {state.kind === 'work_session' && <div className="space-y-2"><Label htmlFor="crew-request">Initial request <span className="font-normal text-muted-foreground">(optional)</span></Label><Input id="crew-request" value={state.initialRequest} onChange={event => setState(current => ({ ...current, initialRequest: event.target.value }))} /></div>}
           <div className="space-y-2"><Label htmlFor="crew-model">Model <span className="font-normal text-muted-foreground">(harness default when blank)</span></Label><Input id="crew-model" value={state.model} onChange={event => setState(current => ({ ...current, model: event.target.value }))} /></div>
-          <div className="space-y-2"><Label htmlFor="crew-directory">Working directory {state.kind === 'employee' ? '(optional)' : ''}</Label><Input id="crew-directory" required={state.kind === 'work_session'} placeholder="/absolute/project/path" value={state.workingDirectory} onChange={event => setState(current => ({ ...current, workingDirectory: event.target.value }))} /></div>
+          <div className="space-y-2">
+            <Label htmlFor="crew-directory">Working directory {state.kind === 'employee' ? '(optional)' : ''}</Label>
+            <div className="flex gap-2"><Input id="crew-directory" required={state.kind === 'work_session'} placeholder="/absolute/project/path" value={state.workingDirectory} onChange={event => setState(current => ({ ...current, workingDirectory: event.target.value }))} />{state.kind === 'work_session' && <Button type="button" variant="outline" onClick={browse}>Browse</Button>}</div>
+            {state.kind === 'work_session' && browseEntries.length > 0 && <div className="max-h-36 overflow-y-auto rounded border p-1" aria-label="Host directories">{browseEntries.filter(entry => entry.kind === 'directory' && entry.canonical_path).map(entry => <button className="block w-full rounded px-2 py-1 text-left text-sm hover:bg-muted" type="button" key={entry.name} onClick={() => setState(current => ({ ...current, workingDirectory: entry.canonical_path! }))}>{entry.name}{entry.warning ? ' ⚠' : ''}</button>)}</div>}
+          </div>
           {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
           <DialogFooter><Button type="submit" disabled={!valid || submitting}>{submitting ? 'Creating…' : 'Create'}</Button></DialogFooter>
         </form>

@@ -1,6 +1,7 @@
 // Security (H8): SQLite-backed rate limiter — survives server restarts.
 // Fails closed if db is unavailable (denying is safer than allowing unlimited attempts).
 import { db } from '@/lib/db';
+import { createHash } from 'crypto';
 
 const MAX = 5;
 const WINDOW_MS = 15 * 60 * 1000; // 15 minutes
@@ -42,5 +43,28 @@ export function resetRateLimit(ip: string): void {
     db.prepare('DELETE FROM rate_limits WHERE ip = ?').run(ip);
   } catch (err) {
     console.error('[rate-limit] DB error on reset:', err);
+  }
+}
+
+export type CrewRateBucket = 'lifecycle' | 'message' | 'browse';
+const CREW_RATE_MAX: Record<CrewRateBucket, number> = { lifecycle: 20, message: 60, browse: 60 };
+const CREW_WINDOW_MS = 60_000;
+
+/** Fixed-window limiter keyed only by a digest of the authenticated actor. */
+export function checkCrewRateLimit(actor: string, bucket: CrewRateBucket, now = Date.now()): { allowed: boolean; retryAfter?: number } {
+  const key = `crew:${bucket}:${createHash('sha256').update(actor, 'utf8').digest('hex')}`;
+  try {
+    db.prepare('DELETE FROM rate_limits WHERE reset_at <= ?').run(now);
+    const row = db.prepare('SELECT count, reset_at FROM rate_limits WHERE ip = ?').get(key) as { count: number; reset_at: number } | undefined;
+    if (!row) {
+      db.prepare('INSERT INTO rate_limits (ip, count, reset_at) VALUES (?, 1, ?)').run(key, now + CREW_WINDOW_MS);
+      return { allowed: true };
+    }
+    if (row.count >= CREW_RATE_MAX[bucket]) return { allowed: false, retryAfter: Math.max(1, Math.ceil((row.reset_at - now) / 1000)) };
+    db.prepare('UPDATE rate_limits SET count = count + 1 WHERE ip = ?').run(key);
+    return { allowed: true };
+  } catch (error) {
+    console.error('[crew-rate-limit] DB error, failing closed:', error);
+    return { allowed: false, retryAfter: 60 };
   }
 }

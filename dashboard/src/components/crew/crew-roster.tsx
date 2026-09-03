@@ -5,12 +5,15 @@ import { CrewAvatar } from './crew-avatar';
 import type { CrewMood } from './crew-critter';
 
 export interface RosterEntry {
+  targetId?: string;
+  kind?: 'employee' | 'work_session';
   name: string;
   tagline: string;
   avatarVersion: number | null;
   lastActivity: string | null;
   lastPreview: string | null;
   mood: CrewMood;
+  lifecycle?: 'starting' | 'active' | 'stopping' | 'archived' | 'failed';
 }
 
 interface CrewRosterProps {
@@ -34,7 +37,7 @@ const PREFETCH_TOP_N = 2;
  * its own unit test.
  */
 export function prefetchTargets(agents: RosterEntry[], n: number): string[] {
-  return agents.slice(0, n).map((a) => a.name);
+  return agents.slice(0, n).map((a) => a.targetId ?? a.name);
 }
 
 /**
@@ -130,11 +133,11 @@ export function CrewRoster({ agents, selected, onSelect, variant, onPrefetch }: 
       <div className="flex flex-col gap-1 overflow-y-auto p-2">
         {agents.map((a) => (
           <button
-            key={a.name}
-            onClick={() => onSelect(a.name)}
-            onMouseEnter={() => onPrefetch?.(a.name)}
+            key={a.targetId ?? a.name}
+            onClick={() => onSelect(a.targetId ?? a.name)}
+            onMouseEnter={() => onPrefetch?.(a.targetId ?? a.name)}
             className={`flex w-full items-center gap-3 rounded-xl px-2.5 py-2 text-left transition-colors ${
-              selected === a.name ? 'bg-muted' : 'hover:bg-muted/50'
+              selected === (a.targetId ?? a.name) ? 'bg-muted' : 'hover:bg-muted/50'
             }`}
           >
             <div className="relative">
@@ -143,6 +146,7 @@ export function CrewRoster({ agents, selected, onSelect, variant, onPrefetch }: 
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-medium leading-tight">{a.name}</p>
+              {a.kind === 'work_session' && <p className="text-[10px] font-medium uppercase text-amber-600">Work Session · {a.lifecycle}</p>}
               <p className="truncate text-xs text-muted-foreground">{a.lastPreview ?? a.tagline}</p>
             </div>
             {a.mood === 'typing' && (
@@ -160,9 +164,9 @@ export function CrewRoster({ agents, selected, onSelect, variant, onPrefetch }: 
     <div className="overflow-y-auto">
       {agents.map((a) => (
         <button
-          key={a.name}
-          onClick={() => onSelect(a.name)}
-          onMouseEnter={() => onPrefetch?.(a.name)}
+          key={a.targetId ?? a.name}
+          onClick={() => onSelect(a.targetId ?? a.name)}
+          onMouseEnter={() => onPrefetch?.(a.targetId ?? a.name)}
           className="flex w-full items-center gap-3 border-b border-border/60 px-3 py-2.5 text-left transition-colors active:bg-muted/50"
         >
           <div className="relative shrink-0">
@@ -174,6 +178,7 @@ export function CrewRoster({ agents, selected, onSelect, variant, onPrefetch }: 
               <p className="min-w-0 flex-1 truncate text-[15px] font-semibold leading-tight">
                 {a.name}
               </p>
+              {a.kind === 'work_session' && <span className="shrink-0 text-[10px] font-medium uppercase text-amber-600">{a.lifecycle}</span>}
               {a.lastActivity && (
                 <span className="shrink-0 text-xs text-muted-foreground">
                   {formatChatTimestamp(a.lastActivity)}

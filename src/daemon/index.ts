@@ -6,6 +6,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
 import { reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
+import { runClaudeSessionReporter } from '../pty/claude-session-reporter.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -359,9 +360,14 @@ class Daemon {
 // with TelegramPollers, IPC server, and Claude PTY processes as a side effect.
 // See: https://github.com/grandamenium/cortextos/issues/44
 if (require.main === module) {
-  const daemon = new Daemon();
-  daemon.start().catch(err => {
-    console.error('[daemon] Fatal error:', err);
-    process.exit(1);
-  });
+  if (process.argv[2] === '--claude-session-report') {
+    process.argv.splice(2, 1);
+    runClaudeSessionReporter().catch(() => { process.exitCode = 1; });
+  } else {
+    const daemon = new Daemon();
+    daemon.start().catch(err => {
+      console.error('[daemon] Fatal error:', err);
+      process.exit(1);
+    });
+  }
 }

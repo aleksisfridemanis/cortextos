@@ -5,7 +5,7 @@ import {
   buildOpenCodeWorkSessionLaunch,
   selectOpenCodeSession,
   workSessionChildEnv,
-} from '../../../src/pty/work-session.js';
+} from '../../../src/pty/work-session-pty.js';
 
 describe('Work Session harness contracts', () => {
   it('uses a generated Claude session id for fresh launch and only that id for resume', () => {
@@ -31,7 +31,7 @@ describe('Work Session harness contracts', () => {
       { id: 'other', cwd: '/other', created_at: 105 },
     ], '/project', 100, 110);
     expect(selected).toBe('exact');
-    expect(buildOpenCodeWorkSessionLaunch({ cwd: '/project', sessionId: selected }).args).toEqual(['--session', 'exact']);
+    expect(buildOpenCodeWorkSessionLaunch({ cwd: '/project', sessionId: selected }).args).toEqual(['--session', 'exact', '--auto=false']);
   });
 
   it('passes only the strict tokenless child environment allowlist', () => {

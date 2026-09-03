@@ -37,7 +37,7 @@ export interface InboxMessage {
 // routing dependency. If rooms.json is missing or corrupt, recording still
 // works.
 
-export type RoomKind = 'dm' | 'agent' | 'channel';
+export type RoomKind = 'dm' | 'agent' | 'channel' | 'work_session';
 
 export interface Room {
   /** Derived id: dm-<a>--<b>, agent-<name>, or ch-<slug>. Path-segment safe. */
@@ -48,6 +48,8 @@ export interface Room {
   members: string[];
   /** For kind:"agent" — the agent whose session this room is scoped to. */
   agent?: string;
+  /** For kind:"work_session" — opaque session id whose log remains stable across resume/promotion. */
+  work_session_id?: string;
   created_at: string; // ISO 8601
   created_by: string;
   archived?: boolean;
@@ -714,6 +716,12 @@ export type IPCCommandType =
   | 'context-review'
   | 'context-owner-decision'
   | 'reconcile-crew'
+  | 'list-work-sessions'
+  | 'create-work-session'
+  | 'stop-work-session'
+  | 'resume-work-session'
+  | 'inject-work-session'
+  | 'promote-work-session'
   | 'start-agent'
   | 'stop-agent'
   | 'restart-agent'

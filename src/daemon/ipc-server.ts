@@ -13,6 +13,8 @@ import { createEmployee, CrewServiceError, type CreateEmployeeInput } from '../a
 import { homedir } from 'os';
 import { applyContextOwnerDecision, getContextOwnershipReview, resolveEmployeeContextPaths } from '../context/owner-controls.js';
 import { reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
+import { WorkSessionRegistryError } from '../work-sessions/registry.js';
+import type { CreateWorkSessionInput, WorkSessionEmployeeInput } from '../work-sessions/types.js';
 
 const WORKER_NAME_REGEX = /^[a-z0-9_-]+$/;
 
@@ -585,6 +587,54 @@ export class IPCServer {
 
     try {
       switch (request.type) {
+        case 'list-work-sessions':
+          response = { success: true, data: this.agentManager.workSessions.list() };
+          break;
+
+        case 'create-work-session': {
+          if (!request.mutation_id || !request.data) {
+            response = { success: false, error: 'Work Session request and mutation id required', code: 'INVALID_INPUT' };
+            break;
+          }
+          try {
+            const session = await this.agentManager.workSessions.create(request.data as unknown as CreateWorkSessionInput, request.mutation_id);
+            response = { success: true, data: { session } };
+          } catch (error) {
+            const code = error instanceof WorkSessionRegistryError ? error.code : (error as Error).message;
+            response = { success: false, error: 'Work Session creation failed', code };
+          }
+          break;
+        }
+
+        case 'stop-work-session':
+        case 'resume-work-session':
+        case 'inject-work-session':
+        case 'promote-work-session': {
+          if (!request.mutation_id || !request.data?.id) {
+            response = { success: false, error: 'Work Session id and mutation id required', code: 'INVALID_INPUT' };
+            break;
+          }
+          try {
+            const id = String(request.data.id);
+            const actor = String(request.data.actor ?? '');
+            let data: unknown;
+            if (request.type === 'stop-work-session') data = await this.agentManager.workSessions.stop(id, actor, request.mutation_id);
+            else if (request.type === 'resume-work-session') data = await this.agentManager.workSessions.resume(id, actor, request.mutation_id);
+            else if (request.type === 'inject-work-session') {
+              await this.agentManager.workSessions.send(id, String(request.data.text ?? ''), actor, request.mutation_id);
+              data = { delivered: true, mutation_id: request.mutation_id };
+            } else {
+              await this.agentManager.workSessions.promote(id, { ...(request.data.employee as unknown as WorkSessionEmployeeInput), actor }, request.mutation_id);
+              data = this.agentManager.workSessions.get(id);
+            }
+            response = { success: true, data };
+          } catch (error) {
+            const code = error instanceof WorkSessionRegistryError ? error.code : (error as Error).message;
+            response = { success: false, error: 'Work Session operation failed', code };
+          }
+          break;
+        }
+
         case 'reconcile-crew': {
           const ctxRoot = process.env.CTX_ROOT ?? join(homedir(), '.cortextos', this.instanceId);
           response = { success: true, data: reconcileCrewMutationJournal(ctxRoot) };

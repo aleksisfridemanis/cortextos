@@ -62,6 +62,9 @@ jobs:
       - name: Run codex parity tests
         run: npm run test:codex
 
+      - name: Run Work Session and Crew contract tests
+        run: npm test -- tests/unit/work-sessions tests/unit/pty/work-session-adapters.test.ts tests/integration/crew-creation-lifecycle.test.ts
+
   dashboard-build:
     name: Dashboard Build
     runs-on: ubuntu-latest
@@ -96,3 +99,6 @@ jobs:
 
       - name: Build dashboard
         run: npm run build
+
+      - name: Run dashboard route and Crew tests
+        run: npm test

@@ -32,4 +32,15 @@ describe('CreateChatDialog contract', () => {
     expect(request.body).not.toHaveProperty('actor');
     expect(request.body).not.toHaveProperty('telegram_token');
   });
+
+  it('builds a distinct exact-resume Work Session request', () => {
+    const request = buildCreateChatRequest({
+      ...initialCreateChatState(), kind: 'work_session', name: 'release', org: 'platform', harness: 'codex-app-server', workingDirectory: '/workspace',
+    }, '28d64d6a-b787-46e4-8bb2-a488909a60d2');
+    expect(request).toEqual({
+      endpoint: '/api/work-sessions',
+      headers: { 'content-type': 'application/json', 'x-cortext-intent': 'create-work-session', 'x-cortext-mutation-id': '28d64d6a-b787-46e4-8bb2-a488909a60d2' },
+      body: { display_name: 'release', org: 'platform', harness: 'codex-app-server', model: undefined, requested_cwd: '/workspace' },
+    });
+  });
 });

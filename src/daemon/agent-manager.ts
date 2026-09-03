@@ -22,6 +22,9 @@ import { stripBom } from '../utils/strip-bom.js';
 import { BuzzRelayClient, BuzzDispatcher, loadBuzzConfig, type NostrEvent } from '../buzz/index.js';
 import { computeDormancy, parseHeartbeatIntervalMs } from '../utils/dormancy.js';
 import { CRONS_DIRECTORY, CRONS_FILENAME } from '../bus/crons-schema.js';
+import { WorkSessionManager } from '../work-sessions/manager.js';
+import { WorkSessionPTY } from '../pty/work-session-pty.js';
+import { createEmployee } from '../agents/create-employee.js';
 
 type LogFn = (msg: string) => void;
 
@@ -112,6 +115,7 @@ export class AgentManager {
   private ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
+  readonly workSessions: WorkSessionManager;
 
   // Set true at construction time if any agent in state/ has a stale
   // .daemon-crashed marker, meaning the previous daemon process died
@@ -141,6 +145,21 @@ export class AgentManager {
     this.ctxRoot = ctxRoot;
     this.frameworkRoot = frameworkRoot;
     this.org = org;
+    this.workSessions = new WorkSessionManager({
+      ctxRoot,
+      frameworkRoot,
+      adapterFactory: record => new WorkSessionPTY({
+        ctxRoot, frameworkRoot, instanceId, record,
+        onExit: () => this.workSessions.handleRuntimeExit(record.id),
+      }),
+      createEmployee: (input, mutationId) => createEmployee(input, mutationId, {
+        ctxRoot, frameworkRoot, instanceId,
+        startEmployee: async request => {
+          await this.startAgent(request.name, request.agent_dir, undefined, input.org);
+          return { mutation_id: request.mutation_id, started: true };
+        },
+      }),
+    });
     this.daemonJustCrashed = this.detectDaemonCrashMarkers();
     if (this.daemonJustCrashed) {
       console.log('[agent-manager] Detected .daemon-crashed marker(s) — previous daemon exited abnormally. Will quiet BUG-011 alarm for this startup cycle.');
@@ -1551,6 +1570,12 @@ export class AgentManager {
     this.slackSocketClient?.stop();
     this.slackSocketClient = null;
     this.slackSocketStarted = false;
+    for (const session of this.workSessions.list()) {
+      if (session.lifecycle === 'active' || session.lifecycle === 'starting') {
+        try { await this.workSessions.stop(session.id, 'system:daemon-shutdown'); }
+        catch (error) { console.error(`[agent-manager] Error stopping Work Session ${session.id}:`, error); }
+      }
+    }
     // DELIBERATE EXCEPTION to the identity rule used everywhere else in this
     // file, and NOT an oversight. Shutdown wants "stop whatever is running under
     // this name", which is a name question, so acting by name is correct routing

@@ -76,6 +76,10 @@ export async function GET(
   const ctxRoot = getCTXRoot();
   const messages: BusMessage[] = [];
   const [a1, a2] = agents;
+  const requestedRoomId = searchParams.get('room_id');
+  if (requestedRoomId !== null && (!/^work-[a-z0-9-]{1,123}$/.test(requestedRoomId) || pair !== `room--${requestedRoomId}`)) {
+    return Response.json({ error: 'Invalid Work Session room' }, { status: 400 });
+  }
 
   // Resolve user identity so inbound and outbound Telegram messages
   // land in the same channel as bus messages for the same conversation.
@@ -85,7 +89,7 @@ export async function GET(
   // recorded here by the daemon, in both directions, under one id — so
   // anything it carries suppresses the parallel-store reconstruction below.
   const byId = new Map<string, BusMessage>();
-  for (const msg of readRoomLog(ctxRoot, `dm-${pair}`)) {
+  for (const msg of readRoomLog(ctxRoot, requestedRoomId ?? `dm-${pair}`)) {
     if (!msg.text) continue; // never render an empty bubble
     if (!matchesSearch(msg.text)) continue;
     if (before && msg.timestamp >= before) continue;

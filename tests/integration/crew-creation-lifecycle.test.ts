@@ -58,18 +58,20 @@ describe('Crew Work Session lifecycle', () => {
     const manager = new WorkSessionManager({
       ctxRoot,
       adapterFactory: () => ({
-        startFresh: async () => ({ resume_handle: { harness: 'claude-code', session_id: 'session-exact' } }),
+        startFresh: async () => ({ resume_handle: { runtime: 'claude-code', session_id: '66666666-6666-4666-8666-666666666666' } }),
         resumeExact: async () => undefined,
         send: async () => undefined,
         stop: async () => undefined,
+        status: () => ({ running: true, pid: 1, error_code: null }),
+        getResumeHandle: () => null,
       }),
     });
     const mutationId = '7f51a223-4111-46fb-b4f2-27870567d55d';
 
-    const result = await manager.create({ name: 'Investigate', harness: 'claude-code', cwd, actor: 'owner:test' }, mutationId);
+    const result = await manager.create({ display_name: 'Investigate', org: 'platform', harness: 'claude-code', requested_cwd: cwd, actor: 'owner:test' }, mutationId);
 
     expect(result).toMatchObject({ lifecycle: 'active', mutation_id: mutationId });
     expect(readCrewMutationJournal(ctxRoot).find(row => row.mutation_id === mutationId)).toMatchObject({ stage: 'finalized' });
-    expect(readCrewLifecycleAuditEvents(ctxRoot).find(row => row.event_id === mutationId)).toMatchObject({ action: 'create_work_session', result: 'success' });
+    expect(readCrewLifecycleAuditEvents(ctxRoot).find(row => row.event_id === mutationId)).toMatchObject({ action: 'create', target: { kind: 'work_session' }, result: 'success' });
   });
 });

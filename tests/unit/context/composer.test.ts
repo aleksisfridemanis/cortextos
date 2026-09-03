@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   EMPLOYEE_CORE_MAX_BYTES,
   HANDOFF_MAX_BYTES,
+  WORK_SESSION_CONTEXT_MAX_BYTES,
   composeEmployeeContext,
+  composeWorkSessionContext,
   materializeContextPacket,
 } from '../../../src/context/composer.js';
 
@@ -91,5 +93,18 @@ describe('composeEmployeeContext', () => {
     const outputs = ['claude-code', 'codex-app-server', 'opencode'].map(runtime => materializeContextPacket(packet, runtime as never));
     expect(new Set(outputs.map(output => output.packet_digest)).size).toBe(1);
     expect(outputs.map(output => output.routes)).toEqual([packet.routes, packet.routes, packet.routes]);
+  });
+
+  it('builds a tiny Work Session packet without Employee or org context', () => {
+    writeFileSync(join(frameworkRoot, 'templates', 'context', 'work-session.md'), 'runtime and comms only\n');
+    writeFileSync(join(root, 'AGENTS.md'), 'project instructions\n');
+    const packet = composeWorkSessionContext({ frameworkRoot, projectRoot: root, initialRequest: 'repair the release' });
+    expect(packet.text).toContain('runtime and comms only');
+    expect(packet.text).toContain('project instructions');
+    expect(packet.text).toContain('repair the release');
+    expect(packet.text).not.toContain('identity bytes');
+    expect(packet.text).not.toContain('goals bytes');
+    expect(packet.routes).toEqual([]);
+    expect(packet.byte_length).toBeLessThanOrEqual(WORK_SESSION_CONTEXT_MAX_BYTES);
   });
 });

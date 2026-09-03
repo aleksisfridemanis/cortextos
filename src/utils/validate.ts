@@ -32,6 +32,12 @@ export function validateAgentName(name: string): void {
   }
 }
 
+export function validateWorkSessionId(id: string): void {
+  if (!id || id.length > 128 || !/^[a-z0-9_-]+$/.test(id)) {
+    throw new Error('Invalid Work Session identifier');
+  }
+}
+
 export function validateOrgName(org: string): void {
   if (!org || !AGENT_NAME_REGEX.test(org)) {
     throw new Error(

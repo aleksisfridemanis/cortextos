@@ -2,12 +2,15 @@ import fs from 'fs';
 import path from 'path';
 import { getCTXRoot } from '@/lib/config';
 import { resolveIdentity } from '@/lib/comms-identity';
-import { readPairSummary } from '@/lib/rooms';
+import { readPairSummary, readRoomLog } from '@/lib/rooms';
 import { findAvatarFile } from '@/lib/crew-avatars';
+import { IPCClient } from '@/lib/ipc-client';
 
 export const dynamic = 'force-dynamic';
 
 export interface CrewMember {
+  targetId: string;
+  kind: 'employee' | 'work_session';
   name: string;
   org: string;
   enabled: boolean;
@@ -21,6 +24,9 @@ export interface CrewMember {
   lastActivity: string | null;
   /** Preview text of that last message, null when empty. */
   lastPreview: string | null;
+  roomId?: string;
+  lifecycle?: 'starting' | 'active' | 'stopping' | 'archived' | 'failed';
+  harness?: 'claude-code' | 'codex-app-server' | 'opencode';
 }
 
 /**
@@ -93,6 +99,8 @@ export async function GET() {
       const tail = readPairSummary(ctxRoot, name, identity.canonicalUser, identity);
 
       agents.push({
+        targetId: name,
+        kind: 'employee',
         name,
         org: entry.org ?? '',
         enabled: true,
@@ -108,6 +116,24 @@ export async function GET() {
   } catch {
     /* registry missing — empty roster */
   }
+
+  try {
+    const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard' });
+    if (result.success && Array.isArray(result.data)) {
+      for (const value of result.data) {
+        const session = value as { id?: string; display_name?: string; harness?: CrewMember['harness']; lifecycle?: CrewMember['lifecycle']; room_id?: string; org?: string };
+        if (!session.id || !session.display_name || !session.room_id || !/^[a-z0-9_-]+$/.test(session.id)) continue;
+        const messages = readRoomLog(ctxRoot, session.room_id);
+        const last = messages.at(-1);
+        agents.push({
+          targetId: session.id, kind: 'work_session', name: session.display_name, org: session.org ?? '', enabled: session.lifecycle === 'active',
+          tagline: `${session.harness ?? 'native'} Work Session`, avatarVersion: null,
+          lastActivity: last?.timestamp ?? null, lastPreview: last?.text ?? null,
+          roomId: session.room_id, lifecycle: session.lifecycle, harness: session.harness,
+        });
+      }
+    }
+  } catch { /* daemon unavailable: Employee roster remains usable */ }
 
   return Response.json({ user: identity.canonicalUser, agents });
 }

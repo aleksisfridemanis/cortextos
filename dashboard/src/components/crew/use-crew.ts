@@ -45,12 +45,17 @@ export function resolveInitialSelection(
 }
 
 export interface CrewMember {
+  targetId: string;
+  kind: 'employee' | 'work_session';
   name: string;
   org: string;
   tagline: string;
   avatarVersion: number | null;
   lastActivity: string | null;
   lastPreview: string | null;
+  roomId?: string;
+  lifecycle?: 'starting' | 'active' | 'stopping' | 'archived' | 'failed';
+  harness?: 'claude-code' | 'codex-app-server' | 'opencode';
 }
 
 /**
@@ -200,12 +205,15 @@ export function useCrew(): CrewState {
     () =>
       agents
         .map((a) => ({
+          targetId: a.targetId,
+          kind: a.kind,
           name: a.name,
           tagline: a.tagline,
           avatarVersion: a.avatarVersion,
           lastActivity: a.lastActivity,
           lastPreview: a.lastPreview,
           mood: moodOf(presence.get(a.name)),
+          lifecycle: a.lifecycle,
         }))
         .sort(byRecency),
     [agents, presence],

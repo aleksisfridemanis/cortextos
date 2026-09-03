@@ -33,7 +33,7 @@ function CrewAppInner() {
   // viewport instead (see useKeyboardInset for the full rationale).
   const { viewportHeight: viewportH } = useKeyboardInset();
 
-  const selectedAgent = agents.find((a) => a.name === selected) ?? null;
+  const selectedAgent = agents.find((a) => a.targetId === selected) ?? null;
   const workingCount = roster.filter((r) => r.mood !== 'resting').length;
 
   function select(name: string) {
@@ -45,8 +45,11 @@ function CrewAppInner() {
   }
 
   const prefetch = useCallback(
-    (name: string) => warmRoomCache([user, name].sort().join('--')),
-    [user],
+    (targetId: string) => {
+      const member = agents.find(item => item.targetId === targetId);
+      warmRoomCache(member?.kind === 'work_session' && member.roomId ? `room:${member.roomId}` : [user, targetId].sort().join('--'));
+    },
+    [user, agents],
   );
 
   function onListTouchStart(e: React.TouchEvent<HTMLDivElement>) {
@@ -91,6 +94,7 @@ function CrewAppInner() {
             mood={moodFor(selectedAgent.name)}
             onBack={back}
             onAvatarChanged={(v) => onAvatarChanged(selectedAgent.name, v)}
+            onLifecycleChanged={refresh}
             frameless
           />
         </div>

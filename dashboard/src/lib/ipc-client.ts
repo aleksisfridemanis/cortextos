@@ -69,6 +69,12 @@ export interface IPCRequest {
     | 'context-review'
     | 'context-owner-decision'
     | 'reconcile-crew'
+    | 'list-work-sessions'
+    | 'create-work-session'
+    | 'stop-work-session'
+    | 'resume-work-session'
+    | 'inject-work-session'
+    | 'promote-work-session'
     | 'start-agent'
     | 'stop-agent'
     | 'restart-agent'
@@ -86,6 +92,7 @@ export interface IPCRequest {
   agent?: string;
   data?: Record<string, unknown>;
   mutation_id?: string;
+  source?: string;
 }
 
 export interface IPCResponse {
@@ -96,6 +103,9 @@ export interface IPCResponse {
 }
 
 function getIpcPath(instanceId: string = 'default'): string {
+  if (process.env.CORTEXT_PLAYWRIGHT_FAKE_IPC === '1' && process.env.CORTEXT_PLAYWRIGHT_IPC_PATH) {
+    return process.env.CORTEXT_PLAYWRIGHT_IPC_PATH;
+  }
   if (process.platform === 'win32') {
     return `\\\\.\\pipe\\cortextos-${instanceId}`;
   }

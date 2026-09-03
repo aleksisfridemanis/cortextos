@@ -7,6 +7,7 @@ import { digestCrewAuditValue } from '../audit/crew-lifecycle-audit.js';
 
 export const EMPLOYEE_CORE_MAX_BYTES = 24_576;
 export const HANDOFF_MAX_BYTES = 16_384;
+export const WORK_SESSION_CONTEXT_MAX_BYTES = 16_384;
 export type ContextHarness = 'claude-code' | 'codex-app-server' | 'opencode';
 
 export interface ComposeEmployeeContextOptions {
@@ -16,6 +17,12 @@ export interface ComposeEmployeeContextOptions {
   mode: 'fresh' | 'continuation';
   projectRoot?: string;
   handoff?: string;
+}
+
+export interface ComposeWorkSessionContextOptions {
+  frameworkRoot: string;
+  projectRoot: string;
+  initialRequest?: string;
 }
 
 function readRequired(sourceRef: string): string {
@@ -85,6 +92,27 @@ export function composeEmployeeContext(options: ComposeEmployeeContextOptions): 
     })),
     text,
     byte_length: byteLength,
+  };
+}
+
+export function composeWorkSessionContext(options: ComposeWorkSessionContextOptions): EffectiveContextPacket {
+  const blocks: EffectiveContextBlock[] = [
+    block(join(options.frameworkRoot, 'templates', 'context', 'work-session.md'), 'framework', 'tiny Work Session runtime and communication contract'),
+  ];
+  for (const fileName of ['AGENTS.md', 'CLAUDE.md']) {
+    const sourceRef = join(options.projectRoot, fileName);
+    if (existsSync(sourceRef)) blocks.push(block(sourceRef, 'instance', 'project-authored harness instructions'));
+  }
+  if (options.initialRequest) {
+    blocks.push({ source_ref: 'logical://current-work/initial-request', text: options.initialRequest, owner: 'owner', inclusion_reason: 'owner request that opened this Work Session' });
+  }
+  const text = blocks.map(item => `<!-- source: ${item.source_ref} -->\n${item.text}`).join('\n\n');
+  const byteLength = Buffer.byteLength(text, 'utf8');
+  if (byteLength > WORK_SESSION_CONTEXT_MAX_BYTES) throw new Error(`CONTEXT_BUDGET_EXCEEDED: Work Session packet is ${byteLength} bytes`);
+  return {
+    schema_version: 1, builder_version: '1', launch_mode: 'fresh', blocks, routes: [],
+    provenance: blocks.map(item => ({ source_ref: item.source_ref, digest: digest(item.text), owner: item.owner, inclusion_reason: item.inclusion_reason })),
+    text, byte_length: byteLength,
   };
 }
 

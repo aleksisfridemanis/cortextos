@@ -2,17 +2,13 @@
  * Dashboard Authentication Tests
  * Tests 24.2 (wrong password rejected) and 24.4 (session/token handling)
  *
- * Run against the live e2e-phase dashboard at port 3001.
- *
- * Note: JWT signature verification is not performed at the middleware level
- * (Edge Runtime limitation). Middleware checks for presence of Bearer token.
- * Individual API routes can add additional verification if needed.
+ * Runs only against the isolated Playwright supervisor at 127.0.0.1:39183.
  */
 import { test, expect } from '@playwright/test';
 
-const DASHBOARD_URL = process.env.DASHBOARD_URL || 'http://localhost:3001';
-const ADMIN_USER = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASS = process.env.ADMIN_PASSWORD || 'cortextos';
+const DASHBOARD_URL = process.env.DASHBOARD_URL!;
+const ADMIN_USER = process.env.ADMIN_USERNAME!;
+const ADMIN_PASS = process.env.ADMIN_PASSWORD!;
 
 test.describe('Dashboard Auth (24.2, 24.4)', () => {
   test('24.2 - Wrong password returns 401 / shows error', async ({ page }) => {
@@ -51,10 +47,12 @@ test.describe('Dashboard Auth (24.2, 24.4)', () => {
     expect(body.token).toMatch(/^ey[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/);
   });
 
-  test('24.4 - No Authorization header returns 401', async ({ page }) => {
+  test('24.4 - No Authorization header returns 401', async ({ browser }) => {
     // Without any token, middleware rejects with 401
-    const resp = await page.request.get(`${DASHBOARD_URL}/api/tasks`);
+    const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+    const resp = await context.request.get(`${DASHBOARD_URL}/api/tasks`);
     expect(resp.status()).toBe(401);
+    await context.close();
   });
 
   test('24.4 - Authenticated request works with valid Bearer token', async ({ page }) => {
@@ -74,17 +72,20 @@ test.describe('Dashboard Auth (24.2, 24.4)', () => {
     expect(Array.isArray(tasks)).toBe(true);
   });
 
-  test('24.4 - CORS preflight returns 204 with correct headers', async ({ page }) => {
-    const resp = await page.request.fetch(`${DASHBOARD_URL}/api/tasks`, {
+  test('24.4 - CORS preflight echoes only a validated origin', async ({ page }) => {
+    const allowed = await page.request.fetch(`${DASHBOARD_URL}/api/tasks`, {
       method: 'OPTIONS',
       headers: {
-        'Origin': 'http://localhost:8081',
+        'Origin': DASHBOARD_URL,
         'Access-Control-Request-Method': 'GET',
         'Access-Control-Request-Headers': 'Authorization',
       },
     });
-    expect(resp.status()).toBe(204);
-    expect(resp.headers()['access-control-allow-origin']).toBe('*');
-    expect(resp.headers()['access-control-allow-headers']).toContain('Authorization');
+    expect(allowed.status()).toBe(204);
+    expect(allowed.headers()['access-control-allow-origin']).toBe(DASHBOARD_URL);
+    expect(allowed.headers()['access-control-allow-headers']).toContain('Authorization');
+    const denied = await page.request.fetch(`${DASHBOARD_URL}/api/tasks`, { method: 'OPTIONS', headers: { Origin: 'https://forged.invalid' } });
+    expect(denied.headers()['access-control-allow-origin']).toBe('null');
+    expect(denied.headers()['access-control-allow-origin']).not.toBe('*');
   });
 });

@@ -475,7 +475,10 @@ export async function fetchMessagesInto(
   localIds: Set<string>,
 ): Promise<void> {
   try {
-    const r = await fetch(`/api/comms/channel/${pair}?limit=200`);
+    const url = pair.startsWith('room:')
+      ? `/api/comms/channel/room--${encodeURIComponent(pair.slice(5))}?limit=200&room_id=${encodeURIComponent(pair.slice(5))}`
+      : `/api/comms/channel/${pair}?limit=200`;
+    const r = await fetch(url);
     // A failed fetch is not an empty conversation — leave what is on screen.
     if (!r.ok) {
       setLoading(false);
@@ -572,9 +575,14 @@ function ChatSkeleton() {
 }
 
 export interface CrewChatAgent {
+  targetId: string;
+  kind: 'employee' | 'work_session';
   name: string;
   tagline: string;
   avatarVersion: number | null;
+  roomId?: string;
+  lifecycle?: 'starting' | 'active' | 'stopping' | 'archived' | 'failed';
+  harness?: 'claude-code' | 'codex-app-server' | 'opencode';
 }
 
 interface CrewChatProps {
@@ -586,6 +594,7 @@ interface CrewChatProps {
   onAvatarChanged: (version: number | null) => void;
   /** Standalone-app mode: edge-to-edge, no card chrome. */
   frameless?: boolean;
+  onLifecycleChanged?: () => void;
 }
 
 export function formatTime(iso: string): string {
@@ -647,8 +656,8 @@ function MessageContent({ text }: { text: string }) {
   return <>{parts}</>;
 }
 
-export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless = false }: CrewChatProps) {
-  const pair = [user, agent.name].sort().join('--');
+export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecycleChanged, frameless = false }: CrewChatProps) {
+  const pair = agent.kind === 'work_session' && agent.roomId ? `room:${agent.roomId}` : [user, agent.name].sort().join('--');
   const [messages, setMessages] = useState<BusMessage[]>(() => roomCache.get(pair) ?? []);
   const [loading, setLoading] = useState(() => !roomCache.has(pair));
   // Unsent draft, restored per-member from sessionStorage. (Item B4.)
@@ -692,7 +701,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
 
   const typing = mood === 'typing';
 
-  const statusText = typing
+  const statusText = agent.kind === 'work_session'
+    ? `Work Session · ${agent.lifecycle ?? 'archived'}`
+    : typing
     ? 'typing…'
     : mood === 'active'
       ? 'active now'
@@ -1126,9 +1137,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
 
       const res = await fetch('/api/messages/send', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(agent.kind === 'work_session' ? { 'x-cortext-mutation-id': crypto.randomUUID() } : {}) },
         body: JSON.stringify({
-          agent: agent.name,
+          ...(agent.kind === 'work_session'
+            ? { target_kind: 'work_session', work_session_id: agent.targetId }
+            : { agent: agent.name }),
           text: messageText,
           ...(replyTarget ? { reply_to: replyTarget.id } : {}),
         }),
@@ -1171,6 +1184,28 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
       sendingRef.current = false;
       setSending(false);
     }
+  }
+
+  async function runSessionAction(action: 'stop' | 'resume' | 'promote') {
+    if (agent.kind !== 'work_session') return;
+    let employee: Record<string, unknown> | undefined;
+    if (action === 'promote') {
+      const name = window.prompt('Employee name');
+      const org = name ? window.prompt('Organization') : null;
+      if (!name || !org) return;
+      employee = { name, org, runtime: agent.harness, model: undefined };
+    }
+    const response = await fetch(`/api/work-sessions/${encodeURIComponent(agent.targetId)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-cortext-intent': `${action}-work-session`, 'x-cortext-mutation-id': crypto.randomUUID() },
+      body: JSON.stringify({ action, employee }),
+    });
+    if (!response.ok) {
+      const value = await response.json().catch(() => ({}));
+      setSendError(value.error ?? 'Work Session operation failed');
+      return;
+    }
+    onLifecycleChanged?.();
   }
 
   async function sendVoice() {
@@ -1558,6 +1593,11 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
               <p className="truncate text-[11px] leading-tight">{status}</p>
             </div>
           </div>
+          {agent.kind === 'work_session' && (
+            <Button variant="ghost" size="sm" className="pointer-events-auto" onClick={() => runSessionAction(agent.lifecycle === 'active' ? 'stop' : 'resume')}>
+              {agent.lifecycle === 'active' ? 'Stop' : 'Resume'}
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -1620,6 +1660,14 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, frameless
           <p className="truncate font-semibold leading-tight">{agent.name}</p>
           <p className="truncate text-xs">{status}</p>
         </div>
+        {agent.kind === 'work_session' && (
+          <div className="flex gap-1">
+            <Button variant="outline" size="sm" onClick={() => runSessionAction(agent.lifecycle === 'active' ? 'stop' : 'resume')}>
+              {agent.lifecycle === 'active' ? 'Stop' : 'Resume'}
+            </Button>
+            <Button variant="outline" size="sm" disabled={agent.lifecycle !== 'active'} onClick={() => runSessionAction('promote')}>Promote</Button>
+          </div>
+        )}
         <Button
           variant="ghost"
           size="sm"

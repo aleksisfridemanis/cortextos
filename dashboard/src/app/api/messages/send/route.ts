@@ -2,6 +2,8 @@ import { NextRequest } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getCTXRoot, getAllAgents } from '@/lib/config';
+import { IPCClient } from '@/lib/ipc-client';
+import { checkCrewRateLimit } from '@/lib/rate-limit';
 
 export const dynamic = 'force-dynamic';
 
@@ -27,9 +29,40 @@ const REPLY_TO_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 export async function POST(request: NextRequest) {
   let body: Record<string, unknown>;
   try {
-    body = await request.json();
+    const declared = Number(request.headers.get('content-length') ?? 0);
+    if (Number.isFinite(declared) && declared > 131_072) return Response.json({ error: 'Request body is too large' }, { status: 413 });
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength > 131_072) return Response.json({ error: 'Request body is too large' }, { status: 413 });
+    body = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(bytes));
   } catch {
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+
+  if (body.target_kind === 'work_session') {
+    const { auth } = await import('@/lib/auth');
+    const session = await auth();
+    if (!session?.user?.id) return Response.json({ error: 'Authentication required' }, { status: 401 });
+    const actor = `owner:${session.user.id}`;
+    const rate = checkCrewRateLimit(actor, 'message');
+    if (!rate.allowed) return Response.json({ error: 'Rate limit exceeded' }, { status: 429, headers: { 'Retry-After': String(rate.retryAfter ?? 60) } });
+    const id = typeof body.work_session_id === 'string' ? body.work_session_id : '';
+    const text = typeof body.text === 'string' ? body.text : '';
+    if (!/^[a-z0-9_-]{1,128}$/.test(id)) return Response.json({ error: 'Invalid Work Session id' }, { status: 400 });
+    if (!text) return Response.json({ error: 'text is required' }, { status: 400 });
+    if (Buffer.byteLength(text, 'utf8') > 65_536) return Response.json({ error: 'Message is too large' }, { status: 413 });
+    const mutationId = request.headers.get('x-cortext-mutation-id') ?? '';
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(mutationId)) {
+      return Response.json({ error: 'Valid mutation id required' }, { status: 400 });
+    }
+    const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({
+      type: 'inject-work-session', source: 'dashboard', mutation_id: mutationId,
+      data: { id, text, actor },
+    });
+    if (!result.success) {
+      const status = result.code === 'NOT_FOUND' ? 404 : result.code === 'INVALID_TRANSITION' ? 409 : result.code === 'REGISTRY_CORRUPT' ? 503 : 500;
+      return Response.json({ error: status === 409 ? 'Resume the Work Session before sending' : 'Unable to send Work Session message', code: result.code }, { status });
+    }
+    return Response.json({ success: true, messageId: mutationId }, { status: 200 });
   }
 
   const { agent, text, type, reply_to } = body as {
@@ -48,6 +81,7 @@ export async function POST(request: NextRequest) {
   if (!text || typeof text !== 'string') {
     return Response.json({ error: 'text is required' }, { status: 400 });
   }
+  if (Buffer.byteLength(text, 'utf8') > 65_536) return Response.json({ error: 'Message is too large' }, { status: 413 });
   if (reply_to !== undefined && (typeof reply_to !== 'string' || !REPLY_TO_PATTERN.test(reply_to))) {
     return Response.json({ error: 'Invalid reply_to' }, { status: 400 });
   }

@@ -304,6 +304,32 @@ export interface AgentDetail {
   runtime?: AgentRuntime;
 }
 
+// -- Work Sessions --
+
+export type WorkSessionHarness = 'claude-code' | 'codex-app-server' | 'opencode';
+export type WorkSessionLifecycle = 'starting' | 'active' | 'stopping' | 'archived' | 'failed';
+
+/** Browser-safe Work Session metadata. Native resume handles are intentionally absent. */
+export interface WorkSession {
+  schema_version: 1;
+  kind: 'work_session';
+  id: string;
+  display_name: string;
+  org: string;
+  harness: WorkSessionHarness;
+  model: string | null;
+  requested_cwd: string;
+  canonical_cwd: string;
+  room_id: string;
+  lifecycle: WorkSessionLifecycle;
+  mutation_id: string;
+  created_at: string;
+  updated_at: string;
+  last_error: string | null;
+  promoted_employee: string | null;
+  created_by: string;
+}
+
 export interface MemoryFile {
   date: string;
   path: string;

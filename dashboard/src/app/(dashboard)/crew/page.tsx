@@ -25,7 +25,7 @@ function CrewPageInner() {
   // Pull-to-refresh: the clientY where a top-anchored drag began, else null.
   const pullStartRef = useRef<number | null>(null);
 
-  const selectedAgent = agents.find((a) => a.name === selected) ?? null;
+  const selectedAgent = agents.find((a) => a.targetId === selected) ?? null;
 
   function select(name: string) {
     try {
@@ -58,15 +58,18 @@ function CrewPageInner() {
     } catch {
       /* ignore */
     }
-    const resolved = resolveInitialSelection(selected, stored, agents.map((a) => a.name));
+    const resolved = resolveInitialSelection(selected, stored, agents.map((a) => a.targetId));
     if (resolved) {
       router.replace(`/crew?with=${encodeURIComponent(resolved)}`, { scroll: false });
     }
   }, [loading, selected, agents, router]);
 
   const prefetch = useCallback(
-    (name: string) => warmRoomCache([user, name].sort().join('--')),
-    [user],
+    (targetId: string) => {
+      const member = agents.find(item => item.targetId === targetId);
+      warmRoomCache(member?.kind === 'work_session' && member.roomId ? `room:${member.roomId}` : [user, targetId].sort().join('--'));
+    },
+    [user, agents],
   );
 
   function onListTouchStart(e: React.TouchEvent<HTMLDivElement>) {
@@ -115,6 +118,7 @@ function CrewPageInner() {
             user={user}
             mood={moodFor(selectedAgent.name)}
             onAvatarChanged={(v) => onAvatarChanged(selectedAgent.name, v)}
+            onLifecycleChanged={refresh}
           />
         ) : (
           <div className="flex items-center justify-center rounded-xl border bg-muted/10 text-sm text-muted-foreground">
@@ -136,6 +140,7 @@ function CrewPageInner() {
             mood={moodFor(selectedAgent.name)}
             onBack={back}
             onAvatarChanged={(v) => onAvatarChanged(selectedAgent.name, v)}
+            onLifecycleChanged={refresh}
             frameless
           />
         </div>
