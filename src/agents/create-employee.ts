@@ -414,7 +414,7 @@ async function createEmployeeInternal(
       } else {
         receipt = await dependencies.queryEmployeeStart?.(startRequest) ?? null;
       }
-      if (!receipt || receipt.mutation_id !== mutationId || receipt.started !== true) {
+      if (!receipt || receipt.mutation_id !== mutationId || typeof receipt.started !== 'boolean') {
         throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee start recovery returned an invalid receipt');
       }
       recordCrewMutationEffect(ctxRoot, mutationId, {
@@ -591,7 +591,7 @@ async function createEmployeeInternal(
       agent_dir: finalDir,
       mutation_id: mutationId,
     });
-    if (receipt.mutation_id !== mutationId || receipt.started !== true) throw new Error('Invalid daemon mutation receipt');
+    if (receipt.mutation_id !== mutationId || typeof receipt.started !== 'boolean') throw new Error('Invalid daemon mutation receipt');
     recordCrewMutationEffect(ctxRoot, mutationId, {
       mutation_id: receipt.mutation_id,
       started: receipt.started,
