@@ -52,6 +52,30 @@ describe('Crew mutation journal', () => {
     }
   });
 
+  it('sanitizes journal structure without rejecting legitimate values containing sensitive words', () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-structural-'));
+    try {
+      const mutationId = '34333333-3333-4333-8333-333333333333';
+      expect(() => prepareCrewMutation(root, {
+        mutation_id: mutationId,
+        idempotency_key: mutationId,
+        actor: 'owner:Token migration',
+        target: { kind: 'employee', id: 'token-migration-worker' },
+        action: 'create',
+        request_digest: 'a'.repeat(64),
+        before_digest: 'b'.repeat(64),
+        intended_after_digest: 'c'.repeat(64),
+      })).not.toThrow();
+      commitCrewMutationState(root, mutationId, 'c'.repeat(64));
+      startCrewMutationEffect(root, mutationId);
+      expect(() => recordCrewMutationEffect(root, mutationId, {
+        authorization: 'must-never-be-journaled',
+      })).toThrow(/forbidden field authorization/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('reconciles prepared-without-state as failure and leaves unverified durable state pending', () => {
     const root = mkdtempSync(join(tmpdir(), 'crew-journal-reconcile-'));
     try {
@@ -101,7 +125,14 @@ describe('Crew mutation journal', () => {
       }]));
       writeFileSync(join(root, 'config', 'rooms.json'), JSON.stringify([{ id: `work-${id}`, work_session_id: target }]));
       expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 1, pending: 0 });
-      expect(getCrewMutation(root, id)?.final_result?.result).toBe('success');
+      expect(getCrewMutation(root, id)?.final_result).toMatchObject({
+        result: 'success',
+        result_snapshot: {
+          id: target,
+          lifecycle: 'active',
+          continuation_digest: digestCrewAuditValue(handle),
+        },
+      });
 
       const missing = '77777777-7777-4777-8777-777777777777';
       prepareCrewMutation(root, {

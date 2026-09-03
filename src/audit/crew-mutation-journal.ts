@@ -118,10 +118,15 @@ function assertEntry(entry: CrewMutationJournalEntry): void {
   if (entry.state_digest !== null && !DIGEST_PATTERN.test(entry.state_digest)) {
     throw new Error('Invalid Crew mutation state digest');
   }
-  const raw = JSON.stringify(entry);
-  if (/(?:secret|token|password|credential|authorization|resume_handle|api_key|private_key|sentinel-secret-value)/i.test(raw)) {
-    throw new Error('Crew mutation journal contains sensitive material');
-  }
+  const forbiddenKey = /^(?:secret|token|password|credential|authorization|resume_handle|api_key|private_key)$/i;
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object') return;
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (forbiddenKey.test(key)) throw new Error(`Crew mutation journal contains forbidden field ${key}`);
+      visit(child);
+    }
+  };
+  visit(entry);
 }
 
 export function readCrewMutationJournal(ctxRoot: string): CrewMutationJournalEntry[] {
@@ -474,7 +479,7 @@ function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): R
         const rooms = readJson(join(ctxRoot, 'config', 'rooms.json')) as Array<Record<string, unknown>>;
         if (!Array.isArray(rooms) || !rooms.some(room => room.id === record!.room_id && room.work_session_id === record!.id)) return null;
       } catch { return null; }
-      return { result: 'success', after_digest: afterDigest };
+      return { result: 'success', after_digest: afterDigest, result_snapshot: workSessionSnapshot(record) };
     }
     return record.lifecycle === 'failed'
       ? { result: 'failure', after_digest: afterDigest, error_code: 'RUNTIME_START_FAILED', sanitized_error: 'Runtime start failed' }
