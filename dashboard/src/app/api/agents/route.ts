@@ -3,6 +3,7 @@ import { auth } from '@/lib/auth';
 import { getAllAgents } from '@/lib/config';
 import { getHeartbeat, getHealthStatus } from '@/lib/data/heartbeats';
 import { IPCClient } from '@/lib/ipc-client';
+import { checkCrewRateLimit } from '@/lib/rate-limit';
 
 export const dynamic = 'force-dynamic';
 const CREW_BODY_MAX_BYTES = 131_072;
@@ -57,6 +58,14 @@ export async function POST(request: NextRequest) {
     }
     const session = await auth();
     if (!session?.user?.id) throw new RouteError('UNAUTHENTICATED', 401, 'Authentication required');
+    const actor = `owner:${session.user.id}`;
+    const rate = checkCrewRateLimit(actor, 'lifecycle');
+    if (!rate.allowed) {
+      return Response.json(
+        { error: 'Rate limit exceeded', code: 'RATE_LIMITED' },
+        { status: 429, headers: { 'Retry-After': String(rate.retryAfter ?? 60) } },
+      );
+    }
     const body = await readBoundedJson(request);
     if (Object.prototype.hasOwnProperty.call(body, 'actor')) {
       throw new RouteError('FORGED_ACTOR', 400, 'Actor is server-derived');
@@ -66,7 +75,7 @@ export async function POST(request: NextRequest) {
     const result = await ipc.send({
       type: 'create-employee',
       mutation_id: mutationId,
-      data: { ...body, actor: `owner:${session.user.id}` },
+      data: { ...body, actor },
     });
     if (!result.success) {
       const status = result.code === 'CONFLICT' || result.code === 'IDEMPOTENCY_CONFLICT' ? 409
