@@ -231,7 +231,7 @@ describe('Crew mutation journal', () => {
     }
   });
 
-  it('finalizes a durably recorded Employee start even when the runtime later exits', async () => {
+  it('leaves a recorded running Employee pending until AgentManager proves attachment or disposition', async () => {
     const root = mkdtempSync(join(tmpdir(), 'crew-journal-employee-receipt-'));
     const frameworkRoot = join(root, 'framework');
     const ctxRoot = join(root, 'ctx');
@@ -254,8 +254,9 @@ describe('Crew mutation journal', () => {
       recordCrewMutationEffect(ctxRoot, id, { ...canonical, receipt_digest: digestCrewAuditValue(canonical) });
       child.kill('SIGTERM');
       await once(child, 'exit');
-      expect(reconcileCrewMutationJournal(ctxRoot, { frameworkRoot })).toEqual({ finalized: 1, pending: 0 });
-      expect(getCrewMutation(ctxRoot, id)?.final_result).toMatchObject({ result: 'success' });
+      expect(reconcileCrewMutationJournal(ctxRoot, { frameworkRoot })).toEqual({ finalized: 0, pending: 1 });
+      expect(getCrewMutation(ctxRoot, id)).toMatchObject({ stage: 'effect_recorded' });
+      expect(getCrewMutation(ctxRoot, id)).not.toHaveProperty('final_result');
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       rmSync(root, { recursive: true, force: true });

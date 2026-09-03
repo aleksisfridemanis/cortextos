@@ -96,5 +96,20 @@ describe('WorkSessionPTY owned lifecycle', () => {
       .toEqual({ id: 'claude-1', text: 'Claude answer' });
     expect(parser({ type: 'message.part.completed', properties: { part: { id: 'open-1', type: 'text', text: 'OpenCode answer' } } }))
       .toEqual({ id: 'open-1', text: 'OpenCode answer' });
+    expect(parser({ type: 'message.part.updated', properties: { part: { id: 'open-1', type: 'text', text: 'Open' } } }))
+      .toBeNull();
+  });
+
+  it('fails closed on prompt echo, redraws, and arbitrary TUI output', () => {
+    const output = vi.fn();
+    const internals = adapter as unknown as {
+      ready: boolean;
+      options: { onOutput?: (value: unknown) => void };
+      capture(value: string): void;
+    };
+    internals.ready = true;
+    internals.options.onOutput = output;
+    internals.capture('> prompt echo\rstatus redraw\rtool chrome\n');
+    expect(output).not.toHaveBeenCalled();
   });
 });

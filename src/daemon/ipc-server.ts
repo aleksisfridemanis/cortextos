@@ -1024,7 +1024,7 @@ export class IPCClient {
   /**
    * Send a command to the daemon and get the response.
    */
-  async send(request: IPCRequest): Promise<IPCResponse> {
+  async send(request: IPCRequest, timeoutMs?: number): Promise<IPCResponse> {
     const { createConnection } = require('net');
 
     return new Promise((resolve, reject) => {
@@ -1056,10 +1056,17 @@ export class IPCClient {
         }
       });
 
-      // Timeout after 5 seconds
-      socket.setTimeout(5000, () => {
+      const deadline = timeoutMs ?? coreIpcRequestDeadline(request);
+      socket.setTimeout(deadline, () => {
+        resolve({
+          success: false,
+          error: request.mutation_id
+            ? 'Mutation outcome is not yet known; retry with the same mutation id'
+            : 'IPC request timed out',
+          code: request.mutation_id ? 'MUTATION_OUTCOME_UNKNOWN' : 'IPC_TIMEOUT',
+          ...(request.mutation_id ? { data: { mutation_id: request.mutation_id } } : {}),
+        });
         socket.destroy();
-        reject(new Error('IPC request timed out'));
       });
     });
   }
@@ -1075,4 +1082,8 @@ export class IPCClient {
       return false;
     }
   }
+}
+
+export function coreIpcRequestDeadline(request: IPCRequest): number {
+  return request.mutation_id ? 70_000 : request.type === 'reconcile-crew' ? 120_000 : 5_000;
 }

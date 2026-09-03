@@ -2,6 +2,8 @@ import { randomBytes, randomUUID } from 'crypto';
 import {
   chmodSync,
   closeSync,
+  accessSync,
+  constants,
   cpSync,
   existsSync,
   fsyncSync,
@@ -9,10 +11,12 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
+  statSync,
   unlinkSync,
   writeFileSync,
   writeSync,
@@ -223,6 +227,21 @@ function validateInput(input: CreateEmployeeInput, frameworkRoot: string): void 
   }
 }
 
+function canonicalWorkingDirectory(requested: string | undefined): string | null {
+  if (requested === undefined) return null;
+  let canonical: string;
+  try { canonical = realpathSync(requested); } catch {
+    throw new CrewServiceError('CWD_NOT_FOUND', 404, 'Working directory does not exist');
+  }
+  if (!statSync(canonical).isDirectory()) {
+    throw new CrewServiceError('CWD_NOT_DIRECTORY', 400, 'Working directory must be a directory');
+  }
+  try { accessSync(canonical, constants.R_OK | constants.X_OK); } catch {
+    throw new CrewServiceError('CWD_UNREADABLE', 400, 'Working directory is not readable and searchable');
+  }
+  return canonical;
+}
+
 function templateName(runtime: CrewEmployeeRuntime): string {
   if (runtime === 'codex-app-server') return 'agent-codex';
   if (runtime === 'opencode') return 'agent-opencode';
@@ -268,6 +287,9 @@ async function defaultStart(instanceId: string, request: EmployeeStartRequest): 
   if (!response.success) {
     if (response.error?.includes('Daemon is not running')) {
       return { mutation_id: request.mutation_id, name: request.name, started: false, pid: null, process_started_at: null, disposition: 'configured' };
+    }
+    if (response.code === 'MUTATION_OUTCOME_UNKNOWN' || response.code === 'MUTATION_PENDING') {
+      throw new CrewServiceError(response.code, 503, 'Employee start outcome is unresolved');
     }
     throw new Error(response.code ?? 'DAEMON_START_FAILED');
   }
@@ -381,6 +403,7 @@ async function createEmployeeInternal(
   const instanceId = dependencies.instanceId ?? process.env.CTX_INSTANCE_ID ?? 'default';
   const now = dependencies.now ?? (() => new Date().toISOString());
   validateInput(input, frameworkRoot);
+  const workingDirectory = canonicalWorkingDirectory(input.working_directory);
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(mutationId)) {
     throw new CrewServiceError('INVALID_MUTATION_ID', 400, 'A valid mutation id is required');
   }
@@ -397,7 +420,7 @@ async function createEmployeeInternal(
     org: input.org,
     runtime: input.runtime,
     model: input.model ?? null,
-    working_directory: input.working_directory ? resolve(input.working_directory) : null,
+    working_directory: workingDirectory,
     room_id: roomId,
     mutation_id: mutationId,
     created_at: now(),
@@ -407,7 +430,7 @@ async function createEmployeeInternal(
     org: input.org,
     runtime: input.runtime,
     model: input.model ?? null,
-    working_directory: input.working_directory ?? null,
+    working_directory: workingDirectory,
     telegram_polling: false,
     room_id: roomId,
     source_work_session_id: dependencies[PROMOTION_GRANT]?.source_work_session_id ?? null,
@@ -445,7 +468,7 @@ async function createEmployeeInternal(
         && digestCrewAuditValue(existing) === priorMutation.intended_after_digest
         && existsSync(join(frameworkRoot, 'orgs', existing.org, 'agents', input.name));
       if (!exactState) throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
-      if (priorMutation.stage === 'effect_recorded' || priorMutation.stage === 'audit_written') {
+      if (priorMutation.stage === 'audit_written') {
         reconcileCrewMutationJournal(ctxRoot, { frameworkRoot, ownerToken: currentCrewMutationOperationToken(mutationId) });
         const reconciled = getCrewMutation(ctxRoot, mutationId);
         if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') {
@@ -472,10 +495,12 @@ async function createEmployeeInternal(
       try { validateStartReceipt(receipt, startRequest); } catch {
         throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee start recovery returned an invalid receipt');
       }
-      recordCrewMutationEffect(ctxRoot, mutationId, {
-        ...receipt,
-        receipt_digest: employeeStartReceiptDigest(receipt),
-      });
+      if (priorMutation.stage !== 'effect_recorded') {
+        recordCrewMutationEffect(ctxRoot, mutationId, {
+          ...receipt,
+          receipt_digest: employeeStartReceiptDigest(receipt),
+        });
+      }
       finalizeCrewMutationAudit(ctxRoot, mutationId, receipt.started
         ? { result: 'success', after_digest: priorMutation.intended_after_digest }
         : receipt.disposition === 'exited' || receipt.disposition === 'failed'
@@ -685,6 +710,7 @@ async function createEmployeeInternal(
       });
       throw serviceError;
     }
+    if (error instanceof CrewServiceError && ['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING'].includes(error.code)) throw error;
     throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
   }
 }

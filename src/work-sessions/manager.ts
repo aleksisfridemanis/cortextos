@@ -45,7 +45,7 @@ interface Dependencies {
   now?: () => string;
   failAt?: 'after-session-record' | 'after-runtime-exit-prepare' | 'after-runtime-exit-state'
     | 'after-runtime-exit-state-commit' | 'after-runtime-exit-effect-start'
-    | 'after-runtime-exit-receipt' | 'after-runtime-exit-audit';
+    | 'after-runtime-exit-receipt' | 'after-runtime-exit-audit' | 'after-message-effect-receipt';
 }
 
 function safeId(mutationId: string): string { return `ws-${mutationId}`; }
@@ -595,10 +595,26 @@ export class WorkSessionManager {
     startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
     try {
       await this.adapter(record).send(text);
-      this.appendDelivery(record, actor, mutationId, text, 'delivered');
+    } catch {
+      this.appendDelivery(record, actor, mutationId, text, 'indeterminate');
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'indeterminate', after_digest: stateDigest(record), error_code: 'DELIVERY_RETRY_REQUIRED', sanitized_error: 'Delivery outcome requires owner retry' });
+      throw new WorkSessionRegistryError('DELIVERY_RETRY_REQUIRED', 'Message delivery outcome is uncertain');
+    }
+    try {
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { delivered: true, mutation_id: mutationId });
+      if (this.dependencies.failAt === 'after-message-effect-receipt') throw new Error('injected after message effect receipt');
+      this.appendDelivery(record, actor, mutationId, text, 'delivered');
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(record) });
     } catch {
+      const durable = getCrewMutation(this.dependencies.ctxRoot, mutationId);
+      if (durable?.effect_receipt?.delivered === true) {
+        try { this.appendDelivery(record, actor, mutationId, text, 'delivered'); } catch { /* recovery will retry the projection */ }
+        reconcileCrewMutationJournal(this.dependencies.ctxRoot, {
+          frameworkRoot: this.dependencies.frameworkRoot,
+          ownerToken: currentCrewMutationOperationToken(mutationId),
+        });
+        throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Delivery succeeded; durable finalization requires recovery');
+      }
       this.appendDelivery(record, actor, mutationId, text, 'indeterminate');
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'indeterminate', after_digest: stateDigest(record), error_code: 'DELIVERY_RETRY_REQUIRED', sanitized_error: 'Delivery outcome requires owner retry' });
       throw new WorkSessionRegistryError('DELIVERY_RETRY_REQUIRED', 'Message delivery outcome is uncertain');

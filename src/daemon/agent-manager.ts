@@ -179,7 +179,7 @@ export class AgentManager {
     reconcileCrewMutationJournal(this.ctxRoot, { frameworkRoot: this.frameworkRoot });
     for (const entry of listPendingCrewMutations(this.ctxRoot)) {
       if (entry.target.kind !== 'employee' || entry.action !== 'create'
-        || !['state_committed', 'effect_started'].includes(entry.stage)) continue;
+        || !['state_committed', 'effect_started', 'effect_recorded'].includes(entry.stage)) continue;
       try {
         const registry = JSON.parse(readFileSync(join(this.ctxRoot, 'config', 'enabled-agents.json'), 'utf8'));
         const rooms = JSON.parse(readFileSync(join(this.ctxRoot, 'config', 'rooms.json'), 'utf8')) as Array<Record<string, unknown>>;

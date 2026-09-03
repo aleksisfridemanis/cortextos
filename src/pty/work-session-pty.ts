@@ -466,9 +466,10 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         const output = this.completedOutput(value);
         if (output && this.ready) this.emitOutput(output);
       } catch {
-        if (!this.ready || this.options.record.harness === 'codex-app-server') continue;
-        const text = line.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').trim();
-        if (text) this.emitOutput({ id: this.fallbackOutputId(text), text });
+        // Interactive TUI bytes are not authoritative assistant completions.
+        // Prompt echo, redraw/status chrome, and tool output must never enter
+        // the durable room as if the model authored it.
+        continue;
       }
     }
   }
@@ -497,7 +498,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     }
     const properties = value.properties && typeof value.properties === 'object' ? value.properties as Record<string, unknown> : null;
     const part = properties?.part && typeof properties.part === 'object' ? properties.part as Record<string, unknown> : null;
-    if ((value.type === 'message.part.updated' || value.type === 'message.part.completed') && part?.type === 'text'
+    if (value.type === 'message.part.completed' && part?.type === 'text'
       && typeof part.text === 'string' && part.text.trim()) {
       return { id: typeof part.id === 'string' ? part.id : this.fallbackOutputId(part.text), text: part.text.trim() };
     }

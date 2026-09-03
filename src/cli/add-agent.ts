@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, symlinkSync, lstatSync, unlinkSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
+import { randomUUID } from 'crypto';
 import { OrgContext } from '../types';
 import { validateAgentName, validateOrgName } from '../utils/validate';
 import { createEmployee, CrewServiceError, CREW_EMPLOYEE_RUNTIMES } from '../agents/create-employee';
@@ -24,9 +25,10 @@ export const addAgentCommand = new Command('add-agent')
   .option('--runtime <runtime>', `Agent runtime (${VALID_RUNTIMES.join(', ')})`, 'claude-code')
   .option('--model <model>', 'Harness model override')
   .option('--working-directory <path>', 'Default absolute project directory')
+  .option('--mutation-id <uuid>', 'Reuse an Employee creation mutation after an unknown outcome')
   .option('--buzz-channel <uuid>', 'Buzz (Nostr/NIP-29) channel UUID to scaffold this agent onto')
   .description('Add a new agent to the organization')
-  .action(async (name: string, options: { template: string; org?: string; instance: string; runtime: string; model?: string; workingDirectory?: string; buzzChannel?: string }) => {
+  .action(async (name: string, options: { template: string; org?: string; instance: string; runtime: string; model?: string; workingDirectory?: string; mutationId?: string; buzzChannel?: string }) => {
     if (!VALID_RUNTIMES.includes(options.runtime as RuntimeKind)) {
       console.error(`Error: --runtime must be one of: ${VALID_RUNTIMES.join(', ')} (got "${options.runtime}")`);
       process.exit(1);
@@ -97,6 +99,7 @@ export const addAgentCommand = new Command('add-agent')
     if (options.template === 'agent'
       && !options.buzzChannel
       && CREW_EMPLOYEE_RUNTIMES.includes(options.runtime as typeof CREW_EMPLOYEE_RUNTIMES[number])) {
+      const mutationId = options.mutationId ?? randomUUID();
       try {
         const result = await createEmployee({
           name,
@@ -106,7 +109,7 @@ export const addAgentCommand = new Command('add-agent')
           working_directory: options.workingDirectory,
           telegram_polling: false,
           actor: 'owner:local-cli',
-        }, undefined, {
+        }, mutationId, {
           ctxRoot: join(homedir(), '.cortextos', options.instance),
           frameworkRoot: projectRoot,
           instanceId: options.instance,
@@ -116,6 +119,9 @@ export const addAgentCommand = new Command('add-agent')
       } catch (error) {
         const message = error instanceof CrewServiceError ? error.message : 'Employee creation failed';
         console.error(`Error: ${message}`);
+        if (error instanceof CrewServiceError && ['MUTATION_PENDING', 'MUTATION_OUTCOME_UNKNOWN'].includes(error.code)) {
+          console.error(`Mutation outcome is unresolved. Retry with --mutation-id ${mutationId}`);
+        }
         process.exit(1);
       }
     }

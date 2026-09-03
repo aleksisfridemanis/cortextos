@@ -422,7 +422,10 @@ function certifyEmployeeCreate(
         && receipt.receipt_digest !== digestCrewAuditValue(legacyCanonical))) return null;
     if (receipt.started === true && receipt.disposition === 'running'
       && Number.isSafeInteger(receipt.pid) && typeof receipt.process_started_at === 'string') {
-      return { result: 'success', after_digest: entry.intended_after_digest };
+      // A durable spawn receipt proves what the previous daemon observed, not
+      // that the replacement daemon owns that PTY. AgentManager must classify
+      // it as attached, detached-and-terminated, or exited before finalization.
+      return 'pending';
     }
     if (receipt.started === false && receipt.disposition === 'configured'
       && receipt.pid === null && receipt.process_started_at === null) {

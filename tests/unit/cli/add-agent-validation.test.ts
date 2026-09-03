@@ -18,6 +18,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { addAgentCommand } from '../../../src/cli/add-agent';
 
+it('exposes mutation id reuse for unresolved Employee creation', () => {
+  expect(addAgentCommand.options.some(option => option.long === '--mutation-id')).toBe(true);
+});
+
 describe('BUG-041: add-agent agent name validation', () => {
   afterEach(() => {
     vi.restoreAllMocks();

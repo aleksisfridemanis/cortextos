@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -164,7 +164,7 @@ describe('createEmployee', () => {
     await expect(first).resolves.toMatchObject({ status: 'created' });
   });
 
-  it('certifies the canonical full readiness receipt after a post-effect crash', async () => {
+  it('requires manager attachment confirmation after a post-effect crash', async () => {
     const mutationId = 'b7ee842e-b948-4cbb-a4e6-e80c6847dc85';
     dependencies.failAt = 'after-effect';
     await expect(createEmployee({
@@ -173,7 +173,56 @@ describe('createEmployee', () => {
     expect(JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'))[0])
       .toMatchObject({ stage: 'effect_recorded', effect_receipt: { name: 'ada', pid: testProcess.pid, disposition: 'running' } });
     const { reconcileCrewMutationJournal } = await import('../../../src/audit/crew-mutation-journal.js');
-    expect(reconcileCrewMutationJournal(ctxRoot, { frameworkRoot })).toEqual({ finalized: 1, pending: 0 });
+    expect(reconcileCrewMutationJournal(ctxRoot, { frameworkRoot })).toEqual({ finalized: 0, pending: 1 });
+    dependencies.failAt = undefined;
+    dependencies.queryEmployeeStart = async request => ({
+      mutation_id: request.mutation_id, name: request.name, started: true,
+      pid: testProcess.pid, process_started_at: testProcess.started_at, disposition: 'running',
+    });
+    await expect(createEmployee({
+      name: 'ada', org: 'platform', runtime: 'claude-code', telegram_polling: false, actor: 'owner:test',
+    }, mutationId, dependencies)).resolves.toMatchObject({ status: 'created' });
+  });
+
+  it('canonicalizes a directory and rejects files and dangling symlinks before publication', async () => {
+    const project = join(root, 'project');
+    const alias = join(root, 'project-link');
+    mkdirSync(project);
+    const { symlinkSync } = await import('fs');
+    symlinkSync(project, alias, 'dir');
+    const result = await createEmployee({
+      name: 'canonical', org: 'platform', runtime: 'claude-code', working_directory: alias,
+      telegram_polling: false, actor: 'owner:test',
+    }, 'd7ee842e-b948-4cbb-a4e6-e80c6847dc85', dependencies);
+    expect(result.employee.working_directory).toBe(realpathSync(project));
+    const replacement = join(root, 'replacement');
+    mkdirSync(replacement);
+    unlinkSync(alias);
+    symlinkSync(replacement, alias, 'dir');
+    expect(JSON.parse(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8')).canonical.working_directory)
+      .toBe(realpathSync(project));
+
+    const file = join(root, 'not-a-directory');
+    writeFileSync(file, 'private');
+    await expect(createEmployee({
+      name: 'file-cwd', org: 'platform', runtime: 'claude-code', working_directory: file,
+      telegram_polling: false, actor: 'owner:test',
+    }, 'e7ee842e-b948-4cbb-a4e6-e80c6847dc85', dependencies)).rejects.toMatchObject({ code: 'CWD_NOT_DIRECTORY' });
+    const dangling = join(root, 'dangling');
+    symlinkSync(join(root, 'absent'), dangling, 'dir');
+    await expect(createEmployee({
+      name: 'dangling-cwd', org: 'platform', runtime: 'claude-code', working_directory: dangling,
+      telegram_polling: false, actor: 'owner:test',
+    }, 'f7ee842e-b948-4cbb-a4e6-e80c6847dc85', dependencies)).rejects.toMatchObject({ code: 'CWD_NOT_FOUND' });
+    const unreadable = join(root, 'unreadable');
+    mkdirSync(unreadable);
+    chmodSync(unreadable, 0o000);
+    await expect(createEmployee({
+      name: 'unreadable-cwd', org: 'platform', runtime: 'claude-code', working_directory: unreadable,
+      telegram_polling: false, actor: 'owner:test',
+    }, '07ee842e-b948-4cbb-a4e6-e80c6847dc85', dependencies)).rejects.toMatchObject({ code: 'CWD_UNREADABLE' });
+    chmodSync(unreadable, 0o700);
+    expect(JSON.parse(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8'))).not.toHaveProperty('file-cwd');
   });
 
   it('records an offline start as configured and never audits it as started success', async () => {

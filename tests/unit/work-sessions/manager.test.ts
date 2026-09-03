@@ -352,6 +352,38 @@ describe('WorkSessionManager', () => {
     ]);
   });
 
+  it('persists only the authoritative OpenCode completion, ignoring partials, repeats, and TUI noise', async () => {
+    const { manager, cwd, ctxRoot } = fixture();
+    const created = await manager.create({ display_name: 'Open output', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'e9111111-1111-4111-8111-111111111111');
+    const outputAdapter = new WorkSessionPTY({
+      ctxRoot, frameworkRoot: cwd, instanceId: 'test', record: { ...created, harness: 'opencode' },
+      onOutput: output => manager.recordRuntimeOutput(created.id, output),
+    });
+    const internals = outputAdapter as unknown as { ready: boolean; capture(data: string): void };
+    internals.ready = true;
+    internals.capture([
+      JSON.stringify({ type: 'message.part.updated', properties: { part: { id: 'part-1', type: 'text', text: 'Hel' } } }),
+      '> prompt echo\rstatus redraw',
+      JSON.stringify({ type: 'message.part.completed', properties: { part: { id: 'part-1', type: 'text', text: 'Hello world' } } }),
+      JSON.stringify({ type: 'message.part.completed', properties: { part: { id: 'part-1', type: 'text', text: 'Hello world' } } }),
+      '',
+    ].join('\n'));
+    expect(readRoomLog(ctxRoot, created.room_id).filter(message => message.source === 'work_session')).toEqual([
+      expect.objectContaining({ from: created.id, text: 'Hello world' }),
+    ]);
+  });
+
+  it('never downgrades room delivery after the durable delivered receipt', async () => {
+    const { manager, cwd, ctxRoot } = fixture('after-message-effect-receipt');
+    const created = await manager.create({ display_name: 'Receipt', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'e8111111-1111-4111-8111-111111111111');
+    const mutationId = 'e8222222-2222-4222-8222-222222222222';
+    await expect(manager.send(created.id, 'delivered once', 'owner:test', mutationId))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(getCrewMutation(ctxRoot, mutationId)).toMatchObject({ stage: 'finalized', final_result: { result: 'success' } });
+    expect(readRoomLog(ctxRoot, created.room_id).find(message => message.id === mutationId))
+      .toMatchObject({ delivery_state: 'delivered' });
+  });
+
   it('recovers stop and resume mutations interrupted after effect-start', async () => {
     const { manager, adapter, cwd, ctxRoot } = fixture();
     const created = await manager.create({ display_name: 'Lifecycle', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'e3111111-1111-4111-8111-111111111111');
