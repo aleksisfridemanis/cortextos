@@ -64,6 +64,25 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     rmSync(testDir, { recursive: true, force: true });
   });
 
+  it('reports Employee start success only after a live pid and runtime generation are observable', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    vi.spyOn(am, 'startAgent').mockResolvedValue();
+    await expect(am.startEmployeeForMutation({
+      name: 'alice', org: 'acme', agent_dir: join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'),
+      mutation_id: '11111111-1111-4111-8111-111111111111',
+    })).rejects.toThrow('EMPLOYEE_START_NOT_READY');
+
+    vi.spyOn(am, 'getAgentStatus')
+      .mockReturnValueOnce(null)
+      .mockReturnValue({
+        name: 'alice', status: 'running', pid: 4242, sessionStart: '2026-09-03T00:00:00.000Z', crashCount: 0,
+      });
+    await expect(am.startEmployeeForMutation({
+      name: 'alice', org: 'acme', agent_dir: join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'),
+      mutation_id: '22222222-2222-4222-8222-222222222222',
+    })).resolves.toMatchObject({ started: true, pid: 4242, process_started_at: '2026-09-03T00:00:00.000Z' });
+  });
+
   it('skips agents marked enabled: false in enabled-agents.json', async () => {
     // Mark alice as disabled at the instance level (the file the CLI writes to)
     writeFileSync(

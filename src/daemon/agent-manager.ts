@@ -24,7 +24,13 @@ import { computeDormancy, parseHeartbeatIntervalMs } from '../utils/dormancy.js'
 import { CRONS_DIRECTORY, CRONS_FILENAME } from '../bus/crons-schema.js';
 import { WorkSessionManager } from '../work-sessions/manager.js';
 import { WorkSessionPTY } from '../pty/work-session-pty.js';
-import { createEmployee, createPromotedEmployee, type CrewEmployeeRuntime } from '../agents/create-employee.js';
+import {
+  createEmployee,
+  createPromotedEmployee,
+  type CrewEmployeeRuntime,
+  type EmployeeStartReceipt,
+  type EmployeeStartRequest,
+} from '../agents/create-employee.js';
 import { listPendingCrewMutations, reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
 import { promotionEmployeeMutationId } from '../work-sessions/promotion.js';
 
@@ -113,6 +119,7 @@ export class AgentManager {
   // idempotent no-op path, and have its start SWALLOWED — so callers MUST keep
   // stop-before-start ordering for coordinated restarts.
   private stoppingAgents: Set<string> = new Set();
+  private employeeStartReceipts = new Map<string, EmployeeStartReceipt & { name: string }>();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -154,10 +161,8 @@ export class AgentManager {
         ctxRoot, frameworkRoot, instanceId, record,
         onExit: () => this.workSessions.handleRuntimeExit(record.id),
       }),
-      startEmployee: async request => {
-        await this.startAgent(request.name, request.agent_dir, undefined, request.org);
-        return { mutation_id: request.mutation_id, started: true };
-      },
+      startEmployee: request => this.startEmployeeForMutation(request),
+      queryEmployeeStart: request => this.queryEmployeeStart(request),
     });
     this.daemonJustCrashed = this.detectDaemonCrashMarkers();
     if (this.daemonJustCrashed) {
@@ -186,10 +191,8 @@ export class AgentManager {
           telegram_polling: false as const,
           actor: entry.actor,
         };
-        const startEmployee = async (request: { name: string; agent_dir: string; org: string; mutation_id: string }) => {
-          await this.startAgent(request.name, request.agent_dir, undefined, request.org);
-          return { mutation_id: request.mutation_id, started: true };
-        };
+        const startEmployee = (request: EmployeeStartRequest) => this.startEmployeeForMutation(request);
+        const queryEmployeeStart = (request: EmployeeStartRequest) => this.queryEmployeeStart(request);
         const room = rooms.find(item => item.id === record.room_id);
         const parent = listPendingCrewMutations(this.ctxRoot).find(candidate => candidate.target.kind === 'work_session'
           && candidate.action === 'promote'
@@ -199,10 +202,10 @@ export class AgentManager {
           await createPromotedEmployee(input, entry.mutation_id, {
             sourceWorkSessionId: parent.target.id,
             parentMutationId: parent.mutation_id,
-          }, { ctxRoot: this.ctxRoot, frameworkRoot: this.frameworkRoot, instanceId: this.instanceId, startEmployee });
+          }, { ctxRoot: this.ctxRoot, frameworkRoot: this.frameworkRoot, instanceId: this.instanceId, startEmployee, queryEmployeeStart });
         } else {
           await createEmployee(input, entry.mutation_id, {
-            ctxRoot: this.ctxRoot, frameworkRoot: this.frameworkRoot, instanceId: this.instanceId, startEmployee,
+            ctxRoot: this.ctxRoot, frameworkRoot: this.frameworkRoot, instanceId: this.instanceId, startEmployee, queryEmployeeStart,
           });
         }
       } catch (error) {
@@ -211,6 +214,38 @@ export class AgentManager {
     }
     await this.workSessions.reconcilePending();
     reconcileCrewMutationJournal(this.ctxRoot, { frameworkRoot: this.frameworkRoot });
+  }
+
+  async startEmployeeForMutation(request: EmployeeStartRequest): Promise<EmployeeStartReceipt> {
+    const prior = this.employeeStartReceipts.get(request.mutation_id);
+    if (prior) {
+      if (prior.name !== request.name) throw new Error('IDEMPOTENCY_CONFLICT');
+      return prior;
+    }
+    const before = this.getAgentStatus(request.name);
+    if (before?.status === 'running') throw new Error('EMPLOYEE_START_OWNERSHIP_UNCONFIRMED');
+    await this.startAgent(request.name, request.agent_dir, undefined, request.org);
+    const status = this.getAgentStatus(request.name);
+    if (status?.status !== 'running' || !status.pid || !status.sessionStart) {
+      throw new Error('EMPLOYEE_START_NOT_READY');
+    }
+    const receipt = {
+      mutation_id: request.mutation_id,
+      started: true,
+      pid: status.pid,
+      process_started_at: status.sessionStart,
+      name: request.name,
+    } as const;
+    this.employeeStartReceipts.set(request.mutation_id, receipt);
+    return receipt;
+  }
+
+  async queryEmployeeStart(request: EmployeeStartRequest): Promise<EmployeeStartReceipt | null> {
+    const receipt = this.employeeStartReceipts.get(request.mutation_id);
+    if (!receipt || receipt.name !== request.name) return null;
+    const status = this.getAgentStatus(request.name);
+    if (status?.status !== 'running' || status.pid !== receipt.pid || status.sessionStart !== receipt.process_started_at) return null;
+    return receipt;
   }
 
   /**

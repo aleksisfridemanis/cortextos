@@ -106,7 +106,12 @@ describe('Crew Work Session lifecycle', () => {
       status: () => ({ running: true, pid: 1, error_code: null }),
       getResumeHandle: () => null,
     };
-    const manager = new WorkSessionManager({ ctxRoot, frameworkRoot, adapterFactory: () => adapter });
+    const manager = new WorkSessionManager({
+      ctxRoot,
+      frameworkRoot,
+      adapterFactory: () => adapter,
+      startEmployee: async request => ({ mutation_id: request.mutation_id, started: true }),
+    });
     const created = await manager.create({
       display_name: 'Promote real', org: 'platform', harness: 'claude-code', requested_cwd: cwd, actor: 'owner:test',
     }, '8f51a223-4111-46fb-b4f2-27870567d55d');

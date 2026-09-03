@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CREW_BODY_MAX_BYTES,
   CREW_NAME_MAX_CHARS,
@@ -127,7 +127,7 @@ describe('createEmployee', () => {
     },
   );
 
-  it('replays the exact mutation after a crash at the effect-start boundary', async () => {
+  it('never replays an uncertain Employee start and converges only from an exact receipt query', async () => {
     const mutationId = '97ee842e-b948-4cbb-a4e6-e80c6847dc85';
     const input = { name: 'ada', org: 'platform', runtime: 'claude-code' as const, telegram_polling: false as const, actor: 'owner:test' };
     dependencies.failAt = 'after-effect-start';
@@ -135,10 +135,31 @@ describe('createEmployee', () => {
     expect(started).toEqual([]);
 
     dependencies.failAt = undefined;
+    await expect(createEmployee(input, mutationId, dependencies)).rejects.toMatchObject({ code: 'MUTATION_PENDING' });
+    expect(started).toEqual([]);
+    dependencies.queryEmployeeStart = async request => ({ mutation_id: request.mutation_id, started: true, pid: 42, process_started_at: '2026-09-03T00:00:01Z' });
     await expect(createEmployee(input, mutationId, dependencies)).resolves.toMatchObject({ status: 'created' });
-    expect(started).toEqual([mutationId]);
+    expect(started).toEqual([]);
     const journal = JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'));
     expect(journal[0]).toMatchObject({ stage: 'finalized', final_result: { result: 'success' } });
+  });
+
+  it('joins identical concurrent creates and rejects a conflicting binding before start', async () => {
+    const mutationId = 'a7ee842e-b948-4cbb-a4e6-e80c6847dc85';
+    const input = { name: 'ada', org: 'platform', runtime: 'claude-code' as const, telegram_polling: false as const, actor: 'owner:test' };
+    let release!: () => void;
+    dependencies.startEmployee = request => new Promise(resolve => {
+      started.push(request.mutation_id);
+      release = () => resolve({ mutation_id: request.mutation_id, started: true });
+    });
+    const first = createEmployee(input, mutationId, dependencies);
+    const joined = createEmployee(input, mutationId, dependencies);
+    const conflict = createEmployee({ ...input, name: 'grace' }, mutationId, dependencies);
+    expect(joined).toBe(first);
+    await expect(conflict).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await vi.waitFor(() => expect(started).toEqual([mutationId]));
+    release();
+    await expect(first).resolves.toMatchObject({ status: 'created' });
   });
 
   it('exports the exact request ceilings', () => {

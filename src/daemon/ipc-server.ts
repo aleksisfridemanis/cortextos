@@ -688,10 +688,8 @@ export class IPCServer {
           }
           try {
             const result = await createEmployee(request.data as unknown as CreateEmployeeInput, request.mutation_id, {
-              startEmployee: async start => {
-                await this.agentManager.startAgent(start.name, start.agent_dir, undefined, start.org);
-                return { mutation_id: start.mutation_id, started: true };
-              },
+              startEmployee: start => this.agentManager.startEmployeeForMutation(start),
+              queryEmployeeStart: start => this.agentManager.queryEmployeeStart(start),
             });
             response = { success: true, data: result };
           } catch (error) {

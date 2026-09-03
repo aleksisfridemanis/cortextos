@@ -80,6 +80,8 @@ export interface EmployeeStartRequest {
 export interface EmployeeStartReceipt {
   mutation_id: string;
   started: boolean;
+  pid?: number;
+  process_started_at?: string;
 }
 
 export interface CreateEmployeeDependencies {
@@ -88,6 +90,7 @@ export interface CreateEmployeeDependencies {
   instanceId?: string;
   now?: () => string;
   startEmployee?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt>;
+  queryEmployeeStart?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt | null>;
   failAt?: 'before-state-commit' | 'after-directory-publish' | 'after-enabled-write' | 'after-publication'
     | 'after-state-commit' | 'after-effect-start' | 'after-effect' | 'after-audit';
 }
@@ -100,6 +103,14 @@ interface PromotionGrant {
 const PROMOTION_GRANT = Symbol('cortext-promotion-grant');
 type InternalCreateEmployeeInput = CreateEmployeeInput & Partial<PromotionGrant>;
 type InternalCreateEmployeeDependencies = CreateEmployeeDependencies & { [PROMOTION_GRANT]?: PromotionGrant };
+
+interface EmployeeMutationRun {
+  actor: string;
+  target: string;
+  requestDigest: string;
+  promise: Promise<CreateEmployeeResult>;
+}
+const employeeMutationRuns = new Map<string, EmployeeMutationRun>();
 
 export class CrewServiceError extends Error {
   constructor(
@@ -259,7 +270,7 @@ function resultFromRegistry(name: string, record: EmployeeRegistryRecord): Creat
   return { status: 'created', employee: { name, ...record }, audit: 'finalized' };
 }
 
-export async function createEmployee(
+export function createEmployee(
   input: CreateEmployeeInput,
   mutationId: string = randomUUID(),
   dependencies: CreateEmployeeDependencies = {},
@@ -267,12 +278,12 @@ export async function createEmployee(
   if (input && typeof input === 'object'
     && (Object.prototype.hasOwnProperty.call(input, 'source_work_session_id')
       || Object.prototype.hasOwnProperty.call(input, 'parent_mutation_id'))) {
-    throw new CrewServiceError('FORGED_SERVER_FIELD', 400, 'Promotion authority is server-owned');
+    return Promise.reject(new CrewServiceError('FORGED_SERVER_FIELD', 400, 'Promotion authority is server-owned'));
   }
-  return createEmployeeInternal(input, mutationId, dependencies);
+  return runEmployeeMutation(input, mutationId, dependencies);
 }
 
-export async function createPromotedEmployee(
+export function createPromotedEmployee(
   input: CreateEmployeeInput,
   mutationId: string,
   grant: { sourceWorkSessionId: string; parentMutationId: string },
@@ -282,11 +293,42 @@ export async function createPromotedEmployee(
     source_work_session_id: grant.sourceWorkSessionId,
     parent_mutation_id: grant.parentMutationId,
   };
-  return createEmployeeInternal(
+  return runEmployeeMutation(
     { ...input, ...authorization },
     mutationId,
     Object.assign({}, dependencies, { [PROMOTION_GRANT]: authorization }),
   );
+}
+
+function runEmployeeMutation(
+  input: InternalCreateEmployeeInput,
+  mutationId: string,
+  dependencies: InternalCreateEmployeeDependencies,
+): Promise<CreateEmployeeResult> {
+  const ctxRoot = dependencies.ctxRoot ?? process.env.CTX_ROOT ?? join(homedir(), '.cortextos', dependencies.instanceId ?? process.env.CTX_INSTANCE_ID ?? 'default');
+  const key = `${ctxRoot}\0${mutationId}`;
+  const target = input?.name ?? '';
+  const requestDigest = digestCrewAuditValue({
+    ...input,
+    actor: undefined,
+    source_work_session_id: dependencies[PROMOTION_GRANT]?.source_work_session_id ?? null,
+    parent_mutation_id: dependencies[PROMOTION_GRANT]?.parent_mutation_id ?? null,
+  });
+  const current = employeeMutationRuns.get(key);
+  if (current) {
+    if (current.actor !== input?.actor || current.target !== target || current.requestDigest !== requestDigest) {
+      return Promise.reject(new CrewServiceError('IDEMPOTENCY_CONFLICT', 409, 'Mutation id is already bound to another request'));
+    }
+    return current.promise;
+  }
+  const promise = Promise.resolve().then(() => createEmployeeInternal(input, mutationId, dependencies));
+  const descriptor = { actor: input?.actor ?? '', target, requestDigest, promise };
+  employeeMutationRuns.set(key, descriptor);
+  void promise.then(
+    () => { if (employeeMutationRuns.get(key) === descriptor) employeeMutationRuns.delete(key); },
+    () => { if (employeeMutationRuns.get(key) === descriptor) employeeMutationRuns.delete(key); },
+  );
+  return promise;
 }
 
 async function createEmployeeInternal(
@@ -359,14 +401,20 @@ async function createEmployeeInternal(
         }
         throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
       }
-      if (priorMutation.stage === 'state_committed') startCrewMutationEffect(ctxRoot, mutationId);
-      const receipt = await (dependencies.startEmployee ?? (request => defaultStart(instanceId, request)))({
+      const startRequest = {
         name: input.name,
         org: existing.org,
         agent_dir: join(frameworkRoot, 'orgs', existing.org, 'agents', input.name),
         mutation_id: mutationId,
-      });
-      if (receipt.mutation_id !== mutationId || typeof receipt.started !== 'boolean') {
+      };
+      let receipt: EmployeeStartReceipt | null;
+      if (priorMutation.stage === 'state_committed') {
+        startCrewMutationEffect(ctxRoot, mutationId);
+        receipt = await (dependencies.startEmployee ?? (request => defaultStart(instanceId, request)))(startRequest);
+      } else {
+        receipt = await dependencies.queryEmployeeStart?.(startRequest) ?? null;
+      }
+      if (!receipt || receipt.mutation_id !== mutationId || receipt.started !== true) {
         throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee start recovery returned an invalid receipt');
       }
       recordCrewMutationEffect(ctxRoot, mutationId, {
@@ -543,7 +591,7 @@ async function createEmployeeInternal(
       agent_dir: finalDir,
       mutation_id: mutationId,
     });
-    if (receipt.mutation_id !== mutationId || typeof receipt.started !== 'boolean') throw new Error('Invalid daemon mutation receipt');
+    if (receipt.mutation_id !== mutationId || receipt.started !== true) throw new Error('Invalid daemon mutation receipt');
     recordCrewMutationEffect(ctxRoot, mutationId, {
       mutation_id: receipt.mutation_id,
       started: receipt.started,

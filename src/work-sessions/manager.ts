@@ -38,6 +38,7 @@ interface Dependencies {
   frameworkRoot?: string;
   createEmployee?: (input: CreateEmployeeInput, mutationId: string) => Promise<unknown>;
   startEmployee?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt>;
+  queryEmployeeStart?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt | null>;
   now?: () => string;
   failAt?: 'after-session-record' | 'after-runtime-exit-prepare' | 'after-runtime-exit-state'
     | 'after-runtime-exit-state-commit' | 'after-runtime-exit-effect-start'
@@ -655,6 +656,7 @@ export class WorkSessionManager {
             ctxRoot: this.dependencies.ctxRoot,
             frameworkRoot: this.dependencies.frameworkRoot,
             startEmployee: this.dependencies.startEmployee,
+            queryEmployeeStart: this.dependencies.queryEmployeeStart,
           },
         ));
       const employeeMutationId = promotionEmployeeMutationId(mutationId);
@@ -694,6 +696,7 @@ export class WorkSessionManager {
           ctxRoot: this.dependencies.ctxRoot,
           frameworkRoot: this.dependencies.frameworkRoot,
           startEmployee: this.dependencies.startEmployee,
+          queryEmployeeStart: this.dependencies.queryEmployeeStart,
         },
       ));
     try {
