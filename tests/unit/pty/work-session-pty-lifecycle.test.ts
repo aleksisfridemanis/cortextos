@@ -131,10 +131,11 @@ describe('WorkSessionPTY owned lifecycle', () => {
       emitOutput(value: { id: string; text: string }): void;
     };
     internals.options.onOutput = publish;
-    internals.emitOutput({ id: 'native-completion-1', text: 'durable answer' });
+    internals.emitOutput({ id: 'native-completion-z', text: 'first durable answer' });
+    internals.emitOutput({ id: 'native-completion-a', text: 'second durable answer' });
 
     const state = join(cwd, 'ctx', 'state', 'work-sessions', record.id);
-    expect(readdirSync(join(state, 'output-inbox'))).toHaveLength(1);
+    expect(readdirSync(join(state, 'output-inbox')).filter(name => /^\d/.test(name))).toHaveLength(2);
     expect(existsSync(join(state, 'output-recovery-required.json'))).toBe(true);
 
     const recovered = vi.fn();
@@ -142,9 +143,12 @@ describe('WorkSessionPTY owned lifecycle', () => {
       ctxRoot: join(cwd, 'ctx'), frameworkRoot: cwd, instanceId: 'test', record,
       onOutput: recovered,
     });
-    expect(restarted.reconcileOutputInbox()).toBe(1);
-    expect(recovered).toHaveBeenCalledWith({ id: 'native-completion-1', text: 'durable answer' });
-    expect(readdirSync(join(state, 'output-inbox'))).toEqual([]);
+    expect(restarted.reconcileOutputInbox()).toBe(2);
+    expect(recovered.mock.calls.map(call => call[0])).toEqual([
+      expect.objectContaining({ id: 'native-completion-z', text: 'first durable answer', completed_at: expect.any(String) }),
+      expect.objectContaining({ id: 'native-completion-a', text: 'second durable answer', completed_at: expect.any(String) }),
+    ]);
+    expect(readdirSync(join(state, 'output-inbox')).filter(name => /^\d/.test(name))).toEqual([]);
     expect(existsSync(join(state, 'output-recovery-required.json'))).toBe(false);
   });
 });

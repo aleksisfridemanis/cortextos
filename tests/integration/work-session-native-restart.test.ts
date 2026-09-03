@@ -15,10 +15,13 @@ describe('native Work Session process restart ownership', () => {
   const roots: string[] = [];
   const originalPath = process.env.PATH;
   const originalXdgData = process.env.XDG_DATA_HOME;
+  const originalCodexHome = process.env.CODEX_HOME;
   afterEach(() => {
     process.env.PATH = originalPath;
     if (originalXdgData === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgData;
+    if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalCodexHome;
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   });
 
@@ -44,12 +47,21 @@ process.stdin.on('data', chunk => {
   for (const line of lines) {
     if (!line.trim()) continue;
     const request = JSON.parse(line);
-    const result = request.method === 'thread/start' ? { thread: { id: 'native-thread' } } : {};
+    if ((request.method === 'thread/start' || request.method === 'thread/resume') && request.params.sandbox !== 'workspace-write') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32600, data: { category: 'sandbox_unavailable' } } }) + '\\n');
+      continue;
+    }
+    const result = request.method === 'thread/start'
+      ? { thread: { id: 'native-thread' }, instructionSources: [] }
+      : request.method === 'thread/resume'
+        ? { thread: { id: request.params.threadId }, instructionSources: [] }
+        : request.method === 'turn/start' ? { turn: { id: 'native-turn' } } : {};
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n');
     if (request.method === 'turn/start') {
       process.stdout.write(JSON.stringify({ method: 'item/completed', params: { item: {
         id: 'native-answer', type: 'agentMessage', text: 'native durable answer'
       } } }) + '\\n');
+      process.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'native-thread', turn: { id: 'native-turn' } } }) + '\\n');
     }
   }
 
@@ -57,6 +69,10 @@ process.stdin.on('data', chunk => {
 setInterval(() => {}, 1000);
 `);
     chmodSync(executable, 0o755);
+    const hostCodex = join(root, 'host-codex');
+    mkdirSync(hostCodex, { recursive: true });
+    writeFileSync(join(hostCodex, 'auth.json'), '{"tokens":{"access_token":"test"}}');
+    process.env.CODEX_HOME = hostCodex;
     process.env.PATH = `${bin}:${originalPath ?? ''}`;
     return { root, cwd, ctxRoot };
   }
@@ -75,21 +91,29 @@ const fs = require('fs');
 const path = require('path');
 const args = process.argv.slice(2);
 fs.writeFileSync(path.join(process.cwd(), 'launch-args.json'), JSON.stringify(args));
+if (args[0] === 'auth' && args[1] === 'status') {
+  process.stdout.write(JSON.stringify({ loggedIn: true }));
+  process.exit(0);
+}
 const settingsPath = args[args.indexOf('--settings') + 1];
 const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
 const command = settings.hooks.SessionStart[0].hooks[0].command;
 const quoted = command.match(/"([^"]+)"$/);
 const ackPath = quoted && quoted[1];
 const sessionId = args.includes('--resume') ? args[args.indexOf('--resume') + 1] : args[args.indexOf('--session-id') + 1];
-fs.writeFileSync(ackPath, JSON.stringify({ session_id: sessionId }));
-process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: sessionId }) + '\\n');
 let buffer = '';
+let initialized = false;
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => {
   buffer += chunk;
   const lines = buffer.split(/\\n/); buffer = lines.pop() || '';
   for (const line of lines) if (line.trim()) {
     const request = JSON.parse(line);
+    if (!initialized) {
+      initialized = true;
+      fs.writeFileSync(ackPath, JSON.stringify({ session_id: sessionId }));
+      process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: sessionId }) + '\\n');
+    }
     process.stdout.write(JSON.stringify({ type: 'assistant', uuid: 'claude-native-answer', message: { content: [{ type: 'text', text: 'Claude native answer: ' + request.message.content[0].text }] } }) + '\\n');
     process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId }) + '\\n');
   }
@@ -146,7 +170,10 @@ setInterval(() => {}, 1000);
     await adapter.send('native prompt');
     await new Promise(resolve => setTimeout(resolve, 100));
     const args = JSON.parse(readFileSync(join(cwd, 'launch-args.json'), 'utf8')) as string[];
-    if (harness === 'claude-code') expect(args).toEqual(expect.arrayContaining(['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--safe-mode', '--strict-mcp-config', '--disable-slash-commands']));
+    if (harness === 'claude-code') {
+      expect(args).toEqual(expect.arrayContaining(['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands']));
+      expect(args).not.toContain('--safe-mode');
+    }
     else expect(args.slice(0, 3)).toEqual(['acp', '--cwd', cwd]);
     if (harness === 'opencode') {
       const isolated = join(ctxRoot, 'state', 'work-sessions', record.id, 'opencode', 'data', 'opencode');

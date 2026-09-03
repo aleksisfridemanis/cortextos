@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'crypto';
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, readdirSync, unlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, readdirSync, unlinkSync, writeFileSync,
 } from 'fs';
 import { execFileSync } from 'child_process';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import type { WorkSessionRecord } from '../work-sessions/types.js';
 import type { WorkSessionLaunchInput, WorkSessionResumeHandle, WorkSessionRuntimeAdapter, WorkSessionRuntimeOutput } from '../work-sessions/types.js';
 import {
@@ -11,6 +11,7 @@ import {
 } from '../utils/process-identity.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 import { closedRuntimeErrorCode } from '../utils/application-error.js';
+import { withFileLockSync } from '../utils/lock.js';
 
 const CHILD_ENV_ALLOWLIST = ['PATH', 'HOME', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'] as const;
 
@@ -42,7 +43,7 @@ export function buildClaudeWorkSessionLaunch(input: { cwd: string; sessionId: st
     ? ['--resume', input.sessionId]
     : ['--session-id', input.sessionId]));
   args.push('--permission-mode', 'manual');
-  args.push('--safe-mode', '--disable-slash-commands', '--strict-mcp-config');
+  args.push('--setting-sources', '', '--disable-slash-commands', '--strict-mcp-config');
   if (input.mcpConfigPath) args.push('--mcp-config', input.mcpConfigPath);
   if (input.settingsPath) args.push('--settings', input.settingsPath);
   if (input.model) args.push('--model', input.model);
@@ -51,7 +52,7 @@ export function buildClaudeWorkSessionLaunch(input: { cwd: string; sessionId: st
 
 interface CodexRequest { method: string; params: Record<string, unknown> }
 export function buildCodexWorkSessionLaunch(input: { cwd: string; model?: string; threadId?: string }) {
-  const shared = { cwd: input.cwd, model: input.model, sandbox: 'workspaceWrite', approvalPolicy: 'never', allowProviderModelFallback: false };
+  const shared = { cwd: input.cwd, model: input.model, sandbox: 'workspace-write', approvalPolicy: 'never', allowProviderModelFallback: false };
   const requests: CodexRequest[] = [{ method: 'initialize', params: { clientInfo: { name: 'cortextos-work-session', version: '1' } } }];
   requests.push(input.threadId
     ? { method: 'thread/resume', params: { ...shared, threadId: input.threadId } }
@@ -104,9 +105,9 @@ export function openCodePermissionConfig(): Record<string, unknown> {
 export function prepareOpenCodeEnvironment(source: NodeJS.ProcessEnv, stateDir: string): Record<string, string> {
   const sourceHome = source.HOME;
   const sourceData = source.XDG_DATA_HOME ?? (sourceHome ? join(sourceHome, '.local', 'share') : null);
-  if (!sourceData) throw new Error('OPENCODE_AUTH_UNAVAILABLE');
+  if (!sourceData) throw new Error('RUNTIME_AUTH_UNAVAILABLE');
   const sourceAuth = join(sourceData, 'opencode', 'auth.json');
-  if (!existsSync(sourceAuth)) throw new Error('OPENCODE_AUTH_UNAVAILABLE');
+  if (!existsSync(sourceAuth)) throw new Error('RUNTIME_AUTH_UNAVAILABLE');
   const home = join(stateDir, 'home');
   const data = join(stateDir, 'data');
   const config = join(stateDir, 'config');
@@ -114,9 +115,32 @@ export function prepareOpenCodeEnvironment(source: NodeJS.ProcessEnv, stateDir: 
   const authDir = join(data, 'opencode');
   for (const directory of [home, data, config, cache, authDir]) mkdirSync(directory, { recursive: true, mode: 0o700 });
   const auth = join(authDir, 'auth.json');
-  copyFileSync(sourceAuth, auth);
+  // Refresh through a new inode so an existing mode-0400 credential copy can
+  // be replaced safely during exact resume without ever becoming writable.
+  atomicWriteSync(auth, readFileSync(sourceAuth, 'utf8').trimEnd());
   chmodSync(auth, 0o400);
   return { HOME: home, XDG_DATA_HOME: data, XDG_CONFIG_HOME: config, XDG_CACHE_HOME: cache, OPENCODE_CONFIG_DIR: config };
+}
+
+/** Isolate Codex state/instructions while preserving only installed authentication. */
+export function prepareCodexEnvironment(source: NodeJS.ProcessEnv, stateDir: string): Record<string, string> {
+  const sourceRoot = source.CODEX_HOME ?? (source.HOME ? join(source.HOME, '.codex') : null);
+  if (!sourceRoot || !existsSync(join(sourceRoot, 'auth.json'))) throw new Error('RUNTIME_AUTH_UNAVAILABLE');
+  const home = join(stateDir, 'home');
+  const codexHome = join(stateDir, 'codex-home');
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  const auth = join(codexHome, 'auth.json');
+  atomicWriteSync(auth, readFileSync(join(sourceRoot, 'auth.json'), 'utf8').trimEnd());
+  chmodSync(auth, 0o400);
+  atomicWriteSync(join(codexHome, 'config.toml'), [
+    'project_doc_max_bytes = 0',
+    'model_provider = "openai"',
+    '[shell_environment_policy]',
+    'inherit = "none"',
+  ].join('\n'));
+  chmodSync(join(codexHome, 'config.toml'), 0o400);
+  return { HOME: home, CODEX_HOME: codexHome };
 }
 
 /**
@@ -206,9 +230,10 @@ export interface NativeWorkSessionOptions {
   onExit?: (event: { exitCode: number; signal?: number }) => void | Promise<void>;
   onOutput?: (output: WorkSessionRuntimeOutput) => void;
   timeoutMs?: number;
+  turnTimeoutMs?: number;
 }
 
-function waitFor<T>(probe: () => T | undefined, timeoutMs: number, intervalMs = 50): Promise<T> {
+function waitFor<T>(probe: () => T | undefined, timeoutMs: number, intervalMs = 50, timeoutCode = 'RESUME_HANDLE_UNAVAILABLE'): Promise<T> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
     const tick = () => {
@@ -216,7 +241,7 @@ function waitFor<T>(probe: () => T | undefined, timeoutMs: number, intervalMs = 
         const value = probe();
         if (value !== undefined) return resolve(value);
       } catch (error) { return reject(error); }
-      if (Date.now() - started >= timeoutMs) return reject(new Error('RESUME_HANDLE_UNAVAILABLE'));
+      if (Date.now() - started >= timeoutMs) return reject(new Error(timeoutCode));
       setTimeout(tick, intervalMs);
     };
     tick();
@@ -231,6 +256,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private readonly responses = new Map<number, unknown>();
   private readonly requestMethods = new Map<number, string>();
   private readonly timeoutMs: number;
+  private readonly turnTimeoutMs: number;
   private intentionalStop = false;
   private ready = false;
   private currentThreadId: string | null = null;
@@ -244,9 +270,12 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private claudeSessionId: string | null = null;
   private readonly claudeTurnResults: Array<true | Error> = [];
   private ambientOpenCodeCommands = false;
+  private readonly codexTurnCompletions: Array<string | Error> = [];
+  private claudeAckPath: string | null = null;
 
   constructor(private readonly options: NativeWorkSessionOptions) {
     this.timeoutMs = options.timeoutMs ?? 10_000;
+    this.turnTimeoutMs = options.turnTimeoutMs ?? 5 * 60_000;
     const receipt = this.readRuntimeReceipt();
     this.currentHandle = receipt?.resume_handle ?? options.record.resume_handle;
     this.currentOwner = receipt?.runtime_owner ?? options.record.runtime_owner ?? null;
@@ -256,7 +285,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     this.assertCanonicalCwd(input.cwd);
     this.spawningMutationId = input.mutation_id;
     const result = this.options.record.harness === 'claude-code'
-      ? await this.startClaude(input, undefined)
+      ? await this.startClaude(input, undefined, input.context ?? 'Initialize this Work Session.')
       : this.options.record.harness === 'codex-app-server'
         ? await this.startCodex(input, undefined)
         : await this.startOpenCode(input, undefined);
@@ -268,10 +297,10 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       // Persist it before the optional initial message introduces another await/crash
       // boundary, so restart can resume rather than treating a known handle as lost.
       this.persistRuntimeReceipt(owner, result.resume_handle);
-      if (input.context) {
+      if (input.context && this.options.record.harness !== 'claude-code') {
         this.ready = true;
         await this.send(input.context);
-      } else if (this.options.record.harness === 'claude-code' || this.options.record.harness === 'opencode') {
+      } else if (!input.context && (this.options.record.harness === 'opencode' || this.options.record.harness === 'codex-app-server')) {
         // A structured session acknowledgement alone does not prove that the
         // selected model can authenticate. Keep output suppressed until this
         // bounded provider round-trip completes.
@@ -297,9 +326,6 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     try {
       const owner = this.requireCurrentOwner(input.mutation_id);
       this.persistRuntimeReceipt(owner, handle);
-      if (this.options.record.harness === 'claude-code' || this.options.record.harness === 'opencode') {
-        await this.send('Reply with OK to confirm runtime readiness.');
-      }
       if (this.options.record.harness === 'opencode' && this.ambientOpenCodeCommands) throw new Error('AMBIENT_CONFIG_DETECTED');
       this.ready = true;
       return { runtime_owner: owner };
@@ -312,21 +338,29 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   async send(text: string): Promise<void> {
     if (!this.pty) throw new Error('WORK_SESSION_NOT_RUNNING');
     if (this.options.record.harness === 'codex-app-server') {
-      await this.rpc('turn/start', {
+      this.codexTurnCompletions.length = 0;
+      const started = await this.rpc('turn/start', {
         threadId: this.currentThreadId ?? (this.options.record.resume_handle as { thread_id?: string } | null)?.thread_id,
         input: [{ type: 'text', text, text_elements: [] }],
         model: this.options.record.model ?? undefined,
         cwd: this.options.record.canonical_cwd,
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'workspaceWrite', writableRoots: [this.options.record.canonical_cwd], networkAccess: false },
-      });
+      }) as { turn?: { id?: string } };
+      const turnId = started?.turn?.id;
+      if (!turnId) throw new Error('RUNTIME_REQUEST_REJECTED');
+      const completed = await waitFor(() => {
+        const index = this.codexTurnCompletions.findIndex(item => item instanceof Error || item === turnId || item === '*');
+        return index < 0 ? undefined : this.codexTurnCompletions.splice(index, 1)[0];
+      }, this.turnTimeoutMs, 50, 'RUNTIME_TURN_TIMEOUT');
+      if (completed instanceof Error) throw completed;
       return;
     }
     if (this.options.record.harness === 'opencode') {
       const sessionId = this.currentHandle?.runtime === 'opencode' ? this.currentHandle.session_id : null;
       if (!sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
       this.acpTurnText = '';
-      await this.rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
+      await this.rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text }] }, this.turnTimeoutMs);
       return;
     }
     if (this.options.record.harness === 'claude-code') {
@@ -337,7 +371,8 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         type: 'user', session_id: sessionId, parent_tool_use_id: null,
         message: { role: 'user', content: [{ type: 'text', text }] },
       })}\n`);
-      const result = await waitFor(() => this.claudeTurnResults.shift(), this.timeoutMs);
+      if (this.claudeSessionId !== sessionId) await this.awaitClaudeAcknowledgement(sessionId);
+      const result = await waitFor(() => this.claudeTurnResults.shift(), this.turnTimeoutMs, 50, 'RUNTIME_TURN_TIMEOUT');
       if (result instanceof Error) throw result;
       return;
     }
@@ -557,6 +592,12 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
             }
           }
         }
+        if (value.method === 'turn/completed') {
+          const params = value.params && typeof value.params === 'object' ? value.params as Record<string, unknown> : {};
+          const turn = params.turn && typeof params.turn === 'object' ? params.turn as Record<string, unknown> : {};
+          this.codexTurnCompletions.push(typeof turn.id === 'string' ? turn.id : '*');
+        }
+        if (value.method === 'error') this.codexTurnCompletions.push(new Error('RUNTIME_REQUEST_REJECTED'));
         const output = this.completedOutput(value);
         if (output && this.ready) this.emitOutput(output);
       } catch {
@@ -597,35 +638,59 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     if (!output.id || !output.text.trim()) return;
     const directory = this.outputInboxPath();
     mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const path = join(directory, `${createHash('sha256').update(output.id).digest('hex')}.json`);
-    const body = JSON.stringify({ schema_version: 1, session_id: this.options.record.id, output }, null, 2);
-    if (existsSync(path)) {
-      const prior = JSON.parse(readFileSync(path, 'utf8')) as { session_id?: unknown; output?: unknown };
-      if (prior.session_id !== this.options.record.id || JSON.stringify(prior.output) !== JSON.stringify(output)) {
-        throw new Error('OUTPUT_ID_CONFLICT');
+    withFileLockSync(directory, () => {
+      const digest = createHash('sha256').update(output.id).digest('hex');
+      const existing = readdirSync(directory).find(name => name.endsWith(`-${digest}.json`));
+      if (existing) {
+        const prior = JSON.parse(readFileSync(join(directory, existing), 'utf8')) as { session_id?: unknown; output?: unknown };
+        const priorOutput = prior.output as Partial<WorkSessionRuntimeOutput> | undefined;
+        if (prior.session_id !== this.options.record.id
+          || priorOutput?.id !== output.id || priorOutput.text !== output.text) {
+          throw new Error('OUTPUT_ID_CONFLICT');
+        }
+        return;
       }
-      return;
-    }
-    atomicWriteSync(path, body);
+      const sequencePath = join(directory, 'sequence.json');
+      let sequence = 0;
+      try {
+        const counter = JSON.parse(readFileSync(sequencePath, 'utf8')) as { sequence?: unknown };
+        if (!Number.isSafeInteger(counter.sequence) || Number(counter.sequence) < 0) throw new Error('OUTPUT_SEQUENCE_CORRUPT');
+        sequence = Number(counter.sequence);
+      } catch (error) {
+        if (existsSync(sequencePath)) throw error;
+      }
+      sequence += 1;
+      atomicWriteSync(sequencePath, JSON.stringify({ schema_version: 1, session_id: this.options.record.id, sequence }));
+      const durableOutput = { ...output, completed_at: output.completed_at ?? new Date().toISOString() };
+      const name = `${String(sequence).padStart(16, '0')}-${digest}.json`;
+      atomicWriteSync(join(directory, name), JSON.stringify({
+        schema_version: 2, session_id: this.options.record.id, sequence, completed_at: durableOutput.completed_at, output: durableOutput,
+      }, null, 2));
+    });
   }
 
   /** Publish durable completed output and remove each inbox item only after success. */
   reconcileOutputInbox(): number {
     const directory = this.outputInboxPath();
     if (!existsSync(directory)) return 0;
-    if (!this.options.onOutput) return readdirSync(directory).filter(name => name.endsWith('.json')).length;
+    if (!this.options.onOutput) return readdirSync(directory).filter(name => /^\d{16}-[0-9a-f]{64}\.json$/.test(name)).length;
     let published = 0;
-    for (const name of readdirSync(directory).filter(entry => entry.endsWith('.json')).sort()) {
+    const queued = readdirSync(directory).filter(entry => /^\d{16}-[0-9a-f]{64}\.json$/.test(entry)).map(name => {
       const path = join(directory, name);
       const envelope = JSON.parse(readFileSync(path, 'utf8')) as {
-        schema_version?: unknown; session_id?: unknown; output?: WorkSessionRuntimeOutput;
+        schema_version?: unknown; session_id?: unknown; sequence?: unknown; completed_at?: unknown; output?: WorkSessionRuntimeOutput;
       };
-      if (envelope.schema_version !== 1 || envelope.session_id !== this.options.record.id
-        || !envelope.output || typeof envelope.output.id !== 'string' || typeof envelope.output.text !== 'string') {
+      if (envelope.schema_version !== 2 || envelope.session_id !== this.options.record.id
+        || !Number.isSafeInteger(envelope.sequence) || typeof envelope.completed_at !== 'string'
+        || !envelope.output || typeof envelope.output.id !== 'string' || typeof envelope.output.text !== 'string'
+        || envelope.output.completed_at !== envelope.completed_at) {
         throw new Error('OUTPUT_INBOX_CORRUPT');
       }
+      return { path, sequence: Number(envelope.sequence), output: envelope.output };
+    }).sort((left, right) => left.sequence - right.sequence);
+    for (const envelope of queued) {
       this.options.onOutput(envelope.output);
-      unlinkSync(path);
+      unlinkSync(envelope.path);
       published += 1;
     }
     try { unlinkSync(this.outputRecoveryPath()); } catch { /* no recovery marker */ }
@@ -659,24 +724,25 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     return createHash('sha256').update(`${generation}\0${this.outputSequence}\0${text}`).digest('hex');
   }
 
-  private async rpc(method: string, params: Record<string, unknown>): Promise<any> {
+  private async rpc(method: string, params: Record<string, unknown>, timeoutMs = this.timeoutMs): Promise<any> {
     if (!this.pty) throw new Error('WORK_SESSION_NOT_RUNNING');
     const id = ++this.rpcId;
     this.requestMethods.set(id, method);
     this.pty.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-    const response = await waitFor(() => this.responses.get(id), this.timeoutMs) as { error?: unknown; result?: unknown };
+    const response = await waitFor(() => this.responses.get(id), timeoutMs, 50, method.includes('prompt') ? 'RUNTIME_TURN_TIMEOUT' : 'RESUME_HANDLE_UNAVAILABLE') as { error?: unknown; result?: unknown };
     this.responses.delete(id);
     this.requestMethods.delete(id);
     if (response.error) throw new Error(closedRuntimeErrorCode(response.error, this.options.record.harness, method));
     return response.result;
   }
 
-  private async startClaude(input: { cwd: string; model?: string }, resumeId?: string) {
+  private async startClaude(input: { cwd: string; model?: string }, resumeId?: string, initialText?: string) {
     const sessionId = resumeId ?? randomUUID();
     this.claudeSessionId = null;
     const stateDir = join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id);
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const ackPath = join(stateDir, 'claude-session-ack.json');
+    this.claudeAckPath = ackPath;
     try { unlinkSync(ackPath); } catch {}
     const reporter = join(__dirname, '..', 'daemon.js');
     const settingsPath = join(stateDir, 'claude-session-settings.json');
@@ -686,24 +752,52 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     writeFileSync(mcpConfigPath, `${JSON.stringify({ mcpServers: {} }, null, 2)}\n`, { mode: 0o600 });
     chmodSync(settingsPath, 0o600);
     const spec = buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId, resume: !!resumeId, settingsPath, mcpConfigPath });
+    if (resumeId) {
+      const auth = JSON.parse(execFileSync('claude', ['auth', 'status', '--json'], { encoding: 'utf8', timeout: this.timeoutMs })) as { loggedIn?: unknown };
+      if (auth.loggedIn !== true) throw new Error('RUNTIME_AUTH_UNAVAILABLE');
+    }
     this.spawn(spec.command, spec.args, spec.cwd, this.env());
+    if (resumeId) return { resume_handle: { runtime: 'claude-code' as const, session_id: sessionId } };
     try {
-      await waitFor(() => {
-        if (this.claudeSessionId === sessionId) return true;
-        if (this.claudeSessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
-        return undefined;
-      }, this.timeoutMs);
+      this.claudeTurnResults.length = 0;
+      this.ready = initialText !== 'Initialize this Work Session.';
+      this.pty!.write(`${JSON.stringify({
+        type: 'user', session_id: sessionId, parent_tool_use_id: null,
+        message: { role: 'user', content: [{ type: 'text', text: initialText }] },
+      })}\n`);
+      await this.awaitClaudeAcknowledgement(sessionId);
+      const completion = await waitFor(() => this.claudeTurnResults.shift(), this.turnTimeoutMs, 50, 'RUNTIME_TURN_TIMEOUT');
+      if (completion instanceof Error) throw completion;
     } catch (error) { await this.stop(); throw error; }
     return { resume_handle: { runtime: 'claude-code' as const, session_id: sessionId } };
   }
 
+  private async awaitClaudeAcknowledgement(sessionId: string): Promise<void> {
+    const ackPath = this.claudeAckPath;
+    if (!ackPath) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+    await waitFor(() => {
+      if (this.claudeSessionId && this.claudeSessionId !== sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      if (!existsSync(ackPath) || this.claudeSessionId !== sessionId) return undefined;
+      const siblings = readdirSync(dirname(ackPath)).filter(name => name.startsWith('claude-session-ack'));
+      if (siblings.length !== 1) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      const ack = JSON.parse(readFileSync(ackPath, 'utf8')) as { session_id?: string };
+      if (ack.session_id !== sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      return true;
+    }, this.timeoutMs);
+  }
+
   private async startCodex(input: { cwd: string; model?: string }, threadId?: string) {
     const spec = buildCodexWorkSessionLaunch({ cwd: input.cwd, model: input.model, threadId });
-    this.spawn(spec.command, spec.args, spec.cwd, this.env());
+    const stateDir = join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id, 'codex');
+    const isolated = prepareCodexEnvironment(process.env, stateDir);
+    this.spawn(spec.command, spec.args, spec.cwd, { ...this.env(), ...isolated });
     try {
       await this.rpc('initialize', { clientInfo: { name: 'cortextos-work-session', version: '1' }, capabilities: {} });
-      const shared = { cwd: input.cwd, model: input.model, approvalPolicy: 'never', sandbox: 'workspaceWrite', allowProviderModelFallback: false };
-      const result = await this.rpc(threadId ? 'thread/resume' : 'thread/start', threadId ? { ...shared, threadId } : shared) as { thread?: { id?: string } };
+      const shared = { cwd: input.cwd, model: input.model, approvalPolicy: 'never', sandbox: 'workspace-write', allowProviderModelFallback: false };
+      const result = await this.rpc(threadId ? 'thread/resume' : 'thread/start', threadId ? { ...shared, threadId } : shared) as {
+        thread?: { id?: string }; instructionSources?: unknown;
+      };
+      if (Array.isArray(result?.instructionSources) && result.instructionSources.length > 0) throw new Error('AMBIENT_CONFIG_DETECTED');
       const exact = result?.thread?.id;
       if (!exact || (threadId && exact !== threadId)) throw new Error('RESUME_HANDLE_UNAVAILABLE');
       this.currentThreadId = exact;

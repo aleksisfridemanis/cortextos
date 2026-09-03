@@ -64,6 +64,7 @@ export interface WorkSessionRuntimeOutput {
   /** Harness-native completed-item id when available; otherwise adapter generation + sequence. */
   id: string;
   text: string;
+  completed_at?: string;
 }
 
 export interface WorkSessionRuntimeStatus {
