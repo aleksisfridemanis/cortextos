@@ -22,9 +22,18 @@ export function closedApplicationErrorCode(error: unknown, fallback = 'INTERNAL_
 }
 
 /** Derive a safe category from a structured harness rejection without exposing its text. */
-export function closedRuntimeErrorCode(error: unknown): string {
+export function closedRuntimeErrorCode(error: unknown, harness?: string, method?: string): string {
   const value = error && typeof error === 'object' ? error as Record<string, unknown> : {};
-  const category = typeof value.code === 'string' ? value.code : typeof value.type === 'string' ? value.type : '';
+  const data = value.data && typeof value.data === 'object' && !Array.isArray(value.data)
+    ? value.data as Record<string, unknown>
+    : {};
+  const safeCategories = [value.code, value.type, data.code, data.type, data.category, data.reason]
+    .filter((candidate): candidate is string => typeof candidate === 'string');
+  const category = safeCategories.join(' ');
+  const isModelMethod = method === 'session/set_config_option' || method === 'thread/start' || method === 'thread/resume';
+  const structuredModel = (harness === 'opencode' || harness === 'codex-app-server') && isModelMethod
+    && (typeof data.providerId === 'string' || typeof data.modelId === 'string');
+  if (structuredModel) return 'MODEL_UNSUPPORTED';
   if (/model|provider/i.test(category)) return 'MODEL_UNSUPPORTED';
   if (/policy|permission|approval/i.test(category)) return 'POLICY_REJECTED';
   if (/sandbox/i.test(category)) return 'SANDBOX_UNAVAILABLE';

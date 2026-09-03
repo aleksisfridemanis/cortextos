@@ -557,7 +557,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const response = await waitFor(() => this.responses.get(id), this.timeoutMs) as { error?: unknown; result?: unknown };
     this.responses.delete(id);
     this.requestMethods.delete(id);
-    if (response.error) throw new Error(closedRuntimeErrorCode(response.error));
+    if (response.error) throw new Error(closedRuntimeErrorCode(response.error, this.options.record.harness, method));
     return response.result;
   }
 
