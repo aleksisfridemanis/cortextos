@@ -110,4 +110,20 @@ describe('POST /api/messages/send — reply_to', () => {
       fs.rmSync(path.join(rootTmp, 'inbox'), { recursive: true, force: true });
     }
   });
+
+  it('never exposes Employee filesystem failures in the public response', async () => {
+    const failure = new Error(`EACCES: ${path.join(rootTmp, 'inbox', 'boris', 'private.json')}`);
+    const write = vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => { throw failure; });
+    try {
+      const res = await send.POST(post({ agent: 'boris', text: 'hello' }));
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body).toMatchObject({ error: 'Unable to send Employee message', code: 'INTERNAL_ERROR' });
+      expect(body.correlation_id).toMatch(/^[0-9a-f-]{36}$/);
+      expect(JSON.stringify(body)).not.toContain(rootTmp);
+      expect(body).not.toHaveProperty('details');
+    } finally {
+      write.mockRestore();
+    }
+  });
 });

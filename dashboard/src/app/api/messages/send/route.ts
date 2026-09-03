@@ -172,10 +172,13 @@ export async function POST(request: NextRequest) {
       if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
     } catch { /* ignore */ }
 
-    const message = err instanceof Error ? err.message : String(err);
-    console.error('[api/messages/send] Error:', message);
+    const correlationId = crypto.randomUUID();
+    const code = err && typeof err === 'object' && typeof (err as { code?: unknown }).code === 'string'
+      ? (err as { code: string }).code
+      : 'INTERNAL_ERROR';
+    console.error('[api/messages/send] Employee delivery failed', { correlationId, code });
     return Response.json(
-      { error: 'Failed to send message', details: message },
+      { error: 'Unable to send Employee message', code: 'INTERNAL_ERROR', correlation_id: correlationId },
       { status: 500 }
     );
   }
