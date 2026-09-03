@@ -5,6 +5,8 @@ import {
   createChatRequestKey,
   initialCreateChatState,
   retainedCreateMutationId,
+  loadPendingCreateBinding,
+  storePendingCreateBinding,
 } from '../create-chat-dialog';
 
 describe('CreateChatDialog contract', () => {
@@ -52,5 +54,15 @@ describe('CreateChatDialog contract', () => {
     const pending = { mutationId: 'original', requestKey: key };
     expect(retainedCreateMutationId(pending, key, () => 'new')).toBe('original');
     expect(retainedCreateMutationId(pending, createChatRequestKey({ ...state, name: 'grace' }), () => 'new')).toBe('new');
+  });
+
+  it('persists and restores a pending creation binding across remounts', () => {
+    const values = new Map<string, string>();
+    const storage = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => values.set(key, value), removeItem: (key: string) => values.delete(key) };
+    const binding = { mutationId: 'durable-id', requestKey: 'exact-request' };
+    storePendingCreateBinding(storage, binding);
+    expect(loadPendingCreateBinding(storage)).toEqual(binding);
+    storePendingCreateBinding(storage, null);
+    expect(loadPendingCreateBinding(storage)).toBeNull();
   });
 });

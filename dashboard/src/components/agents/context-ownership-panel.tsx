@@ -28,13 +28,33 @@ export function retainedContextMutationId(
   return pending?.requestKey === requestKey ? pending.mutationId : create();
 }
 
+export interface PendingContextBinding { mutationId: string; requestKey: string }
+interface SessionStore { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void }
+export function pendingContextStorageKey(agentName: string): string { return `crew:pending-context:${agentName}`; }
+export function loadPendingContextBinding(storage: SessionStore | null, agentName: string): PendingContextBinding | null {
+  if (!storage) return null;
+  try {
+    const value = JSON.parse(storage.getItem(pendingContextStorageKey(agentName)) ?? 'null');
+    return value && typeof value.mutationId === 'string' && typeof value.requestKey === 'string' ? value : null;
+  } catch { return null; }
+}
+export function storePendingContextBinding(storage: SessionStore | null, agentName: string, value: PendingContextBinding | null): void {
+  if (!storage) return;
+  try {
+    if (value) storage.setItem(pendingContextStorageKey(agentName), JSON.stringify(value));
+    else storage.removeItem(pendingContextStorageKey(agentName));
+  } catch { /* storage unavailable */ }
+}
+
 const PENDING_CODES = new Set(['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED']);
 
 export function ContextOwnershipPanel({ agentName }: { agentName: string }) {
   const [review, setReview] = useState<Review | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const pendingDecisionRef = useRef<{ mutationId: string; requestKey: string } | null>(null);
+  const restoredPending = typeof window === 'undefined' ? null : loadPendingContextBinding(window.sessionStorage, agentName);
+  const pendingDecisionRef = useRef<PendingContextBinding | null>(restoredPending);
+  const [pendingMutationId, setPendingMutationId] = useState<string | null>(restoredPending?.mutationId ?? null);
   const load = useCallback(async () => {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentName)}/context`, { cache: 'no-store' });
     const body = await response.json();
@@ -52,6 +72,8 @@ export function ContextOwnershipPanel({ agentName }: { agentName: string }) {
     const requestKey = contextDecisionKey(review, decision, replacement);
     const mutationId = retainedContextMutationId(pendingDecisionRef.current, requestKey, () => crypto.randomUUID());
     pendingDecisionRef.current = { mutationId, requestKey };
+    storePendingContextBinding(window.sessionStorage, agentName, pendingDecisionRef.current);
+    setPendingMutationId(mutationId);
     setBusy(true);
     setError(null);
     try {
@@ -66,10 +88,16 @@ export function ContextOwnershipPanel({ agentName }: { agentName: string }) {
       });
       const body = await response.json();
       if (!response.ok) {
-        if (!PENDING_CODES.has(body.code ?? '')) pendingDecisionRef.current = null;
+        if (!PENDING_CODES.has(body.code ?? '')) {
+          pendingDecisionRef.current = null;
+          storePendingContextBinding(window.sessionStorage, agentName, null);
+          setPendingMutationId(null);
+        }
         throw new Error(body.error ?? 'Context decision rejected');
       }
       pendingDecisionRef.current = null;
+      storePendingContextBinding(window.sessionStorage, agentName, null);
+      setPendingMutationId(null);
       await load();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Context decision rejected');
@@ -83,7 +111,7 @@ export function ContextOwnershipPanel({ agentName }: { agentName: string }) {
         <CardDescription>Review effective source and provenance before changing a safety default.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+        {error && <p role="alert" className="text-sm text-destructive">{error}{pendingMutationId ? <span className="block font-mono text-xs">Pending mutation: {pendingMutationId}</span> : null}</p>}
         {!review ? <p className="text-sm text-muted-foreground">Loading context provenance…</p> : <>
           <dl className="grid gap-2 text-sm sm:grid-cols-2">
             <div><dt className="text-muted-foreground">Classification</dt><dd className="font-medium">{review.classification}</dd></div>

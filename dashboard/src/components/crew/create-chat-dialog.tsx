@@ -72,6 +72,26 @@ export function retainedCreateMutationId(
   return pending?.requestKey === requestKey ? pending.mutationId : create();
 }
 
+export interface PendingCreateBinding { mutationId: string; requestKey: string }
+interface SessionStore { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void }
+export const PENDING_CREATE_STORAGE_KEY = 'crew:pending-create';
+
+export function loadPendingCreateBinding(storage: SessionStore | null): PendingCreateBinding | null {
+  if (!storage) return null;
+  try {
+    const value = JSON.parse(storage.getItem(PENDING_CREATE_STORAGE_KEY) ?? 'null');
+    return value && typeof value.mutationId === 'string' && typeof value.requestKey === 'string' ? value : null;
+  } catch { return null; }
+}
+
+export function storePendingCreateBinding(storage: SessionStore | null, value: PendingCreateBinding | null): void {
+  if (!storage) return;
+  try {
+    if (value) storage.setItem(PENDING_CREATE_STORAGE_KEY, JSON.stringify(value));
+    else storage.removeItem(PENDING_CREATE_STORAGE_KEY);
+  } catch { /* storage unavailable */ }
+}
+
 const PENDING_CODES = new Set(['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED']);
 
 export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => void }) {
@@ -80,7 +100,9 @@ export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => vo
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [browseEntries, setBrowseEntries] = useState<Array<{ name: string; kind: string; canonical_path: string | null; warning: string | null }>>([]);
-  const pendingCreateRef = useRef<{ mutationId: string; requestKey: string } | null>(null);
+  const restoredPending = typeof window === 'undefined' ? null : loadPendingCreateBinding(window.sessionStorage);
+  const pendingCreateRef = useRef<PendingCreateBinding | null>(restoredPending);
+  const [pendingMutationId, setPendingMutationId] = useState<string | null>(restoredPending?.mutationId ?? null);
   const valid = useMemo(() => state.name.length > 0 && state.org.length > 0
     && (state.kind === 'employee' || state.workingDirectory.length > 0), [state]);
 
@@ -101,14 +123,22 @@ export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => vo
       const requestKey = createChatRequestKey(state);
       const mutationId = retainedCreateMutationId(pendingCreateRef.current, requestKey, () => crypto.randomUUID());
       pendingCreateRef.current = { mutationId, requestKey };
+      storePendingCreateBinding(window.sessionStorage, pendingCreateRef.current);
+      setPendingMutationId(mutationId);
       const request = buildCreateChatRequest(state, mutationId);
       const response = await fetch(request.endpoint, { method: 'POST', headers: request.headers, body: JSON.stringify(request.body) });
       const payload = await response.json().catch(() => ({})) as { error?: string; code?: string; employee?: { name?: string }; session?: { id?: string } };
       if (!response.ok) {
-        if (!PENDING_CODES.has(payload.code ?? '')) pendingCreateRef.current = null;
+        if (!PENDING_CODES.has(payload.code ?? '')) {
+          pendingCreateRef.current = null;
+          storePendingCreateBinding(window.sessionStorage, null);
+          setPendingMutationId(null);
+        }
         throw new Error(payload.error || 'Unable to create chat');
       }
       pendingCreateRef.current = null;
+      storePendingCreateBinding(window.sessionStorage, null);
+      setPendingMutationId(null);
       const id = payload.employee?.name ?? payload.session?.id ?? state.name;
       setOpen(false);
       setState(initialCreateChatState());
@@ -151,7 +181,7 @@ export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => vo
             <div className="flex gap-2"><Input id="crew-directory" required={state.kind === 'work_session'} placeholder="/absolute/project/path" value={state.workingDirectory} onChange={event => setState(current => ({ ...current, workingDirectory: event.target.value }))} />{state.kind === 'work_session' && <Button type="button" variant="outline" onClick={browse}>Browse</Button>}</div>
             {state.kind === 'work_session' && browseEntries.length > 0 && <div className="max-h-36 overflow-y-auto rounded border p-1" aria-label="Host directories">{browseEntries.filter(entry => entry.kind === 'directory' && entry.canonical_path).map(entry => <button className="block w-full rounded px-2 py-1 text-left text-sm hover:bg-muted" type="button" key={entry.name} onClick={() => setState(current => ({ ...current, workingDirectory: entry.canonical_path! }))}>{entry.name}{entry.warning ? ' ⚠' : ''}</button>)}</div>}
           </div>
-          {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+          {error && <p role="alert" className="text-sm text-destructive">{error}{pendingMutationId ? <span className="block font-mono text-xs">Pending mutation: {pendingMutationId}</span> : null}</p>}
           <DialogFooter><Button type="submit" disabled={!valid || submitting}>{submitting ? 'Creating…' : 'Create'}</Button></DialogFooter>
         </form>
       </DialogContent>
