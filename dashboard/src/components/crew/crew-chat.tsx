@@ -819,7 +819,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       if (send?.state === 'terminal') { terminalSendRef.current = send; setRetryAnywayAvailable(true); }
       for (const item of envelope.lifecycle ?? []) {
         if (item?.version === 1 && item.principal === user && item.target === agent.targetId
-          && typeof item.id === 'string' && typeof item.requestDigest === 'string') {
+          && typeof item.id === 'string' && typeof item.requestDigest === 'string'
+          && ['stop', 'resume', 'promote'].includes(item.action)
+          && (item.employee === undefined || (item.employee !== null && typeof item.employee === 'object' && !Array.isArray(item.employee)))) {
           pendingLifecycleRef.current.set(item.requestDigest, item);
         }
       }
