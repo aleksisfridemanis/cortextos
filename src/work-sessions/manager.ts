@@ -130,8 +130,7 @@ export class WorkSessionManager {
         && prior.target.id === id
         && prior.request_digest === requestDigest;
       if (!sameRequest) throw new WorkSessionRegistryError('IDEMPOTENCY_CONFLICT', 'Mutation id is already bound to another request');
-      const existing = this.get(id);
-      if (prior.stage === 'finalized' && prior.final_result?.result === 'success' && existing) return existing;
+      if (prior.stage === 'finalized' && prior.final_result?.result === 'success') return this.originalResult(prior);
       throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session mutation requires reconciliation');
     }
     const prepared = prepareCrewMutation(this.dependencies.ctxRoot, {
@@ -190,7 +189,9 @@ export class WorkSessionManager {
       const result = await this.adapter(record).startFresh({ id, cwd: record.canonical_cwd, model: input.model, context });
       record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', { resume_handle: result.resume_handle }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { runtime_started: true, handle_digest: digestCrewAuditValue(result.resume_handle), mutation_id: mutationId });
-      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(record) });
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+        result: 'success', after_digest: stateDigest(record), result_snapshot: resultSnapshot(record),
+      });
       return record;
     } catch (error) {
       if (this.adapter(record).status().running) {

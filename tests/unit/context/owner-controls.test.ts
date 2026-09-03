@@ -82,4 +82,22 @@ describe('owner context controls', () => {
     expect(getContextOwnershipReview({ ctxRoot, frameworkRoot, agentDir, agentName: 'ada', rule_id: 'employee-core' }).audit_status).toBe('applied');
     expect(getContextOwnershipReview({ ctxRoot, frameworkRoot, agentDir: graceDir, agentName: 'grace', rule_id: 'employee-core' }).audit_status).toBe('none');
   });
+
+  it('returns the exact original owner decision after a later rule replacement', () => {
+    const review = getContextOwnershipReview({ ctxRoot, frameworkRoot, agentDir, agentName: 'ada', rule_id: 'employee-core' });
+    const firstInput = {
+      ctxRoot, frameworkRoot, agentDir, agentName: 'ada', actor: 'owner:1',
+      decision: 'replace_default' as const, replacement: 'first owner rule', rule_id: 'employee-core',
+      proposal_digest: review.proposal_digest, mutation_id: '966a6742-b72e-41d3-944e-3fdd54b32d75',
+    };
+    const first = applyContextOwnerDecision(firstInput);
+    applyContextOwnerDecision({
+      ...firstInput,
+      replacement: 'later owner rule',
+      mutation_id: 'a66a6742-b72e-41d3-944e-3fdd54b32d75',
+    });
+
+    expect(applyContextOwnerDecision(firstInput)).toEqual(first);
+    expect(applyContextOwnerDecision(firstInput).rule?.content).toBe('first owner rule');
+  });
 });

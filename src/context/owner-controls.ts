@@ -41,6 +41,7 @@ interface ContextOverrideRule {
 interface ContextOverridesState {
   schema_version: 2;
   employees: Record<string, { rules: Record<string, ContextOverrideRule> }>;
+  history?: Record<string, ContextOverrideRule>;
 }
 
 export interface ContextOwnershipReview {
@@ -70,7 +71,7 @@ function overridesPath(ctxRoot: string): string {
 
 function readOverrides(ctxRoot: string): ContextOverridesState {
   const path = overridesPath(ctxRoot);
-  if (!existsSync(path)) return { schema_version: 2, employees: {} };
+  if (!existsSync(path)) return { schema_version: 2, employees: {}, history: {} };
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as ContextOverridesState;
     if (parsed.schema_version !== 2 || !parsed.employees || typeof parsed.employees !== 'object') throw new Error('invalid');
@@ -158,16 +159,10 @@ export function applyContextOwnerDecision(input: ContextOwnerPaths & {
   if (!input.actor || /[\r\n\0]/.test(input.actor)) throw new Error('UNAUTHENTICATED');
   if (!['approve_merge', 'replace_default', 'disable_default'].includes(input.decision)) throw new Error('INVALID_DECISION');
   if (!/^[0-9a-f-]{36}$/i.test(input.mutation_id)) throw new Error('INVALID_MUTATION_ID');
-  const review = getContextOwnershipReview(input);
-  if (review.proposal_digest !== input.proposal_digest) throw new Error('STALE_PROPOSAL');
   if (input.decision === 'replace_default'
     && (!input.replacement?.trim() || Buffer.byteLength(input.replacement, 'utf8') > 24_576)) {
     throw new Error('INVALID_REPLACEMENT');
   }
-  const effectiveContent = input.decision === 'approve_merge' ? review.proposal
-    : input.decision === 'replace_default' ? input.replacement!
-      : '';
-  const effectiveDigest = digestCrewAuditValue(effectiveContent);
   const requestDigest = digestCrewAuditValue({
     agent_name: input.agentName,
     decision: input.decision,
@@ -175,6 +170,27 @@ export function applyContextOwnerDecision(input: ContextOwnerPaths & {
     proposal_digest: input.proposal_digest,
     replacement_digest: input.replacement ? digestCrewAuditValue(input.replacement) : null,
   });
+  const priorMutation = getCrewMutation(input.ctxRoot, input.mutation_id);
+  if (priorMutation) {
+    if (priorMutation.request_digest !== requestDigest || priorMutation.actor !== input.actor
+      || priorMutation.target.kind !== 'employee' || priorMutation.target.id !== input.agentName) {
+      throw new Error('IDEMPOTENCY_CONFLICT');
+    }
+    if (priorMutation.stage === 'finalized' && priorMutation.final_result?.result === 'success') {
+      const state = readOverrides(input.ctxRoot);
+      const historical = state.history?.[input.mutation_id];
+      const snapshot = priorMutation.final_result.result_snapshot;
+      if (!historical || snapshot?.rule_digest !== digestCrewAuditValue(historical)) throw new Error('MUTATION_PENDING');
+      return { status: 'applied' as const, rule: historical };
+    }
+    throw new Error('MUTATION_PENDING');
+  }
+  const review = getContextOwnershipReview(input);
+  if (review.proposal_digest !== input.proposal_digest) throw new Error('STALE_PROPOSAL');
+  const effectiveContent = input.decision === 'approve_merge' ? review.proposal
+    : input.decision === 'replace_default' ? input.replacement!
+      : '';
+  const effectiveDigest = digestCrewAuditValue(effectiveContent);
   const stateBefore = readOverrides(input.ctxRoot);
   const beforeDigest = digestCrewAuditValue(employeeRule(stateBefore, input.agentName, input.rule_id) ?? null);
   const record: ContextOverrideRule = {
@@ -191,17 +207,6 @@ export function applyContextOwnerDecision(input: ContextOwnerPaths & {
     mutation_id: input.mutation_id,
   };
   const intendedDigest = digestCrewAuditValue(record);
-  const priorMutation = getCrewMutation(input.ctxRoot, input.mutation_id);
-  if (priorMutation) {
-    if (priorMutation.request_digest !== requestDigest || priorMutation.actor !== input.actor
-      || priorMutation.target.kind !== 'employee' || priorMutation.target.id !== input.agentName) {
-      throw new Error('IDEMPOTENCY_CONFLICT');
-    }
-    if (priorMutation.stage === 'finalized' && priorMutation.final_result?.result === 'success') {
-      return { status: 'applied' as const, rule: employeeRule(readOverrides(input.ctxRoot), input.agentName, input.rule_id) };
-    }
-    throw new Error('MUTATION_PENDING');
-  }
   prepareCrewMutation(input.ctxRoot, {
     mutation_id: input.mutation_id,
     idempotency_key: input.mutation_id,
@@ -224,6 +229,8 @@ export function applyContextOwnerDecision(input: ContextOwnerPaths & {
       const employee = current.employees[input.agentName] ?? { rules: {} };
       employee.rules[input.rule_id] = record;
       current.employees[input.agentName] = employee;
+      current.history = current.history ?? {};
+      current.history[input.mutation_id] = record;
       durableWrite(overridesPath(input.ctxRoot), current);
     });
     stateCommitted = true;
@@ -232,6 +239,7 @@ export function applyContextOwnerDecision(input: ContextOwnerPaths & {
     finalizeCrewMutationAudit(input.ctxRoot, input.mutation_id, {
       result: 'success',
       after_digest: intendedDigest,
+      result_snapshot: { rule_digest: intendedDigest, mutation_id: input.mutation_id },
     }, { failAfterAppend: input.failAt === 'after-audit' });
     return { status: 'applied' as const, rule: record };
   } catch (error) {

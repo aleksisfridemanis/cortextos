@@ -56,6 +56,10 @@ describe('WorkSessionManager', () => {
     const resumeMutation = '94444444-4444-4444-8444-444444444444';
     const laterStopMutation = '95555555-5555-4555-8555-555555555555';
     const stopped = await manager.stop(created.id, 'owner:test', stopMutation);
+    const retriedCreate = await manager.create({ display_name: 'Fix release', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '91111111-1111-4111-8111-111111111111');
+    expect(retriedCreate).toEqual(created);
+    expect(retriedCreate.lifecycle).toBe('active');
+    expect(manager.get(created.id)?.lifecycle).toBe('archived');
     const resumed = await manager.resume(created.id, 'owner:test', resumeMutation);
     const retriedStop = await manager.stop(created.id, 'owner:test', stopMutation);
     expect(retriedStop).toEqual(stopped);

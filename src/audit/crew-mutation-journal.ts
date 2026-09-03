@@ -525,15 +525,19 @@ export function reconcileCrewMutationJournal(
       let storedDigest: string | null = null;
       try {
         const state = JSON.parse(readFileSync(join(ctxRoot, 'config', 'context-overrides.json'), 'utf8'));
+        const historical = state?.schema_version === 2 ? state.history?.[entry.mutation_id] : null;
         const rules = state?.schema_version === 2 ? state.employees?.[entry.target.id]?.rules : null;
-        const rule = rules && typeof rules === 'object'
+        const rule = historical ?? (rules && typeof rules === 'object'
           ? Object.values(rules as Record<string, { mutation_id?: string }>).find(item => item?.mutation_id === entry.mutation_id)
-          : null;
+          : null);
         if (rule?.mutation_id === entry.mutation_id) storedDigest = digestCrewAuditValue(rule);
       } catch { /* corrupt or absent state cannot be certified */ }
       if (storedDigest === entry.intended_after_digest) {
         if (entry.stage === 'prepared') commitCrewMutationState(ctxRoot, entry.mutation_id, storedDigest);
-        finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, { result: 'success', after_digest: storedDigest });
+        finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, {
+          result: 'success', after_digest: storedDigest,
+          result_snapshot: { rule_digest: storedDigest, mutation_id: entry.mutation_id },
+        });
         finalized += 1;
       }
       continue;
