@@ -164,8 +164,25 @@ export interface PersistedSendIntent {
   intentKey: string;
   requestDigest: string;
   messageText: string;
+  requestBody: WorkSessionSendRequestBody;
   state: 'pending' | 'terminal';
   uploads: Array<{ url: string; cleanup_token: string }>;
+}
+
+export interface WorkSessionSendRequestBody {
+  target_kind: 'work_session';
+  work_session_id: string;
+  text: string;
+  reply_to?: string;
+}
+
+export function workSessionSendRequestBody(target: string, text: string, replyTo: string | null): WorkSessionSendRequestBody {
+  return {
+    target_kind: 'work_session',
+    work_session_id: target,
+    text,
+    ...(replyTo ? { reply_to: replyTo } : {}),
+  };
 }
 
 export interface PersistedLifecycleIntent {
@@ -228,9 +245,18 @@ export function parsePersistedSendIntent(raw: string | null, principal: string, 
   try {
     const envelope = JSON.parse(raw) as { send?: PersistedSendIntent };
     const value = envelope.send;
+    const requestBody = value?.requestBody;
+    const requestKeys = requestBody && typeof requestBody === 'object' && !Array.isArray(requestBody)
+      ? Object.keys(requestBody)
+      : [];
     return value?.version === 1 && value.principal === principal && value.target === target
       && typeof value.id === 'string' && typeof value.intentKey === 'string'
       && typeof value.requestDigest === 'string' && typeof value.messageText === 'string'
+      && requestBody?.target_kind === 'work_session' && requestBody.work_session_id === target
+      && requestBody.text === value.messageText
+      && (requestBody.reply_to === undefined || (typeof requestBody.reply_to === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(requestBody.reply_to)))
+      && requestKeys.every(key => ['target_kind', 'work_session_id', 'text', 'reply_to'].includes(key))
+      && value.requestDigest === JSON.stringify(requestBody)
       && Array.isArray(value.uploads) && value.uploads.every(item => item && typeof item.url === 'string' && typeof item.cleanup_token === 'string')
       && ['pending', 'terminal'].includes(value.state) ? value : null;
   } catch { return null; }
@@ -1295,13 +1321,12 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         setSendError('Delivery is unknown. Choose Retry anyway to create a new send intent.');
         return;
       }
-      const reusableMessageText = (options.resumePersisted || options.retryAnyway) && restored?.target === target
-        ? restored.messageText
+      const exactRestored = (options.resumePersisted || options.retryAnyway) && restored?.target === target
+        ? restored
         : pendingSendRef.current?.target === target && pendingSendRef.current.intentKey === intentKey
-        ? pendingSendRef.current.messageText
-        : options.retryAnyway && terminal?.target === target && terminal.intentKey === intentKey
-          ? terminal.messageText
+          ? pendingSendRef.current
           : null;
+      const reusableMessageText = exactRestored?.requestBody.text ?? null;
       if (options.retryAnyway) {
         terminalSendRef.current = null;
         pendingSendRef.current = null;
@@ -1334,10 +1359,16 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         }
         messageText = buildMessageText(messageText, urls);
       }
-      const requestDigest = JSON.stringify({ target, text: messageText, reply_to: replyTarget?.id ?? null });
+      const requestBody = agent.kind === 'work_session'
+        ? exactRestored?.requestBody ?? workSessionSendRequestBody(target, messageText, replyTarget?.id ?? null)
+        : null;
+      const requestDigest = requestBody ? JSON.stringify(requestBody) : '';
+      if (options.resumePersisted && exactRestored && requestDigest !== exactRestored.requestDigest) {
+        throw new Error('PERSISTED_SEND_BINDING_MISMATCH');
+      }
       const mutationId = preassignedMutationId;
       if (mutationId) {
-        pendingSendRef.current = { version: 1, principal: user, id: mutationId, target, intentKey, requestDigest, messageText, state: 'pending', uploads: uploaded };
+        pendingSendRef.current = { version: 1, principal: user, id: mutationId, target, intentKey, requestDigest, messageText, requestBody: requestBody!, state: 'pending', uploads: uploaded };
         terminalSendRef.current = null;
         persistIntents();
         setRestoredIntentNotice(`Pending operation ${mutationId}`);
@@ -1346,10 +1377,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       const res = await fetch('/api/messages/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(mutationId ? { 'x-cortext-mutation-id': mutationId } : {}) },
-        body: JSON.stringify({
-          ...(agent.kind === 'work_session'
-            ? { target_kind: 'work_session', work_session_id: agent.targetId }
-            : { agent: agent.name }),
+        body: JSON.stringify(requestBody ?? {
+          agent: agent.name,
           text: messageText,
           ...(replyTarget ? { reply_to: replyTarget.id } : {}),
         }),
@@ -1375,7 +1404,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
             priority: 'normal',
             timestamp: new Date().toISOString(),
             text: messageText,
-            reply_to: replyTarget?.id ?? null,
+            reply_to: requestBody?.reply_to ?? replyTarget?.id ?? null,
             ...(agent.kind === 'work_session' ? { delivery_state: 'delivered' as const } : {}),
           },
         ]);
@@ -1393,7 +1422,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         const data = await res.json().catch(() => ({}));
         if (data.code === 'DELIVERY_RETRY_REQUIRED') {
           pendingSendRef.current = null;
-          terminalSendRef.current = { version: 1, principal: user, id: mutationId!, target, intentKey, requestDigest, messageText, state: 'terminal', uploads: uploaded };
+          terminalSendRef.current = { version: 1, principal: user, id: mutationId!, target, intentKey, requestDigest, messageText, requestBody: requestBody!, state: 'terminal', uploads: uploaded };
           setRetryAnywayAvailable(true);
         } else if (!shouldRetainMutationId(data.code)) {
           pendingSendRef.current = null;

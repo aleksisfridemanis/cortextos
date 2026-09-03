@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, parsePersistedLifecycleIntents, parsePersistedSendIntent, promotionMutationKey, restoredLifecycleActionLabel, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionIntentStorageKey, workSessionLifecycleAction } from '../crew-chat';
+import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, parsePersistedLifecycleIntents, parsePersistedSendIntent, promotionMutationKey, restoredLifecycleActionLabel, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionIntentStorageKey, workSessionLifecycleAction, workSessionSendRequestBody } from '../crew-chat';
 import { shouldTriggerPullRefresh, resolveInitialSelection } from '../use-crew';
 import { prefetchTargets } from '../crew-roster';
 import type { RosterEntry } from '../crew-roster';
@@ -90,14 +90,20 @@ describe('Work Session message identity and delivery state', () => {
     expect(workSessionIntentStorageKey('owner:alice', 'ws-one')).not.toBe(workSessionIntentStorageKey('owner:alice', 'ws-two'));
     const send = {
       version: 1 as const, principal: 'owner:alice', target: 'ws-one', id: 'mutation-one',
-      intentKey: 'pre-upload-binding', requestDigest: JSON.stringify({ text: '/api/media/exact-opaque.png' }),
+      intentKey: 'pre-upload-binding',
       messageText: 'inspect\n/api/media/exact-opaque.png', state: 'pending' as const,
+      requestBody: workSessionSendRequestBody('ws-one', 'inspect\n/api/media/exact-opaque.png', 'parent-1'),
       uploads: [{ url: '/api/media/exact-opaque.png', cleanup_token: 'secret-capability' }],
     };
-    const raw = JSON.stringify({ send });
-    expect(parsePersistedSendIntent(raw, 'owner:alice', 'ws-one')).toEqual(send);
+    const boundSend = { ...send, requestDigest: JSON.stringify(send.requestBody) };
+    const raw = JSON.stringify({ send: boundSend });
+    expect(parsePersistedSendIntent(raw, 'owner:alice', 'ws-one')).toEqual(boundSend);
     expect(parsePersistedSendIntent(raw, 'owner:bob', 'ws-one')).toBeNull();
     expect(parsePersistedSendIntent(raw, 'owner:alice', 'ws-two')).toBeNull();
+    expect(JSON.stringify(parsePersistedSendIntent(raw, 'owner:alice', 'ws-one')!.requestBody))
+      .toBe(JSON.stringify(workSessionSendRequestBody('ws-one', send.messageText, 'parent-1')));
+    expect(parsePersistedSendIntent(JSON.stringify({ send: { ...boundSend, requestDigest: 'tampered' } }), 'owner:alice', 'ws-one')).toBeNull();
+    expect(parsePersistedSendIntent(JSON.stringify({ send: { ...boundSend, requestBody: { ...boundSend.requestBody, reply_to: '../bad' } } }), 'owner:alice', 'ws-one')).toBeNull();
   });
   it('keeps restored lifecycle actions explicitly actionable after lifecycle changes', () => {
     expect(restoredLifecycleActionLabel('stop')).toBe('Resume pending stop');
