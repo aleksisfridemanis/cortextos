@@ -867,9 +867,10 @@ export class WorkSessionManager {
           },
         ));
       const employeeMutationId = promotionEmployeeMutationId(mutationId);
-      await createEmployee({
+      const employeeResult = await createEmployee({
         ...input, working_directory: recoveryRecord.canonical_cwd, room_id: recoveryRecord.room_id, telegram_polling: false,
       }, employeeMutationId);
+      this.assertPromotionEmployeeSucceeded(employeeMutationId, employeeResult);
       recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['archived'], 'archived', { promoted_employee: input.name }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, {
         stopped: true, employee_created: true, recovered: true,
@@ -907,12 +908,13 @@ export class WorkSessionManager {
         },
       ));
     try {
-      await createEmployee({
+      const employeeResult = await createEmployee({
         ...input,
         working_directory: record.canonical_cwd,
         room_id: record.room_id,
         telegram_polling: false,
       }, employeeMutationId);
+      this.assertPromotionEmployeeSucceeded(employeeMutationId, employeeResult);
     } catch (error) {
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: true, employee_created: false, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'failure', after_digest: stateDigest(record), error_code: 'PROMOTION_FAILED', sanitized_error: 'Employee promotion failed' });
@@ -922,6 +924,17 @@ export class WorkSessionManager {
     recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: true, employee_created: true, employee_mutation_digest: digestCrewAuditValue(employeeMutationId), mutation_id: mutationId });
     finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(record) });
     this.adapters.delete(id);
+  }
+
+  private assertPromotionEmployeeSucceeded(employeeMutationId: string, result: unknown): void {
+    const child = getCrewMutation(this.dependencies.ctxRoot, employeeMutationId);
+    if (child && (child.stage !== 'finalized' || child.final_result?.result !== 'success')) {
+      throw new WorkSessionRegistryError('PROMOTION_FAILED', 'Employee promotion did not complete');
+    }
+    const value = result && typeof result === 'object' ? result as Record<string, unknown> : null;
+    if (!value || value.status !== 'created' || value.audit !== 'finalized') {
+      throw new WorkSessionRegistryError('PROMOTION_FAILED', 'Employee promotion did not produce a started Employee');
+    }
   }
 
   private require(id: string, lifecycles: WorkSessionRecord['lifecycle'][]): WorkSessionRecord {

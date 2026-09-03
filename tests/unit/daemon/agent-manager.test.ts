@@ -94,6 +94,11 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
       mutation_id: request.mutation_id, pid: identity.pid, process_started_at: identity.started_at,
       started: false, disposition: 'exited',
     });
+    const restartedAgain = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    await expect(restartedAgain.queryEmployeeStart(request)).resolves.toMatchObject({
+      mutation_id: request.mutation_id, pid: identity.pid, process_started_at: identity.started_at,
+      started: false, disposition: 'exited',
+    });
     if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
   });
 

@@ -83,6 +83,37 @@ describe('createEmployee', () => {
       .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT', status: 409 });
   });
 
+  it('replays a terminal result before consulting the now-missing working directory', async () => {
+    const mutationId = '70c579cb-8eaa-4015-a18c-e8bf8311b0dd';
+    const cwd = join(root, 'temporary-project');
+    mkdirSync(cwd);
+    const input = { name: 'durable', org: 'platform', runtime: 'claude-code' as const, working_directory: cwd, telegram_polling: false as const, actor: 'owner:test' };
+    const first = await createEmployee(input, mutationId, dependencies);
+    rmSync(cwd, { recursive: true });
+    await expect(createEmployee(input, mutationId, dependencies)).resolves.toEqual(first);
+  });
+
+  it.each(['failed', 'exited'] as const)('throws after durably finalizing a %s runtime start', async disposition => {
+    dependencies.startEmployee = async request => ({
+      mutation_id: request.mutation_id,
+      name: request.name,
+      started: false,
+      pid: disposition === 'exited' ? testProcess.pid : null,
+      process_started_at: disposition === 'exited' ? `${testProcess.started_at}-previous-generation` : null,
+      disposition,
+    });
+    const mutationId = disposition === 'failed'
+      ? '71c579cb-8eaa-4015-a18c-e8bf8311b0dd'
+      : '72c579cb-8eaa-4015-a18c-e8bf8311b0dd';
+    await expect(createEmployee({
+      name: disposition, org: 'platform', runtime: 'claude-code', telegram_polling: false, actor: 'owner:test',
+    }, mutationId, dependencies)).rejects.toMatchObject({
+      code: disposition === 'failed' ? 'EMPLOYEE_START_FAILED' : 'EMPLOYEE_RUNTIME_EXITED',
+    });
+    expect(JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'))[0])
+      .toMatchObject({ stage: 'finalized', final_result: { result: 'failure' } });
+  });
+
   it('rejects invalid inputs without mutating registries or staging files', async () => {
     const before = readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8');
     const invalid = [

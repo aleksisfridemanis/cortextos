@@ -192,7 +192,7 @@ function replaceTemplateTokens(dir: string, values: Record<string, string>): voi
   }
 }
 
-function validateInput(input: CreateEmployeeInput, frameworkRoot: string): void {
+function validateInputShape(input: CreateEmployeeInput): void {
   if (!input || typeof input !== 'object') throw new CrewServiceError('INVALID_INPUT', 400, 'Invalid Employee request');
   if (typeof input.name !== 'string' || input.name.length > CREW_NAME_MAX_CHARS) {
     throw new CrewServiceError('INVALID_NAME', 400, `Employee name must contain at most ${CREW_NAME_MAX_CHARS} characters`);
@@ -200,9 +200,6 @@ function validateInput(input: CreateEmployeeInput, frameworkRoot: string): void 
   try { validateAgentName(input.name); } catch { throw new CrewServiceError('INVALID_NAME', 400, 'Invalid Employee name'); }
   if (typeof input.org !== 'string') throw new CrewServiceError('INVALID_ORG', 400, 'Organization is required');
   try { validateOrgName(input.org); } catch { throw new CrewServiceError('INVALID_ORG', 400, 'Invalid organization'); }
-  if (!existsSync(join(frameworkRoot, 'orgs', input.org)) || !lstatSync(join(frameworkRoot, 'orgs', input.org)).isDirectory()) {
-    throw new CrewServiceError('ORG_NOT_FOUND', 404, 'Organization not found');
-  }
   if (!CREW_EMPLOYEE_RUNTIMES.includes(input.runtime)) {
     throw new CrewServiceError('RUNTIME_UNSUPPORTED', 400, 'Unsupported Employee harness');
   }
@@ -224,6 +221,12 @@ function validateInput(input: CreateEmployeeInput, frameworkRoot: string): void 
   }
   if (input.room_id !== undefined) {
     try { validateRoomId(input.room_id); } catch { throw new CrewServiceError('INVALID_ROOM', 400, 'Invalid room identifier'); }
+  }
+}
+
+function validateInputEnvironment(input: CreateEmployeeInput, frameworkRoot: string): void {
+  if (!existsSync(join(frameworkRoot, 'orgs', input.org)) || !lstatSync(join(frameworkRoot, 'orgs', input.org)).isDirectory()) {
+    throw new CrewServiceError('ORG_NOT_FOUND', 404, 'Organization not found');
   }
 }
 
@@ -300,6 +303,30 @@ function resultFromRegistry(name: string, record: EmployeeRegistryRecord, starte
   return { status: started ? 'created' : 'configured', employee: { name, ...record }, audit: 'finalized' };
 }
 
+function resultSnapshot(result: CreateEmployeeResult): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
+}
+
+function resultFromSnapshot(value: Record<string, unknown> | undefined): CreateEmployeeResult | null {
+  if (!value || (value.status !== 'created' && value.status !== 'configured') || value.audit !== 'finalized'
+    || !value.employee || typeof value.employee !== 'object') return null;
+  return JSON.parse(JSON.stringify(value)) as CreateEmployeeResult;
+}
+
+function employeeRequestDigest(input: InternalCreateEmployeeInput, dependencies: InternalCreateEmployeeDependencies): string {
+  return digestCrewAuditValue({
+    name: input?.name,
+    org: input?.org,
+    runtime: input?.runtime,
+    model: input?.model ?? null,
+    working_directory: input?.working_directory ?? null,
+    telegram_polling: input?.telegram_polling,
+    room_id: input?.room_id ?? null,
+    source_work_session_id: dependencies[PROMOTION_GRANT]?.source_work_session_id ?? null,
+    parent_mutation_id: dependencies[PROMOTION_GRANT]?.parent_mutation_id ?? null,
+  });
+}
+
 export function employeeStartReceiptDigest(receipt: EmployeeStartReceipt): string {
   return digestCrewAuditValue({
     mutation_id: receipt.mutation_id,
@@ -369,12 +396,7 @@ function runEmployeeMutation(
   const ctxRoot = dependencies.ctxRoot ?? process.env.CTX_ROOT ?? join(homedir(), '.cortextos', dependencies.instanceId ?? process.env.CTX_INSTANCE_ID ?? 'default');
   const key = `${ctxRoot}\0${mutationId}`;
   const target = input?.name ?? '';
-  const requestDigest = digestCrewAuditValue({
-    ...input,
-    actor: undefined,
-    source_work_session_id: dependencies[PROMOTION_GRANT]?.source_work_session_id ?? null,
-    parent_mutation_id: dependencies[PROMOTION_GRANT]?.parent_mutation_id ?? null,
-  });
+  const requestDigest = employeeRequestDigest(input, dependencies);
   const current = employeeMutationRuns.get(key);
   if (current) {
     if (current.actor !== input?.actor || current.target !== target || current.requestDigest !== requestDigest) {
@@ -402,15 +424,39 @@ async function createEmployeeInternal(
   const frameworkRoot = dependencies.frameworkRoot ?? process.env.CTX_FRAMEWORK_ROOT ?? process.env.CTX_PROJECT_ROOT ?? process.cwd();
   const instanceId = dependencies.instanceId ?? process.env.CTX_INSTANCE_ID ?? 'default';
   const now = dependencies.now ?? (() => new Date().toISOString());
-  validateInput(input, frameworkRoot);
-  const workingDirectory = canonicalWorkingDirectory(input.working_directory);
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(mutationId)) {
     throw new CrewServiceError('INVALID_MUTATION_ID', 400, 'A valid mutation id is required');
   }
+  validateInputShape(input);
 
   reconcileCrewMutationJournal(ctxRoot, { frameworkRoot });
+  const requestDigest = employeeRequestDigest(input, dependencies);
   const enabledPath = join(ctxRoot, 'config', 'enabled-agents.json');
   const roomsPath = join(ctxRoot, 'config', 'rooms.json');
+  const terminalMutation = getCrewMutation(ctxRoot, mutationId);
+  if (terminalMutation) {
+    const sameRequest = terminalMutation.actor === input.actor
+      && terminalMutation.action === 'create'
+      && terminalMutation.target.kind === 'employee'
+      && terminalMutation.target.id === input.name
+      && terminalMutation.request_digest === requestDigest;
+    if (!sameRequest) throw new CrewServiceError('IDEMPOTENCY_CONFLICT', 409, 'Mutation id is already bound to another request');
+    if (terminalMutation.stage === 'finalized') {
+      const stored = resultFromSnapshot(terminalMutation.final_result?.result_snapshot);
+      if (stored) return stored;
+      if (terminalMutation.final_result?.result === 'failure') {
+        const code = terminalMutation.final_result.error_code === 'EMPLOYEE_RUNTIME_EXITED'
+          ? 'EMPLOYEE_RUNTIME_EXITED' : 'EMPLOYEE_START_FAILED';
+        throw new CrewServiceError(code, 500, 'Employee runtime did not start');
+      }
+      const existing = readObject(enabledPath)[input.name];
+      if (existing?.mutation_id === mutationId && terminalMutation.final_result?.error_code === 'EMPLOYEE_NOT_STARTED') {
+        return resultFromRegistry(input.name, existing, false);
+      }
+    }
+  }
+  validateInputEnvironment(input, frameworkRoot);
+  const workingDirectory = canonicalWorkingDirectory(input.working_directory);
   const existingRegistry = readObject(enabledPath);
   const beforeDigest = digestCrewAuditValue(existingRegistry[input.name] ?? null);
   const roomId = input.room_id ?? agentRoomId(input.name);
@@ -425,17 +471,6 @@ async function createEmployeeInternal(
     mutation_id: mutationId,
     created_at: now(),
   };
-  const requestDigest = digestCrewAuditValue({
-    name: input.name,
-    org: input.org,
-    runtime: input.runtime,
-    model: input.model ?? null,
-    working_directory: workingDirectory,
-    telegram_polling: false,
-    room_id: roomId,
-    source_work_session_id: dependencies[PROMOTION_GRANT]?.source_work_session_id ?? null,
-    parent_mutation_id: dependencies[PROMOTION_GRANT]?.parent_mutation_id ?? null,
-  });
   const priorMutation = getCrewMutation(ctxRoot, mutationId);
   if (priorMutation) {
     const sameRequest = priorMutation.actor === input.actor
@@ -501,16 +536,19 @@ async function createEmployeeInternal(
           receipt_digest: employeeStartReceiptDigest(receipt),
         });
       }
+      const recoveredResult = resultFromRegistry(input.name, existing, receipt.started);
       finalizeCrewMutationAudit(ctxRoot, mutationId, receipt.started
-        ? { result: 'success', after_digest: priorMutation.intended_after_digest }
+        ? { result: 'success', after_digest: priorMutation.intended_after_digest, result_snapshot: resultSnapshot(recoveredResult) }
         : receipt.disposition === 'exited' || receipt.disposition === 'failed'
           ? {
             result: 'failure', after_digest: priorMutation.intended_after_digest,
             error_code: receipt.disposition === 'failed' ? 'EMPLOYEE_START_FAILED' : 'EMPLOYEE_RUNTIME_EXITED',
             sanitized_error: receipt.disposition === 'failed' ? 'Employee runtime did not become ready' : 'Employee runtime exited before recovery',
           }
-          : { result: 'indeterminate', after_digest: priorMutation.intended_after_digest, error_code: 'EMPLOYEE_NOT_STARTED', sanitized_error: 'Employee configured but runtime not started' });
-      return resultFromRegistry(input.name, existing, receipt.started);
+          : { result: 'indeterminate', after_digest: priorMutation.intended_after_digest, error_code: 'EMPLOYEE_NOT_STARTED', sanitized_error: 'Employee configured but runtime not started', result_snapshot: resultSnapshot(recoveredResult) });
+      if (receipt.disposition === 'failed') throw new CrewServiceError('EMPLOYEE_START_FAILED', 500, 'Employee runtime did not become ready');
+      if (receipt.disposition === 'exited') throw new CrewServiceError('EMPLOYEE_RUNTIME_EXITED', 500, 'Employee runtime exited before recovery');
+      return recoveredResult;
     }
     throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
   }
@@ -684,8 +722,9 @@ async function createEmployeeInternal(
       receipt_digest: employeeStartReceiptDigest(receipt),
     });
     if (dependencies.failAt === 'after-effect') throw new Error('injected after effect');
+    const createdResult = resultFromRegistry(input.name, record, receipt.started);
     finalizeCrewMutationAudit(ctxRoot, mutationId, receipt.started ? {
-      result: 'success', after_digest: intendedAfterDigest,
+      result: 'success', after_digest: intendedAfterDigest, result_snapshot: resultSnapshot(createdResult),
     } : receipt.disposition === 'exited' || receipt.disposition === 'failed' ? {
       result: 'failure', after_digest: intendedAfterDigest,
       error_code: receipt.disposition === 'failed' ? 'EMPLOYEE_START_FAILED' : 'EMPLOYEE_RUNTIME_EXITED',
@@ -693,8 +732,11 @@ async function createEmployeeInternal(
     } : {
       result: 'indeterminate', after_digest: intendedAfterDigest,
       error_code: 'EMPLOYEE_NOT_STARTED', sanitized_error: 'Employee configured but runtime not started',
+      result_snapshot: resultSnapshot(createdResult),
     }, { failAfterAppend: dependencies.failAt === 'after-audit' });
-    return resultFromRegistry(input.name, record, receipt.started);
+    if (receipt.disposition === 'failed') throw new CrewServiceError('EMPLOYEE_START_FAILED', 500, 'Employee runtime did not become ready');
+    if (receipt.disposition === 'exited') throw new CrewServiceError('EMPLOYEE_RUNTIME_EXITED', 500, 'Employee runtime exited before recovery');
+    return createdResult;
   } catch (error) {
     if (!stateCommitted && publicationRestored) {
       rmSync(stageDir, { recursive: true, force: true });
@@ -710,7 +752,7 @@ async function createEmployeeInternal(
       });
       throw serviceError;
     }
-    if (error instanceof CrewServiceError && ['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING'].includes(error.code)) throw error;
+    if (error instanceof CrewServiceError && ['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'EMPLOYEE_START_FAILED', 'EMPLOYEE_RUNTIME_EXITED'].includes(error.code)) throw error;
     throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
   }
 }

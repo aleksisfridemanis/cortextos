@@ -293,7 +293,12 @@ export class AgentManager {
     if (!receipt) return null;
     if (receipt.name !== request.name) throw new Error('IDEMPOTENCY_CONFLICT');
     if (!receipt.started) {
-      return receipt.disposition === 'failed' && receipt.pid === null && receipt.process_started_at === null ? receipt : null;
+      if (receipt.disposition === 'failed' && receipt.pid === null && receipt.process_started_at === null) return receipt;
+      if (receipt.disposition === 'exited' && receipt.pid && receipt.process_started_at) {
+        const identity = { pid: receipt.pid, started_at: receipt.process_started_at, process_group_id: receipt.process_group_id };
+        return probeProcessIdentity(identity) === 'dead' && probeProcessGroup(identity) === 'dead' ? receipt : null;
+      }
+      return null;
     }
     if (receipt.disposition !== 'running' || !receipt.pid || !receipt.process_started_at) return null;
     const identity = { pid: receipt.pid, started_at: receipt.process_started_at, process_group_id: receipt.process_group_id };

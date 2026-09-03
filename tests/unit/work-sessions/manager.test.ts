@@ -42,7 +42,7 @@ describe('WorkSessionManager', () => {
       status: vi.fn(() => ({ running, pid: running ? testProcess.pid : null, error_code: null, process_started_at: running ? testProcess.started_at : null, ownership: running ? 'attached' : 'dead' })),
       getResumeHandle: vi.fn(() => null),
     };
-    const createEmployee = vi.fn(async () => ({ status: 'created' as const }));
+    const createEmployee = vi.fn(async () => ({ status: 'created' as const, audit: 'finalized' as const }));
     const manager = new WorkSessionManager({ ctxRoot, adapterFactory: () => adapter, createEmployee, failAt });
     return { manager, adapter, createEmployee, cwd, ctxRoot };
   }
@@ -579,5 +579,15 @@ describe('WorkSessionManager', () => {
     }, '55555555-5555-4555-8555-555555555555');
     expect(manager.get(created.id)?.lifecycle).toBe('archived');
     expect(createEmployee).toHaveBeenCalledWith(expect.objectContaining({ working_directory: realpathSync(cwd), room_id: created.room_id }), expect.stringMatching(/^[0-9a-f-]{36}$/));
+  });
+
+  it('does not promote when Employee creation resolves without a started finalized result', async () => {
+    const { manager, createEmployee, cwd } = fixture();
+    vi.mocked(createEmployee).mockResolvedValueOnce({ status: 'configured' } as never);
+    const created = await manager.create({ display_name: 'Do not promote', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '61111111-1111-4111-8111-111111111111');
+    await expect(manager.promote(created.id, {
+      name: 'not-running', org: 'platform', runtime: 'claude-code', actor: 'owner:test',
+    }, '62222222-2222-4222-8222-222222222222')).rejects.toMatchObject({ code: 'PROMOTION_FAILED' });
+    expect(manager.get(created.id)).toMatchObject({ lifecycle: 'archived', promoted_employee: null });
   });
 });
