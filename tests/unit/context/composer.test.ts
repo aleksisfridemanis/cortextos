@@ -4,7 +4,9 @@ import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   EMPLOYEE_CORE_MAX_BYTES,
+  HANDOFF_MAX_BYTES,
   composeEmployeeContext,
+  materializeContextPacket,
 } from '../../../src/context/composer.js';
 
 describe('composeEmployeeContext', () => {
@@ -67,5 +69,27 @@ describe('composeEmployeeContext', () => {
       ctxRoot: join(root, 'ctx'),
       mode: 'fresh',
     })).toThrow(/CONTEXT_BUDGET_EXCEEDED/);
+  });
+
+  it('refreshes framework bytes while preserving instance bytes and bounds one continuation handoff', () => {
+    const before = composeEmployeeContext({ frameworkRoot, agentDir, ctxRoot: join(root, 'ctx'), mode: 'fresh' });
+    writeFileSync(join(frameworkRoot, 'templates', 'context', 'employee-core.md'), 'REFRESHED CORE\n');
+    const after = composeEmployeeContext({
+      frameworkRoot, agentDir, ctxRoot: join(root, 'ctx'), mode: 'continuation', handoff: 'next action: verify\n',
+    });
+    expect(after.text).toContain('REFRESHED CORE');
+    expect(after.blocks.find(item => item.source_ref.endsWith('IDENTITY.md'))?.text)
+      .toBe(before.blocks.find(item => item.source_ref.endsWith('IDENTITY.md'))?.text);
+    expect(after.blocks.at(-1)?.text).toBe('next action: verify\n');
+    expect(() => composeEmployeeContext({
+      frameworkRoot, agentDir, ctxRoot: join(root, 'ctx'), mode: 'continuation', handoff: 'x'.repeat(HANDOFF_MAX_BYTES + 1),
+    })).toThrow(/CONTEXT_BUDGET_EXCEEDED/);
+  });
+
+  it('materializes one logical packet with semantic parity for all three harnesses', () => {
+    const packet = composeEmployeeContext({ frameworkRoot, agentDir, ctxRoot: join(root, 'ctx'), mode: 'fresh' });
+    const outputs = ['claude-code', 'codex-app-server', 'opencode'].map(runtime => materializeContextPacket(packet, runtime as never));
+    expect(new Set(outputs.map(output => output.packet_digest)).size).toBe(1);
+    expect(outputs.map(output => output.routes)).toEqual([packet.routes, packet.routes, packet.routes]);
   });
 });
