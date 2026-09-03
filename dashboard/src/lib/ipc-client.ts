@@ -66,6 +66,9 @@ export interface IPCRequest {
   type:
     | 'status'
     | 'create-employee'
+    | 'context-review'
+    | 'context-owner-decision'
+    | 'reconcile-crew'
     | 'start-agent'
     | 'stop-agent'
     | 'restart-agent'

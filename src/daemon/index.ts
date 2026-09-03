@@ -5,6 +5,7 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
+import { reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -258,6 +259,11 @@ class Daemon {
 
     // Create agent manager
     this.agentManager = new AgentManager(this.instanceId, this.ctxRoot, frameworkRoot, org);
+
+    // Finish or classify every durable Crew mutation before accepting new IPC
+    // traffic. A corrupt journal fails startup closed instead of hiding an
+    // applied-but-unaudited lifecycle or owner decision.
+    reconcileCrewMutationJournal(this.ctxRoot);
 
     // Start IPC server
     this.ipcServer = new IPCServer(this.agentManager, this.instanceId);

@@ -1,4 +1,4 @@
-export type ContextOwner = 'framework' | 'instance' | 'owner';
+export type ContextOwner = 'framework' | 'instance' | 'owner' | 'ambiguous';
 export type ContextLaunchMode = 'fresh' | 'continuation';
 export type ContextRouteKind =
   | 'tools'

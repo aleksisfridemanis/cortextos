@@ -69,8 +69,11 @@ export function digestCrewAuditValue(value: unknown): string {
   return createHash('sha256').update(canonicalCrewAuditJson(value), 'utf8').digest('hex');
 }
 
-function auditPath(ctxRoot: string): string {
-  return join(ctxRoot, 'state', 'crew-lifecycle-audit.jsonl');
+function auditPath(ctxRoot: string, fileName: string): string {
+  if (!['crew-lifecycle-audit.jsonl', 'context-override-audit.jsonl'].includes(fileName)) {
+    throw new Error('Invalid Crew audit sink');
+  }
+  return join(ctxRoot, 'state', fileName);
 }
 
 function assertAuditEvent(event: CrewLifecycleAuditEvent): void {
@@ -100,8 +103,11 @@ function assertAuditEvent(event: CrewLifecycleAuditEvent): void {
   }
 }
 
-export function readCrewLifecycleAuditEvents(ctxRoot: string): CrewLifecycleAuditEvent[] {
-  const path = auditPath(ctxRoot);
+export function readCrewLifecycleAuditEvents(
+  ctxRoot: string,
+  fileName = 'crew-lifecycle-audit.jsonl',
+): CrewLifecycleAuditEvent[] {
+  const path = auditPath(ctxRoot, fileName);
   if (!existsSync(path)) return [];
   const raw = readFileSync(path, 'utf8');
   if (!raw.trim()) return [];
@@ -119,14 +125,15 @@ export function readCrewLifecycleAuditEvents(ctxRoot: string): CrewLifecycleAudi
 export function appendCrewLifecycleAuditEvent(
   ctxRoot: string,
   event: CrewLifecycleAuditEvent,
+  fileName = 'crew-lifecycle-audit.jsonl',
 ): { appended: boolean } {
   assertAuditEvent(event);
   const stateDir = join(ctxRoot, 'state');
-  const lockDir = join(stateDir, 'crew-lifecycle-audit-lock');
+  const lockDir = join(stateDir, `${fileName}-lock`);
   mkdirSync(lockDir, { recursive: true, mode: 0o700 });
   return withFileLockSync(lockDir, () => {
     const equivalent = canonicalCrewAuditJson(event);
-    const existing = readCrewLifecycleAuditEvents(ctxRoot).find(item => item.event_id === event.event_id);
+    const existing = readCrewLifecycleAuditEvents(ctxRoot, fileName).find(item => item.event_id === event.event_id);
     if (existing) {
       if (canonicalCrewAuditJson(existing) !== equivalent) {
         throw new Error(`Conflicting audit event for mutation ${event.event_id}`);
@@ -134,7 +141,7 @@ export function appendCrewLifecycleAuditEvent(
       return { appended: false };
     }
 
-    const path = auditPath(ctxRoot);
+    const path = auditPath(ctxRoot, fileName);
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const fd = openSync(path, 'a', 0o600);
     try {

@@ -10,6 +10,9 @@ import { nextFireFromCron } from './cron-scheduler.js';
 import { parseDurationMs } from '../bus/cron-state.js';
 import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
 import { createEmployee, CrewServiceError, type CreateEmployeeInput } from '../agents/create-employee.js';
+import { homedir } from 'os';
+import { applyContextOwnerDecision, getContextOwnershipReview, resolveEmployeeContextPaths } from '../context/owner-controls.js';
+import { reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
 
 const WORKER_NAME_REGEX = /^[a-z0-9_-]+$/;
 
@@ -479,9 +482,11 @@ export class IPCServer {
   private server: Server | null = null;
   private socketPath: string;
   private agentManager: AgentManager;
+  private instanceId: string;
 
   constructor(agentManager: AgentManager, instanceId: string = 'default') {
     this.agentManager = agentManager;
+    this.instanceId = instanceId;
     this.socketPath = getIpcPath(instanceId);
   }
 
@@ -580,6 +585,47 @@ export class IPCServer {
 
     try {
       switch (request.type) {
+        case 'reconcile-crew': {
+          const ctxRoot = process.env.CTX_ROOT ?? join(homedir(), '.cortextos', this.instanceId);
+          response = { success: true, data: reconcileCrewMutationJournal(ctxRoot) };
+          break;
+        }
+
+        case 'context-review': {
+          try {
+            const ctxRoot = process.env.CTX_ROOT ?? join(homedir(), '.cortextos', this.instanceId);
+            const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT ?? process.env.CTX_PROJECT_ROOT ?? process.cwd();
+            const agentName = String(request.data?.agentName ?? '');
+            const ruleId = String(request.data?.rule_id ?? 'employee-core');
+            response = { success: true, data: getContextOwnershipReview(resolveEmployeeContextPaths(ctxRoot, frameworkRoot, agentName, ruleId)) };
+          } catch (error) {
+            response = { success: false, error: (error as Error).message === 'EMPLOYEE_NOT_FOUND' ? 'Employee not found' : 'Context review unavailable', code: (error as Error).message };
+          }
+          break;
+        }
+
+        case 'context-owner-decision': {
+          try {
+            const ctxRoot = process.env.CTX_ROOT ?? join(homedir(), '.cortextos', this.instanceId);
+            const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT ?? process.env.CTX_PROJECT_ROOT ?? process.cwd();
+            const agentName = String(request.data?.agentName ?? '');
+            const ruleId = String(request.data?.rule_id ?? 'employee-core');
+            const paths = resolveEmployeeContextPaths(ctxRoot, frameworkRoot, agentName, ruleId);
+            response = { success: true, data: applyContextOwnerDecision({
+              ...paths,
+              actor: String(request.data?.actor ?? ''),
+              decision: request.data?.decision as never,
+              proposal_digest: String(request.data?.proposal_digest ?? ''),
+              replacement: typeof request.data?.replacement === 'string' ? request.data.replacement : undefined,
+              mutation_id: request.mutation_id ?? '',
+            }) };
+          } catch (error) {
+            const code = (error as Error).message;
+            response = { success: false, error: code === 'STALE_PROPOSAL' ? 'Context proposal changed; review again' : code === 'MUTATION_PENDING' ? 'Context decision requires recovery' : 'Context decision rejected', code };
+          }
+          break;
+        }
+
         case 'create-employee': {
           if (!request.mutation_id || !request.data) {
             response = { success: false, error: 'Employee request and mutation id required', code: 'INVALID_INPUT' };

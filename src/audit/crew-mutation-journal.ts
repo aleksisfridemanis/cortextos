@@ -249,6 +249,9 @@ export function finalizeCrewMutationAudit(
   const entry = getCrewMutation(ctxRoot, mutationId);
   if (!entry) throw new Error(`Unknown Crew mutation ${mutationId}`);
   if (entry.stage === 'finalized') return entry;
+  const auditFile = ['approve_merge', 'replace_default', 'disable_default'].includes(entry.action)
+    ? 'context-override-audit.jsonl'
+    : 'crew-lifecycle-audit.jsonl';
   appendCrewLifecycleAuditEvent(ctxRoot, {
     schema_version: 1,
     event_id: entry.mutation_id,
@@ -262,7 +265,7 @@ export function finalizeCrewMutationAudit(
     result: finalResult.result,
     error_code: finalResult.error_code ?? null,
     sanitized_error: finalResult.sanitized_error ?? null,
-  });
+  }, auditFile);
   updateEntry(ctxRoot, mutationId, current => {
     current.stage = 'audit_written';
     current.final_result = finalResult;

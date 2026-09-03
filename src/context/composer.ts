@@ -3,9 +3,11 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { buildEmployeeContextRoutes } from './router.js';
 import type { ContextOwner, EffectiveContextBlock, EffectiveContextPacket } from './types.js';
+import { digestCrewAuditValue } from '../audit/crew-lifecycle-audit.js';
 
 export const EMPLOYEE_CORE_MAX_BYTES = 24_576;
 export const HANDOFF_MAX_BYTES = 16_384;
+export type ContextHarness = 'claude-code' | 'codex-app-server' | 'opencode';
 
 export interface ComposeEmployeeContextOptions {
   frameworkRoot: string;
@@ -32,10 +34,24 @@ function digest(text: string): string {
 
 export function composeEmployeeContext(options: ComposeEmployeeContextOptions): EffectiveContextPacket {
   const contextDir = join(options.frameworkRoot, 'templates', 'context');
-  const blocks: EffectiveContextBlock[] = [
-    block(join(contextDir, 'employee-core.md'), 'framework', 'current Employee runtime and essential safety rules'),
-    block(join(contextDir, 'employee-router.md'), 'framework', 'stable dynamic context routing contract'),
-  ];
+  const frameworkCore = block(join(contextDir, 'employee-core.md'), 'framework', 'current Employee runtime and essential safety rules');
+  const blocks: EffectiveContextBlock[] = [];
+  const overridesPath = join(options.ctxRoot, 'config', 'context-overrides.json');
+  let coreOverride: { content?: string | null; disabled?: boolean; mutation_id?: string } | null = null;
+  if (existsSync(overridesPath)) {
+    try { coreOverride = JSON.parse(readFileSync(overridesPath, 'utf8'))?.rules?.['employee-core'] ?? null; } catch {
+      throw new Error('CONTEXT_OVERRIDES_CORRUPT');
+    }
+  }
+  if (!coreOverride) blocks.push(frameworkCore);
+  else if (coreOverride.disabled) {
+    blocks.push({ source_ref: 'owner://context-overrides/employee-core', text: 'The owner explicitly disabled the framework employee-core default.', owner: 'owner', inclusion_reason: `audited disable decision ${coreOverride.mutation_id ?? ''}` });
+  } else if (typeof coreOverride.content === 'string') {
+    blocks.push({ source_ref: 'owner://context-overrides/employee-core', text: coreOverride.content, owner: 'owner', inclusion_reason: `audited owner decision ${coreOverride.mutation_id ?? ''}` });
+  } else {
+    throw new Error('CONTEXT_OVERRIDES_CORRUPT');
+  }
+  blocks.push(block(join(contextDir, 'employee-router.md'), 'framework', 'stable dynamic context routing contract'));
   for (const [name, reason] of [
     ['IDENTITY.md', 'Employee identity and role'],
     ['GOALS.md', 'Employee goals and commitments'],
@@ -70,4 +86,18 @@ export function composeEmployeeContext(options: ComposeEmployeeContextOptions): 
     text,
     byte_length: byteLength,
   };
+}
+
+export function materializeContextPacket(packet: EffectiveContextPacket, runtime: ContextHarness) {
+  const packetDigest = digestCrewAuditValue({
+    schema_version: packet.schema_version,
+    builder_version: packet.builder_version,
+    launch_mode: packet.launch_mode,
+    provenance: packet.provenance,
+    routes: packet.routes,
+  });
+  const common = { runtime, packet_digest: packetDigest, routes: packet.routes, provenance: packet.provenance };
+  if (runtime === 'claude-code') return { ...common, native: { append_system_prompt: packet.text } };
+  if (runtime === 'codex-app-server') return { ...common, native: { input: [{ type: 'text', text: packet.text, text_elements: [] }] } };
+  return { ...common, native: { startup_prompt: packet.text } };
 }

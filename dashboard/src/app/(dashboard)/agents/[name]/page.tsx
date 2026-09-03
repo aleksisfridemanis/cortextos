@@ -10,6 +10,7 @@ import { OrgBadge } from '@/components/shared/org-badge';
 import { RuntimeBadge } from '@/components/shared/runtime-badge';
 import { Button } from '@/components/ui/button';
 import type { SoulFields } from '@/lib/types';
+import { ContextOwnershipPanel } from '@/components/agents/context-ownership-panel';
 
 export const dynamic = 'force-dynamic';
 
@@ -91,6 +92,7 @@ export default async function AgentDetailPage({
         soulFields={soulFields}
         tasks={tasks}
       />
+      <ContextOwnershipPanel agentName={systemName} />
     </div>
   );
 }

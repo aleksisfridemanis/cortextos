@@ -13,6 +13,7 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 import { composeEmployeeContext } from '../context/composer.js';
+import { consumeContextHandoff } from '../context/handoff.js';
 
 type LogFn = (msg: string) => void;
 
@@ -878,8 +879,9 @@ export class AgentProcess {
     const nowUtc = new Date().toISOString();
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
-    const handoffBlock = this.consumeHandoffBlock();
-    const isHandoffRestart = handoffBlock.length > 0;
+    const handoff = consumeContextHandoff(this.env.ctxRoot, this.name);
+    const handoffBlock = handoff ? ` CONTEXT HANDOFF:\n${handoff}` : '';
+    const isHandoffRestart = handoff !== null;
     this.lastSpawnWasHandoff = isHandoffRestart;
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
@@ -901,10 +903,12 @@ export class AgentProcess {
       frameworkRoot: this.env.frameworkRoot,
       agentDir: this.env.agentDir,
       ctxRoot: this.env.ctxRoot,
-      mode: 'fresh',
+      mode: isHandoffRestart ? 'continuation' : 'fresh',
       projectRoot: this.config.working_directory,
+      handoff: handoff ?? undefined,
     });
-    return `${packet.text}\n\n${legacyOperationalPrompt}`;
+    const composedOperationalPrompt = legacyOperationalPrompt.replace(handoffBlock, '');
+    return `${packet.text}\n\n${composedOperationalPrompt}`;
   }
 
   private buildContinuePrompt(): string {
@@ -916,7 +920,17 @@ export class AgentProcess {
     const onlineMessage = this.shouldPromptTelegramOnlineMessage()
       ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
       : '';
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
+    const operational = `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your conversation history is preserved. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
+    const contextTemplate = join(this.env.frameworkRoot, 'templates', 'context', 'employee-core.md');
+    if (!existsSync(contextTemplate)) return `${operational} Re-read AGENTS.md and ALL bootstrap files listed there.`;
+    const packet = composeEmployeeContext({
+      frameworkRoot: this.env.frameworkRoot,
+      agentDir: this.env.agentDir,
+      ctxRoot: this.env.ctxRoot,
+      mode: 'continuation',
+      projectRoot: this.config.working_directory,
+    });
+    return `${packet.text}\n\n${operational}`;
   }
 
   private shouldPromptTelegramOnlineMessage(): boolean {
@@ -969,19 +983,6 @@ export class AgentProcess {
    * or an empty string if no marker exists.
    * The marker is unlinked after reading so it fires only once per restart.
    */
-  private consumeHandoffBlock(): string {
-    const markerPath = join(this.env.ctxRoot, 'state', this.name, '.handoff-doc-path');
-    if (!existsSync(markerPath)) return '';
-    try {
-      const docPath = readFileSync(markerPath, 'utf-8').trim();
-      unlinkSync(markerPath);
-      if (!docPath || !existsSync(docPath)) return '';
-      return ` CONTEXT HANDOFF: Before restoring crons or checking inbox, read the handoff document at ${docPath} to resume your prior session state.`;
-    } catch {
-      return '';
-    }
-  }
-
   /**
    * Issue #392 / OpenCode parity: send lifecycle Telegram directly from the
    * daemon for runtimes whose startup/continue prompts are not reliable enough

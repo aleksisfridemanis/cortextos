@@ -711,6 +711,9 @@ export interface BusPaths {
 export type IPCCommandType =
   | 'status'
   | 'create-employee'
+  | 'context-review'
+  | 'context-owner-decision'
+  | 'reconcile-crew'
   | 'start-agent'
   | 'stop-agent'
   | 'restart-agent'
