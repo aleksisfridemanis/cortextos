@@ -279,6 +279,109 @@ export function finalizeCrewMutationAudit(
   });
 }
 
+function readJson(path: string): unknown {
+  return JSON.parse(readFileSync(path, 'utf8')) as unknown;
+}
+
+function workSessionDigest(record: Record<string, unknown>): string {
+  return digestCrewAuditValue({
+    ...record,
+    resume_handle: record.resume_handle ? digestCrewAuditValue(record.resume_handle) : null,
+  });
+}
+
+function workSessionSnapshot(record: Record<string, unknown>): Record<string, unknown> {
+  const { resume_handle: handle, ...snapshot } = record;
+  return { ...snapshot, continuation_digest: handle ? digestCrewAuditValue(handle) : null };
+}
+
+type ReconciliationCertification = CrewMutationFinalResult | 'pending' | null;
+
+function certifyEmployeeCreate(ctxRoot: string, entry: CrewMutationJournalEntry): ReconciliationCertification {
+  try {
+    const registry = readJson(join(ctxRoot, 'config', 'enabled-agents.json')) as Record<string, Record<string, unknown>>;
+    const rooms = readJson(join(ctxRoot, 'config', 'rooms.json')) as Array<Record<string, unknown>>;
+    const employee = registry?.[entry.target.id];
+    const room = Array.isArray(rooms) && employee
+      ? rooms.find(item => item.id === employee.room_id && item.kind === 'agent' && item.agent === entry.target.id)
+      : null;
+    if (!employee || employee.mutation_id !== entry.mutation_id || !room
+      || digestCrewAuditValue(employee) !== entry.intended_after_digest) return null;
+    if (entry.stage === 'prepared') commitCrewMutationState(ctxRoot, entry.mutation_id, entry.intended_after_digest);
+    if (entry.stage !== 'effect_recorded') return 'pending';
+    const receipt = entry.effect_receipt;
+    if (receipt?.mutation_id !== entry.mutation_id || typeof receipt.started !== 'boolean') return null;
+    return { result: 'success', after_digest: entry.intended_after_digest };
+  } catch { return null; }
+}
+
+function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): ReconciliationCertification {
+  let record: Record<string, unknown> | undefined;
+  try {
+    const records = readJson(join(ctxRoot, 'config', 'work-sessions.json')) as Array<Record<string, unknown>>;
+    record = Array.isArray(records) ? records.find(item => item.id === entry.target.id) : undefined;
+  } catch { return null; }
+  if (!record) return null;
+  if (entry.action === 'create' && record.mutation_id !== entry.mutation_id) return null;
+  const receipt = entry.effect_receipt;
+  if (entry.stage !== 'effect_recorded' || !receipt) return 'pending';
+  const afterDigest = workSessionDigest(record);
+  if (entry.action === 'create') {
+    if (receipt.mutation_id !== entry.mutation_id || typeof receipt.runtime_started !== 'boolean') return null;
+    if (receipt.runtime_started) {
+      if (record.lifecycle !== 'active' || !record.resume_handle
+        || receipt.handle_digest !== digestCrewAuditValue(record.resume_handle)) return null;
+      try {
+        const rooms = readJson(join(ctxRoot, 'config', 'rooms.json')) as Array<Record<string, unknown>>;
+        if (!Array.isArray(rooms) || !rooms.some(room => room.id === record!.room_id && room.work_session_id === record!.id)) return null;
+      } catch { return null; }
+      return { result: 'success', after_digest: afterDigest };
+    }
+    return record.lifecycle === 'failed'
+      ? { result: 'failure', after_digest: afterDigest, error_code: 'RUNTIME_START_FAILED', sanitized_error: 'Runtime start failed' }
+      : null;
+  }
+  if (entry.action === 'stop') {
+    if (receipt.mutation_id !== entry.mutation_id || typeof receipt.stopped !== 'boolean') return null;
+    if (receipt.stopped && record.lifecycle === 'archived') {
+      return { result: 'success', after_digest: afterDigest, result_snapshot: workSessionSnapshot(record) };
+    }
+    return !receipt.stopped && record.lifecycle === 'failed'
+      ? { result: 'failure', after_digest: afterDigest, error_code: 'RUNTIME_STOP_FAILED', sanitized_error: 'Runtime stop failed' }
+      : null;
+  }
+  if (entry.action === 'resume') {
+    if (receipt.mutation_id !== entry.mutation_id || typeof receipt.resumed !== 'boolean') return null;
+    if (receipt.resumed && record.lifecycle === 'active'
+      && receipt.handle_digest === digestCrewAuditValue(record.resume_handle)) {
+      return { result: 'success', after_digest: afterDigest, result_snapshot: workSessionSnapshot(record) };
+    }
+    return !receipt.resumed && record.lifecycle === 'failed'
+      ? { result: 'failure', after_digest: afterDigest, error_code: 'RESUME_HANDLE_UNAVAILABLE', sanitized_error: 'Exact runtime resume failed' }
+      : null;
+  }
+  if (entry.action === 'message') {
+    if (receipt.mutation_id !== entry.mutation_id || receipt.delivered !== true || typeof record.room_id !== 'string') return null;
+    try {
+      const lines = readFileSync(join(ctxRoot, 'rooms', record.room_id, 'log.jsonl'), 'utf8').split('\n');
+      if (!lines.some(line => {
+        try { return JSON.parse(line)?.id === entry.mutation_id; } catch { return false; }
+      })) return null;
+    } catch { return null; }
+    return { result: 'success', after_digest: afterDigest };
+  }
+  if (entry.action === 'promote') {
+    if (receipt.mutation_id !== entry.mutation_id || typeof receipt.employee_created !== 'boolean') return null;
+    if (receipt.employee_created && record.lifecycle === 'archived' && typeof record.promoted_employee === 'string') {
+      return { result: 'success', after_digest: afterDigest };
+    }
+    return !receipt.employee_created
+      ? { result: 'failure', after_digest: afterDigest, error_code: 'PROMOTION_FAILED', sanitized_error: 'Employee promotion failed' }
+      : null;
+  }
+  return null;
+}
+
 export function reconcileCrewMutationJournal(ctxRoot: string): { finalized: number; pending: number } {
   let finalized = 0;
   for (const entry of listPendingCrewMutations(ctxRoot)) {
@@ -305,13 +408,24 @@ export function reconcileCrewMutationJournal(ctxRoot: string): { finalized: numb
       }
       continue;
     }
-    const result: CrewMutationFinalResult = entry.stage === 'prepared'
-      ? { result: 'failure', after_digest: entry.before_digest, error_code: 'INTERRUPTED_BEFORE_STATE', sanitized_error: 'Interrupted before durable state' }
-      : entry.stage === 'effect_recorded'
-        ? { result: 'success', after_digest: entry.state_digest ?? entry.intended_after_digest }
-        : { result: 'indeterminate', after_digest: entry.state_digest ?? entry.intended_after_digest, error_code: 'RECOVERY_REQUIRED', sanitized_error: 'Operator recovery required' };
-    finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, result);
-    finalized += 1;
+    const certified = entry.target.kind === 'employee' && entry.action === 'create'
+      ? certifyEmployeeCreate(ctxRoot, entry)
+      : entry.target.kind === 'work_session'
+        ? certifyWorkSession(ctxRoot, entry)
+        : null;
+    if (certified === 'pending') continue;
+    if (certified) {
+      finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, certified);
+      finalized += 1;
+      continue;
+    }
+    if (entry.stage === 'prepared' && entry.action === 'create') {
+      finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, {
+        result: 'failure', after_digest: entry.before_digest,
+        error_code: 'INTERRUPTED_BEFORE_STATE', sanitized_error: 'Interrupted before durable state',
+      });
+      finalized += 1;
+    }
   }
   return { finalized, pending: listPendingCrewMutations(ctxRoot).length };
 }
