@@ -626,6 +626,30 @@ describe('POST /api/comms/upload', () => {
     expect(fs.readFileSync(path.join(rootTmp, saved.path))).toEqual(bytes);
   });
 
+  it('parses the same multipart bytes across arbitrary transport chunk boundaries', async () => {
+    const boundary = 'chunk-independent';
+    const bytes = Buffer.from('exact-image-bytes');
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="split.png"\r\nContent-Type: image/png\r\n\r\n`),
+      bytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    let offset = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset >= body.length) return controller.close();
+        const size = (offset % 7) + 1;
+        controller.enqueue(body.subarray(offset, Math.min(body.length, offset + size)));
+        offset += size;
+      },
+    });
+    const res = await upload.POST(new NextRequest('http://localhost/api/comms/upload', {
+      method: 'POST', headers: { 'content-type': `multipart/form-data; boundary=${boundary}` }, body: stream,
+    }));
+    expect(res.status).toBe(200);
+    expect(fs.readFileSync(path.join(rootTmp, (await res.json()).path))).toEqual(bytes);
+  });
+
   it('sweeps only old validated upload temp identities', () => {
     const dir = path.join(rootTmp, 'media', 'dashboard-uploads');
     fs.mkdirSync(dir, { recursive: true });
