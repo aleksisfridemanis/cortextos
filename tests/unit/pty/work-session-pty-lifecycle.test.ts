@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { WorkSessionPTY } from '../../../src/pty/work-session-pty.js';
+import { WorkSessionPTY, buildClaudeWorkSessionLaunch, claudeInitIsIsolated } from '../../../src/pty/work-session-pty.js';
 import type { WorkSessionRecord } from '../../../src/work-sessions/types.js';
 
 const native = vi.hoisted(() => ({
@@ -50,6 +50,26 @@ describe('WorkSessionPTY owned lifecycle', () => {
       state.resolveExit = null;
     };
   }
+
+  it('requires Claude safe mode and rejects every ambient init source', () => {
+    const launch = buildClaudeWorkSessionLaunch({ cwd, sessionId: '11111111-1111-4111-8111-111111111111', resume: false });
+    expect(launch.args).toContain('--safe-mode');
+    expect(claudeInitIsIsolated({ memory_paths: {}, agents: [], plugins: [] })).toBe(true);
+    for (const field of ['memory_paths', 'agents', 'plugins', 'skills', 'commands', 'mcp_servers']) {
+      expect(claudeInitIsIsolated({ [field]: field === 'memory_paths' ? { auto: '/private/memory' } : ['ambient'] })).toBe(false);
+    }
+  });
+
+  it('fails Claude exact resume before spawning an unacknowledged process', async () => {
+    record.harness = 'claude-code';
+    adapter = new WorkSessionPTY({ ctxRoot: join(cwd, 'ctx'), frameworkRoot: cwd, instanceId: 'test', record, timeoutMs: 1_000 });
+    const spawn = vi.spyOn(adapter as never, 'spawn' as never);
+    await expect(adapter.resumeExact(
+      { runtime: 'claude-code', session_id: '11111111-1111-4111-8111-111111111111' },
+      { id: record.id, mutation_id: record.mutation_id, cwd },
+    )).rejects.toThrow(/RUNTIME_AUTH_UNAVAILABLE|RESUME_HANDLE_UNAVAILABLE/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
 
   it('does not resolve stop or release process ownership until exit is observed', async () => {
     attachNativeProcess();

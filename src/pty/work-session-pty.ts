@@ -43,11 +43,23 @@ export function buildClaudeWorkSessionLaunch(input: { cwd: string; sessionId: st
     ? ['--resume', input.sessionId]
     : ['--session-id', input.sessionId]));
   args.push('--permission-mode', 'manual');
-  args.push('--setting-sources', '', '--disable-slash-commands', '--strict-mcp-config');
+  // Safe mode is the documented OAuth-compatible isolation boundary. We still
+  // verify the init frame below because an older CLI that ignores the flag is
+  // not safe enough for session-only context.
+  args.push('--safe-mode', '--setting-sources', '', '--disable-slash-commands', '--strict-mcp-config');
   if (input.mcpConfigPath) args.push('--mcp-config', input.mcpConfigPath);
   if (input.settingsPath) args.push('--settings', input.settingsPath);
   if (input.model) args.push('--model', input.model);
   return { command: 'claude', args, cwd: input.cwd, env: workSessionChildEnv(process.env) };
+}
+
+const CLAUDE_AMBIENT_SOURCE_FIELDS = ['memory_paths', 'agents', 'plugins', 'skills', 'commands', 'mcp_servers'] as const;
+
+export function claudeInitIsIsolated(frame: Record<string, unknown>): boolean {
+  const nonEmpty = (value: unknown): boolean => Array.isArray(value) ? value.length > 0
+    : value !== null && typeof value === 'object' ? Object.keys(value as object).length > 0
+    : typeof value === 'string' ? value.length > 0 : value === true;
+  return CLAUDE_AMBIENT_SOURCE_FIELDS.every(field => !nonEmpty(frame[field]));
 }
 
 interface CodexRequest { method: string; params: Record<string, unknown> }
@@ -268,6 +280,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private outputSequence = 0;
   private acpTurnText = '';
   private claudeSessionId: string | null = null;
+  private claudeIsolationError: Error | null = null;
   private readonly claudeTurnResults: Array<true | Error> = [];
   private ambientOpenCodeCommands = false;
   private readonly codexTurnCompletions: Array<string | Error> = [];
@@ -585,6 +598,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         const value = JSON.parse(line) as { id?: unknown; method?: unknown; result?: unknown; error?: unknown; params?: unknown; type?: unknown; subtype?: unknown; session_id?: unknown; is_error?: unknown; message?: unknown };
         if (value.type === 'system' && value.subtype === 'init' && typeof value.session_id === 'string') {
           this.claudeSessionId = value.session_id;
+          if (!claudeInitIsIsolated(value)) this.claudeIsolationError = new Error('AMBIENT_CONFIG_DETECTED');
         }
         if (value.type === 'result') {
           this.claudeTurnResults.push(value.is_error === true
@@ -763,6 +777,15 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private async startClaude(input: { cwd: string; model?: string }, resumeId?: string, initialText?: string) {
     const sessionId = resumeId ?? randomUUID();
     this.claudeSessionId = null;
+    this.claudeIsolationError = null;
+    if (resumeId) {
+      // Claude's CLI has no non-conversational exact-handle probe. `--resume`
+      // can exit before stdin (or copy a live session), so never publish an
+      // active lease from that unacknowledged process.
+      const auth = JSON.parse(execFileSync('claude', ['auth', 'status', '--json'], { encoding: 'utf8', timeout: this.timeoutMs })) as { loggedIn?: unknown };
+      if (auth.loggedIn !== true) throw new Error('RUNTIME_AUTH_UNAVAILABLE');
+      throw new Error('RESUME_HANDLE_UNAVAILABLE');
+    }
     const stateDir = join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id);
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const ackPath = join(stateDir, 'claude-session-ack.json');
@@ -778,12 +801,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     writeFileSync(mcpConfigPath, `${JSON.stringify({ mcpServers: {} }, null, 2)}\n`, { mode: 0o600 });
     chmodSync(settingsPath, 0o600);
     const spec = buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId, resume: !!resumeId, settingsPath, mcpConfigPath });
-    if (resumeId) {
-      const auth = JSON.parse(execFileSync('claude', ['auth', 'status', '--json'], { encoding: 'utf8', timeout: this.timeoutMs })) as { loggedIn?: unknown };
-      if (auth.loggedIn !== true) throw new Error('RUNTIME_AUTH_UNAVAILABLE');
-    }
     this.spawn(spec.command, spec.args, spec.cwd, this.env());
-    if (resumeId) return { resume_handle: { runtime: 'claude-code' as const, session_id: sessionId } };
     try {
       this.claudeTurnResults.length = 0;
       this.ready = initialText !== 'Initialize this Work Session.';
@@ -802,6 +820,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const ackPath = this.claudeAckPath;
     if (!ackPath) throw new Error('RESUME_HANDLE_UNAVAILABLE');
     await waitFor(() => {
+      if (this.claudeIsolationError) throw this.claudeIsolationError;
       if (this.claudeSessionId && this.claudeSessionId !== sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
       if (!existsSync(ackPath) || this.claudeSessionId !== sessionId) return undefined;
       const siblings = readdirSync(dirname(ackPath)).filter(name => name.startsWith('claude-session-ack'));
