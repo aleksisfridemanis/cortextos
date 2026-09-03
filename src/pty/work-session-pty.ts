@@ -62,6 +62,13 @@ export function claudeInitIsIsolated(frame: Record<string, unknown>): boolean {
   return CLAUDE_AMBIENT_SOURCE_FIELDS.every(field => !nonEmpty(frame[field]));
 }
 
+export function claudeIsolatedReporterAuthSupported(status: Record<string, unknown>): boolean {
+  // The installed CLI documents that bare/safe isolation disables keychain
+  // hooks/auth combinations. OAuth-only installs therefore cannot satisfy the
+  // simultaneous isolation + reporter contract and must fail before prompting.
+  return status.loggedIn === true && status.authMethod === 'api_key';
+}
+
 interface CodexRequest { method: string; params: Record<string, unknown> }
 export function buildCodexWorkSessionLaunch(input: { cwd: string; model?: string; threadId?: string }) {
   const shared = { cwd: input.cwd, model: input.model, sandbox: 'workspace-write', approvalPolicy: 'never', allowProviderModelFallback: false };
@@ -792,12 +799,15 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const sessionId = resumeId ?? randomUUID();
     this.claudeSessionId = null;
     this.claudeIsolationError = null;
+    const auth = JSON.parse(execFileSync('claude', ['auth', 'status', '--json'], { encoding: 'utf8', timeout: this.timeoutMs })) as Record<string, unknown>;
+    if (!claudeIsolatedReporterAuthSupported(auth)) {
+      if (auth.loggedIn !== true) throw new Error('RUNTIME_AUTH_UNAVAILABLE');
+      throw new Error('RUNTIME_UNSUPPORTED');
+    }
     if (resumeId) {
       // Claude's CLI has no non-conversational exact-handle probe. `--resume`
       // can exit before stdin (or copy a live session), so never publish an
       // active lease from that unacknowledged process.
-      const auth = JSON.parse(execFileSync('claude', ['auth', 'status', '--json'], { encoding: 'utf8', timeout: this.timeoutMs })) as { loggedIn?: unknown };
-      if (auth.loggedIn !== true) throw new Error('RUNTIME_AUTH_UNAVAILABLE');
       throw new Error('RESUME_HANDLE_UNAVAILABLE');
     }
     const stateDir = join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id);

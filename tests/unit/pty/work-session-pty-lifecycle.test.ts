@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { WorkSessionPTY, buildClaudeWorkSessionLaunch, claudeInitIsIsolated } from '../../../src/pty/work-session-pty.js';
+import { WorkSessionPTY, buildClaudeWorkSessionLaunch, claudeInitIsIsolated, claudeIsolatedReporterAuthSupported } from '../../../src/pty/work-session-pty.js';
 import type { WorkSessionRecord } from '../../../src/work-sessions/types.js';
 
 const native = vi.hoisted(() => ({
@@ -58,6 +58,8 @@ describe('WorkSessionPTY owned lifecycle', () => {
     for (const field of ['memory_paths', 'agents', 'plugins', 'skills', 'commands', 'mcp_servers']) {
       expect(claudeInitIsIsolated({ [field]: field === 'memory_paths' ? { auto: '/private/memory' } : ['ambient'] })).toBe(false);
     }
+    expect(claudeIsolatedReporterAuthSupported({ loggedIn: true, authMethod: 'claude.ai' })).toBe(false);
+    expect(claudeIsolatedReporterAuthSupported({ loggedIn: true, authMethod: 'api_key' })).toBe(true);
   });
 
   it('fails Claude exact resume before spawning an unacknowledged process', async () => {
@@ -67,7 +69,7 @@ describe('WorkSessionPTY owned lifecycle', () => {
     await expect(adapter.resumeExact(
       { runtime: 'claude-code', session_id: '11111111-1111-4111-8111-111111111111' },
       { id: record.id, mutation_id: record.mutation_id, cwd },
-    )).rejects.toThrow(/RUNTIME_AUTH_UNAVAILABLE|RESUME_HANDLE_UNAVAILABLE/);
+    )).rejects.toThrow(/RUNTIME_AUTH_UNAVAILABLE|RUNTIME_UNSUPPORTED|RESUME_HANDLE_UNAVAILABLE/);
     expect(spawn).not.toHaveBeenCalled();
   });
 

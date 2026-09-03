@@ -92,7 +92,7 @@ const path = require('path');
 const args = process.argv.slice(2);
 fs.writeFileSync(path.join(process.cwd(), 'launch-args.json'), JSON.stringify(args));
 if (args[0] === 'auth' && args[1] === 'status') {
-  process.stdout.write(JSON.stringify({ loggedIn: true }));
+  process.stdout.write(JSON.stringify({ loggedIn: true, authMethod: 'api_key' }));
   process.exit(0);
 }
 const settingsPath = args[args.indexOf('--settings') + 1];
