@@ -102,3 +102,21 @@ jobs:
 
       - name: Run dashboard route and Crew tests
         run: npm test
+
+  windows-process-identity:
+    name: Windows Process Identity
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify native process identity and Crew startup boundaries
+        run: npm test -- tests/unit/utils/process-identity.test.ts tests/unit/daemon/agent-manager.test.ts tests/unit/pty/work-session-adapters.test.ts

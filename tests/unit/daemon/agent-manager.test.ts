@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildReplyContext } from '../../../src/daemon/agent-manager.js';
@@ -72,6 +72,8 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
       name: 'alice', org: 'acme', agent_dir: join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'),
       mutation_id: '11111111-1111-4111-8111-111111111111',
     })).rejects.toThrow('EMPLOYEE_START_NOT_READY');
+    expect(JSON.parse(readFileSync(join(ctxRoot, 'state', 'employee-start-receipts', '11111111-1111-4111-8111-111111111111.json'), 'utf8')))
+      .toMatchObject({ started: false, disposition: 'failed', pid: null });
 
     const identity = captureProcessIdentity(process.pid)!;
     vi.spyOn(am, 'getAgentStatus')

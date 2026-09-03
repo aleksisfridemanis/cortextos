@@ -3,8 +3,9 @@ import { isAbsolute, join } from 'path';
 import { existsSync, lstatSync, mkdirSync } from 'fs';
 import { digestCrewAuditValue } from '../audit/crew-lifecycle-audit.js';
 import {
-  claimCrewMutationLease, commitCrewMutationState, finalizeCrewMutationAudit, getCrewMutation, prepareCrewMutation,
+  beginCrewMutationOperation, claimCrewMutationLease, commitCrewMutationState, currentCrewMutationOperationToken, finalizeCrewMutationAudit, getCrewMutation, prepareCrewMutation,
   listPendingCrewMutations, readCrewMutationJournal, reconcileCrewMutationJournal, recordCrewMutationEffect, startCrewMutationEffect,
+  releaseCrewMutationOperation,
 } from '../audit/crew-mutation-journal.js';
 import {
   createPromotedEmployee,
@@ -112,6 +113,22 @@ export class WorkSessionManager {
           const adapter = this.adapter(record);
           const runtime = adapter.status();
           if (runtime.running) {
+            if (!adapter.getResumeHandle()) {
+              this.validateRuntimeOwner(adapter.getRuntimeOwner?.() ?? null, entry.mutation_id);
+              await adapter.stop();
+              this.assertRuntimeStopped(adapter);
+              record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['starting', 'active'], 'failed', {
+                last_error: 'RESUME_HANDLE_MISSING', runtime_owner: null,
+              }, entry.mutation_id);
+              recordCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id, {
+                mutation_id: entry.mutation_id, runtime_started: false, recovered: true, orphan_terminated: true,
+              });
+              finalizeCrewMutationAudit(this.dependencies.ctxRoot, entry.mutation_id, {
+                result: 'failure', after_digest: stateDigest(record), error_code: 'RESUME_HANDLE_MISSING',
+                sanitized_error: 'Runtime was terminated because continuation discovery did not complete',
+              });
+              continue;
+            }
             record = this.recoverOwnedRuntime(record, adapter, entry.mutation_id);
             recordCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id, {
               mutation_id: entry.mutation_id, runtime_started: true, recovered: true,
@@ -175,7 +192,10 @@ export class WorkSessionManager {
   }
 
   private assertTargetAvailable(targetId: string, mutationId: string): void {
-    reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+    reconcileCrewMutationJournal(this.dependencies.ctxRoot, {
+      frameworkRoot: this.dependencies.frameworkRoot,
+      ownerToken: currentCrewMutationOperationToken(mutationId),
+    });
     const pending = listPendingCrewMutations(this.dependencies.ctxRoot)
       .find(entry => entry.target.kind === 'work_session' && entry.target.id === targetId && entry.mutation_id !== mutationId);
     if (pending) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session has a pending mutation');
@@ -275,12 +295,13 @@ export class WorkSessionManager {
       }
       return current.promise as Promise<T>;
     }
+    const leaseToken = beginCrewMutationOperation(mutationId);
     const promise = Promise.resolve().then(operation);
     const descriptor = { ...binding, promise: promise as Promise<unknown> };
     workSessionMutationRuns.set(key, descriptor);
     void promise.then(
-      () => { if (workSessionMutationRuns.get(key) === descriptor) workSessionMutationRuns.delete(key); },
-      () => { if (workSessionMutationRuns.get(key) === descriptor) workSessionMutationRuns.delete(key); },
+      () => { if (workSessionMutationRuns.get(key) === descriptor) workSessionMutationRuns.delete(key); releaseCrewMutationOperation(mutationId, leaseToken); },
+      () => { if (workSessionMutationRuns.get(key) === descriptor) workSessionMutationRuns.delete(key); releaseCrewMutationOperation(mutationId, leaseToken); },
     );
     return promise;
   }
@@ -356,7 +377,7 @@ export class WorkSessionManager {
         throw new WorkSessionRegistryError(prior.final_result?.error_code ?? 'RECOVERY_REQUIRED', prior.final_result?.sanitized_error ?? 'Work Session creation failed');
       }
       if (['effect_recorded', 'audit_written'].includes(prior.stage)) {
-        reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+        reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot, ownerToken: currentCrewMutationOperationToken(mutationId) });
         const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
         if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return this.originalResult(reconciled);
         throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session creation requires reconciliation');
@@ -387,6 +408,23 @@ export class WorkSessionManager {
               }, mutationId);
             }
           } else {
+            if (!this.adapter(recoveryRecord).getResumeHandle()) {
+              const adapter = this.adapter(recoveryRecord);
+              this.validateRuntimeOwner(adapter.getRuntimeOwner?.() ?? null, mutationId);
+              await adapter.stop();
+              this.assertRuntimeStopped(adapter);
+              const failed = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'failed', {
+                last_error: 'RESUME_HANDLE_MISSING', runtime_owner: null,
+              }, mutationId);
+              recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, {
+                runtime_started: false, recovered: true, orphan_terminated: true, mutation_id: mutationId,
+              });
+              finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+                result: 'failure', after_digest: stateDigest(failed), error_code: 'RESUME_HANDLE_MISSING',
+                sanitized_error: 'Runtime was terminated because continuation discovery did not complete',
+              });
+              throw new WorkSessionRegistryError('RESUME_HANDLE_MISSING', 'Runtime continuation discovery did not complete');
+            }
             recoveryRecord = this.recoverOwnedRuntime(recoveryRecord, this.adapter(recoveryRecord), mutationId);
           }
           if (!recoveryRecord.resume_handle) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Recovered Work Session handle is unavailable');
@@ -399,6 +437,7 @@ export class WorkSessionManager {
           });
           return recoveryRecord;
         } catch (error) {
+          if (getCrewMutation(this.dependencies.ctxRoot, mutationId)?.stage === 'finalized') throw error;
           if (this.adapter(recoveryRecord).status().running || this.adapter(recoveryRecord).status().ownership === 'unknown') {
             transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
             throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
@@ -510,7 +549,7 @@ export class WorkSessionManager {
       throw new WorkSessionRegistryError('DELIVERY_RETRY_REQUIRED', 'Message delivery outcome is uncertain');
     }
     if (prior && ['effect_recorded', 'audit_written'].includes(prior.stage)) {
-      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot, ownerToken: currentCrewMutationOperationToken(mutationId) });
       const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
       if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return;
       throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Message delivery requires reconciliation');
@@ -553,7 +592,7 @@ export class WorkSessionManager {
     const prior = this.priorMutation(mutationId, actor, 'stop', id, { id });
     if (prior?.stage === 'finalized') return this.originalResult(prior);
     if (prior && ['effect_recorded', 'audit_written'].includes(prior.stage)) {
-      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot, ownerToken: currentCrewMutationOperationToken(mutationId) });
       const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
       if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return this.originalResult(reconciled);
       throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session stop requires reconciliation');
@@ -639,7 +678,7 @@ export class WorkSessionManager {
     const prior = this.priorMutation(mutationId, actor, 'resume', id, request);
     if (prior?.stage === 'finalized') return this.originalResult(prior);
     if (prior && ['effect_recorded', 'audit_written'].includes(prior.stage)) {
-      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot, ownerToken: currentCrewMutationOperationToken(mutationId) });
       const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
       if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return this.originalResult(reconciled);
       throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session resume requires reconciliation');
@@ -727,7 +766,7 @@ export class WorkSessionManager {
     const prior = this.priorMutation(mutationId, input.actor, 'promote', id, request);
     if (prior?.stage === 'finalized') return;
     if (prior && ['effect_recorded', 'audit_written'].includes(prior.stage)) {
-      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot, ownerToken: currentCrewMutationOperationToken(mutationId) });
       const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
       if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return;
       throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session promotion requires reconciliation');

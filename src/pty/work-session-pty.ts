@@ -6,7 +6,9 @@ import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
 import type { WorkSessionRecord } from '../work-sessions/types.js';
 import type { WorkSessionLaunchInput, WorkSessionResumeHandle, WorkSessionRuntimeAdapter } from '../work-sessions/types.js';
-import { captureProcessIdentity, probeProcessIdentity, type ProcessIdentity } from '../utils/process-identity.js';
+import {
+  captureProcessIdentity, probeProcessGroup, probeProcessIdentity, signalProcessTree, type ProcessIdentity,
+} from '../utils/process-identity.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 
 const CHILD_ENV_ALLOWLIST = ['PATH', 'HOME', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'] as const;
@@ -230,6 +232,11 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         ? await this.startCodex(input, undefined)
         : await this.startOpenCode(input, undefined);
     this.currentHandle = result.resume_handle;
+    const owner = this.requireCurrentOwner(input.mutation_id);
+    // The continuation becomes restart-critical the instant discovery succeeds.
+    // Persist it before the optional initial message introduces another await/crash
+    // boundary, so restart can resume rather than treating a known handle as lost.
+    this.persistRuntimeReceipt(owner, result.resume_handle);
     try {
       if (input.context) await this.send(input.context);
     } catch (error) {
@@ -237,8 +244,6 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       throw error;
     }
     this.ready = true;
-    const owner = this.requireCurrentOwner(input.mutation_id);
-    this.persistRuntimeReceipt(owner, result.resume_handle);
     return { ...result, runtime_owner: owner };
   }
 
@@ -279,39 +284,26 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     if (!pty) {
       const owner = this.currentOwner ?? this.options.record.runtime_owner;
       if (!owner) return;
-      const before = probeProcessIdentity(owner);
-      if (before === 'dead') { this.clearRuntimeReceipt(); return; }
-      if (before === 'unknown') throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
-      try { process.kill(owner.pid, 'SIGTERM'); } catch { /* probe below is authoritative */ }
-      try {
-        await waitFor(() => {
-          const state = probeProcessIdentity(owner);
-          return state === 'dead' ? true : undefined;
-        }, this.timeoutMs);
-      } catch {
-        if (probeProcessIdentity(owner) !== 'alive') throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
-        try { process.kill(owner.pid, 'SIGKILL'); } catch { /* probe below is authoritative */ }
-        try {
-          await waitFor(() => {
-            const state = probeProcessIdentity(owner);
-            return state === 'dead' ? true : undefined;
-          }, this.timeoutMs);
-        } catch { throw new Error('WORK_SESSION_STOP_UNCONFIRMED'); }
-      }
+      await this.terminateOwnedTree(owner);
       this.clearRuntimeReceipt();
       return;
     }
     const exit = this.exitPromise;
     if (!exit) throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
+    if (this.currentOwner) {
+      try { signalProcessTree(this.currentOwner, 'SIGTERM'); } catch { /* PTY kill and proof below remain authoritative */ }
+    }
     try { pty.kill('SIGTERM'); } catch { /* confirm via the exit signal below */ }
     try {
       await this.awaitExit(exit, this.timeoutMs);
+      if (this.currentOwner) await this.terminateOwnedTree(this.currentOwner);
       this.clearRuntimeReceipt();
       return;
     } catch { /* bounded graceful stop elapsed; escalate */ }
     try { pty.kill('SIGKILL'); } catch { /* confirm via the exit signal below */ }
     try {
       await this.awaitExit(exit, this.timeoutMs);
+      if (this.currentOwner) await this.terminateOwnedTree(this.currentOwner);
       this.clearRuntimeReceipt();
     } catch {
       throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
@@ -373,6 +365,23 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private requireCurrentOwner(mutationId: string): ProcessIdentity & { mutation_id: string } {
     if (!this.currentOwner || this.currentOwner.mutation_id !== mutationId) throw new Error('PROCESS_IDENTITY_UNAVAILABLE');
     return this.currentOwner;
+  }
+
+  private async terminateOwnedTree(owner: ProcessIdentity): Promise<void> {
+    const before = probeProcessGroup(owner);
+    if (before === 'dead') return;
+    if (before === 'unknown') throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
+    try { signalProcessTree(owner, 'SIGTERM'); } catch { /* probe below is authoritative */ }
+    try {
+      await waitFor(() => probeProcessGroup(owner) === 'dead' ? true : undefined, this.timeoutMs);
+      return;
+    } catch { /* escalate below */ }
+    const remaining = probeProcessGroup(owner);
+    if (remaining !== 'alive') throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
+    try { signalProcessTree(owner, 'SIGKILL'); } catch { /* probe below is authoritative */ }
+    try {
+      await waitFor(() => probeProcessGroup(owner) === 'dead' ? true : undefined, this.timeoutMs);
+    } catch { throw new Error('WORK_SESSION_STOP_UNCONFIRMED'); }
   }
 
   private assertCanonicalCwd(cwd: string): void {

@@ -32,6 +32,8 @@ function assertRecord(value: unknown): asserts value is WorkSessionRecord {
   }
   if (row.runtime_owner && (!Number.isSafeInteger(row.runtime_owner.pid) || row.runtime_owner.pid < 1
     || typeof row.runtime_owner.started_at !== 'string' || !row.runtime_owner.started_at
+    || (row.runtime_owner.process_group_id !== undefined && row.runtime_owner.process_group_id !== null
+      && (!Number.isSafeInteger(row.runtime_owner.process_group_id) || row.runtime_owner.process_group_id < 1))
     || !UUID.test(row.runtime_owner.mutation_id))) {
     throw new WorkSessionRegistryError('REGISTRY_CORRUPT', 'Work Session registry requires operator recovery');
   }

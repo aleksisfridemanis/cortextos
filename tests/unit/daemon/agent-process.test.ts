@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Capture the PTY exit handler so tests can simulate exits at controlled times
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
+let bootstrapped = true;
 
 const mockPty = {
   spawn: vi.fn().mockResolvedValue(undefined),
@@ -10,6 +11,7 @@ const mockPty = {
   getPid: vi.fn().mockReturnValue(12345),
   isAlive: vi.fn().mockReturnValue(true),
   isAwaitingInteractiveConfirmation: vi.fn().mockReturnValue(false),
+  getOutputBuffer: vi.fn(() => ({ isBootstrapped: () => bootstrapped })),
   onExit: vi.fn().mockImplementation((cb: (exitCode: number, signal?: number) => void) => {
     capturedOnExit = cb;
   }),
@@ -95,6 +97,7 @@ const mockEnv = {
 };
 
 beforeEach(() => {
+  bootstrapped = true;
   capturedOnExit = null;
   mockPty.spawn.mockClear();
   mockPty.kill.mockClear();
@@ -114,6 +117,20 @@ beforeEach(() => {
 });
 
 describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
+  it('does not acknowledge mutation readiness before harness bootstrap', async () => {
+    vi.useFakeTimers();
+    bootstrapped = false;
+    const ready = vi.fn();
+    const ap = new AgentProcess('alice', mockEnv, {});
+    const starting = ap.start(ready);
+    await vi.advanceTimersByTimeAsync(70_000);
+    await starting;
+    expect(ready).not.toHaveBeenCalled();
+    expect(mockPty.kill).toHaveBeenCalled();
+    expect(ap.getStatus().status).toBe('crashed');
+    vi.useRealTimers();
+  });
+
   it('stop() awaits the PTY exit handler before resolving', async () => {
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();

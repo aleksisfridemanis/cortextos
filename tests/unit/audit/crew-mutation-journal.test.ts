@@ -18,8 +18,23 @@ import {
 import { digestCrewAuditValue } from '../../../src/audit/crew-lifecycle-audit.js';
 import { createWorkSessionRecord, readWorkSessions, transitionWorkSession } from '../../../src/work-sessions/registry.js';
 import { upsertRoom } from '../../../src/rooms/registry.js';
+import { captureProcessIdentity } from '../../../src/utils/process-identity.js';
 
 describe('Crew mutation journal', () => {
+  it('atomically rejects a second pending mutation for the same target', () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-target-'));
+    try {
+      const base = {
+        actor: 'owner:1', target: { kind: 'work_session' as const, id: 'ws-shared' }, action: 'stop' as const,
+        request_digest: '1'.repeat(64), before_digest: '2'.repeat(64), intended_after_digest: '3'.repeat(64),
+      };
+      prepareCrewMutation(root, { ...base, mutation_id: '11111111-1111-4111-8111-111111111111', idempotency_key: '11111111-1111-4111-8111-111111111111' });
+      expect(() => prepareCrewMutation(root, { ...base, mutation_id: '22222222-2222-4222-8222-222222222222', idempotency_key: '22222222-2222-4222-8222-222222222222' }))
+        .toThrow('MUTATION_PENDING');
+      expect(listPendingCrewMutations(root)).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('persists prepare before state/effect/audit and converges idempotently', () => {
     const root = mkdtempSync(join(tmpdir(), 'crew-journal-'));
     try {
@@ -216,6 +231,37 @@ describe('Crew mutation journal', () => {
     }
   });
 
+  it('finalizes a durably recorded Employee start even when the runtime later exits', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-employee-receipt-'));
+    const frameworkRoot = join(root, 'framework');
+    const ctxRoot = join(root, 'ctx');
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      const id = '89888888-8888-4888-8888-888888888888';
+      const identity = captureProcessIdentity(child.pid!)!;
+      const employee = { org: 'platform', room_id: 'agent-ada', mutation_id: id };
+      mkdirSync(join(frameworkRoot, 'orgs', 'platform', 'agents', 'ada'), { recursive: true });
+      mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+      writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), JSON.stringify({ ada: employee }));
+      writeFileSync(join(ctxRoot, 'config', 'rooms.json'), JSON.stringify([{ id: 'agent-ada', kind: 'agent', agent: 'ada' }]));
+      prepareCrewMutation(ctxRoot, {
+        mutation_id: id, idempotency_key: id, actor: 'owner:1', target: { kind: 'employee', id: 'ada' }, action: 'create',
+        request_digest: '1'.repeat(64), before_digest: digestCrewAuditValue(null), intended_after_digest: digestCrewAuditValue(employee),
+      });
+      commitCrewMutationState(ctxRoot, id, digestCrewAuditValue(employee));
+      startCrewMutationEffect(ctxRoot, id);
+      const canonical = { mutation_id: id, name: 'ada', started: true, pid: identity.pid, process_started_at: identity.started_at, disposition: 'running' };
+      recordCrewMutationEffect(ctxRoot, id, { ...canonical, receipt_digest: digestCrewAuditValue(canonical) });
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+      expect(reconcileCrewMutationJournal(ctxRoot, { frameworkRoot })).toEqual({ finalized: 1, pending: 0 });
+      expect(getCrewMutation(ctxRoot, id)?.final_result).toMatchObject({ result: 'success' });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('releases a mutation-owned Work Session cwd lease left before room publication', () => {
     const root = mkdtempSync(join(tmpdir(), 'crew-journal-work-crash-'));
     const cwd = join(root, 'project');
@@ -272,7 +318,7 @@ describe('Crew mutation journal', () => {
     }
   });
 
-  it('advances exact prepared Work Session publications and transitions after process death', () => {
+  it('advances exact prepared Work Session publication without admitting a competing target transition', () => {
     const root = mkdtempSync(join(tmpdir(), 'crew-journal-prepared-state-'));
     const cwd = join(root, 'project');
     mkdirSync(cwd);
@@ -295,13 +341,11 @@ describe('Crew mutation journal', () => {
       expect(getCrewMutation(root, createId)?.stage).toBe('state_committed');
 
       const stopId = 'b2222222-2222-4222-8222-222222222222';
-      prepareCrewMutation(root, {
+      expect(() => prepareCrewMutation(root, {
         mutation_id: stopId, idempotency_key: stopId, actor: 'owner:1', target: { kind: 'work_session', id: target }, action: 'stop',
         request_digest: '4'.repeat(64), before_digest: '5'.repeat(64), intended_after_digest: '6'.repeat(64),
-      });
-      transitionWorkSession(root, target, ['starting'], 'stopping', {}, stopId);
-      reconcileCrewMutationJournal(root);
-      expect(getCrewMutation(root, stopId)?.stage).toBe('state_committed');
+      })).toThrow('MUTATION_PENDING');
+      expect(getCrewMutation(root, stopId)).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

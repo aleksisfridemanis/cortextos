@@ -149,6 +149,9 @@ describe('WorkSessionManager', () => {
     expect(joined).toBe(sent);
     await expect(wrong).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
     await vi.waitFor(() => expect(adapter.send).toHaveBeenCalledTimes(1));
+    expect(getCrewMutation(roots.at(-1)! + '/ctx', sendId)?.stage).toBe('effect_started');
+    expect(reconcileCrewMutationJournal(roots.at(-1)! + '/ctx')).toEqual({ finalized: 0, pending: 1 });
+    expect(getCrewMutation(roots.at(-1)! + '/ctx', sendId)?.stage).toBe('effect_started');
     releaseSend();
     await sent;
   });
@@ -443,7 +446,7 @@ describe('WorkSessionManager', () => {
 
   it('retains a live runtime lease across manager restart and releases it only after exact process death', async () => {
     const { manager, adapter, cwd, ctxRoot } = fixture();
-    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: true });
     try {
       const identity = await vi.waitFor(() => {
         const value = captureProcessIdentity(child.pid!);
@@ -487,7 +490,7 @@ describe('WorkSessionManager', () => {
 
   it('terminates the exact detached child before archiving on stop after manager restart', async () => {
     const { manager, adapter, cwd, ctxRoot } = fixture();
-    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: true });
     try {
       const identity = await vi.waitFor(() => {
         const value = captureProcessIdentity(child.pid!);

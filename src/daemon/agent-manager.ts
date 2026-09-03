@@ -259,6 +259,12 @@ export class AgentManager {
     }
     const status = this.getAgentStatus(request.name);
     if (status?.status !== 'running' || !status.pid) {
+      const failed = {
+        mutation_id: request.mutation_id, name: request.name, started: false,
+        pid: null, process_started_at: null, disposition: 'failed' as const,
+      };
+      atomicWriteSync(this.employeeReceiptPath(request.mutation_id), JSON.stringify(failed, null, 2));
+      this.employeeStartReceipts.set(request.mutation_id, failed);
       throw new Error('EMPLOYEE_START_NOT_READY');
     }
     const identity = captureProcessIdentity(status.pid);
@@ -283,7 +289,10 @@ export class AgentManager {
     }
     if (!receipt) return null;
     if (receipt.name !== request.name) throw new Error('IDEMPOTENCY_CONFLICT');
-    if (!receipt.started || receipt.disposition !== 'running' || !receipt.pid || !receipt.process_started_at) return null;
+    if (!receipt.started) {
+      return receipt.disposition === 'failed' && receipt.pid === null && receipt.process_started_at === null ? receipt : null;
+    }
+    if (receipt.disposition !== 'running' || !receipt.pid || !receipt.process_started_at) return null;
     const processState = probeProcessIdentity({ pid: receipt.pid, started_at: receipt.process_started_at });
     if (processState === 'dead') return { ...receipt, started: false, disposition: 'exited' };
     if (processState !== 'alive') return null;

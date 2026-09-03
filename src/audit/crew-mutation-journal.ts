@@ -67,6 +67,7 @@ export interface CrewMutationJournalEntry {
   lease?: {
     owner_pid: number;
     owner_process_started_at: string;
+    owner_token?: string;
     expires_at: string;
   };
   final_result?: CrewMutationFinalResult;
@@ -81,13 +82,31 @@ export type PrepareCrewMutationInput = Pick<CrewMutationJournalEntry,
   'effect_receipt' | 'created_at' | 'updated_at' | 'schema_version' | 'final_result'>>;
 
 const MUTATION_LEASE_MS = 30_000;
+const activeMutationTokens = new Map<string, string>();
 
-function mutationLease(now = Date.now()): NonNullable<CrewMutationJournalEntry['lease']> {
+export function beginCrewMutationOperation(mutationId: string): string {
+  const existing = activeMutationTokens.get(mutationId);
+  if (existing) return existing;
+  const token = randomBytes(32).toString('hex');
+  activeMutationTokens.set(mutationId, token);
+  return token;
+}
+
+export function releaseCrewMutationOperation(mutationId: string, token: string): void {
+  if (activeMutationTokens.get(mutationId) === token) activeMutationTokens.delete(mutationId);
+}
+
+export function currentCrewMutationOperationToken(mutationId: string): string | undefined {
+  return activeMutationTokens.get(mutationId);
+}
+
+function mutationLease(mutationId: string, priorToken?: string, now = Date.now()): NonNullable<CrewMutationJournalEntry['lease']> {
   const identity = captureProcessIdentity(process.pid)?.started_at;
   if (!identity) throw new Error('Crew mutation process identity is unavailable');
   return {
     owner_pid: process.pid,
     owner_process_started_at: identity,
+    owner_token: activeMutationTokens.get(mutationId) ?? priorToken ?? randomBytes(32).toString('hex'),
     expires_at: new Date(now + MUTATION_LEASE_MS).toISOString(),
   };
 }
@@ -147,6 +166,7 @@ function assertEntry(entry: CrewMutationJournalEntry): void {
   }
   if (entry.lease && (!Number.isSafeInteger(entry.lease.owner_pid) || entry.lease.owner_pid < 1
     || typeof entry.lease.owner_process_started_at !== 'string' || !entry.lease.owner_process_started_at
+    || (entry.lease.owner_token !== undefined && !/^[0-9a-f]{64}$/.test(entry.lease.owner_token))
     || !Number.isFinite(Date.parse(entry.lease.expires_at)))) {
     throw new Error('Invalid Crew mutation lease');
   }
@@ -199,12 +219,15 @@ export function prepareCrewMutation(
       if (!sameBinding(existing, input)) throw new Error('Crew mutation idempotency conflict');
       if (heldByAnotherLiveProcess(existing)) throw new Error('MUTATION_PENDING');
       if (existing.stage !== 'finalized') {
-        existing.lease = mutationLease();
+        existing.lease = mutationLease(input.mutation_id, existing.lease?.owner_token);
         existing.updated_at = now();
         durableWrite(journalPath(ctxRoot), entries);
       }
       return { entry: existing, reused: true };
     }
+    const targetConflict = entries.find(item => item.stage !== 'finalized'
+      && item.target.kind === input.target.kind && item.target.id === input.target.id);
+    if (targetConflict) throw new Error('MUTATION_PENDING');
     const timestamp = now();
     const entry: CrewMutationJournalEntry = {
       schema_version: 1,
@@ -226,7 +249,7 @@ export function prepareCrewMutation(
         before_digest: input.before_digest,
       },
       effect_receipt: null,
-      lease: mutationLease(),
+      lease: mutationLease(input.mutation_id),
       created_at: timestamp,
       updated_at: timestamp,
     };
@@ -241,16 +264,19 @@ function updateEntry(
   ctxRoot: string,
   mutationId: string,
   update: (entry: CrewMutationJournalEntry) => void,
+  allowClaim = false,
 ): CrewMutationJournalEntry {
   return locked(ctxRoot, entries => {
     const entry = entries.find(item => item.mutation_id === mutationId);
     if (!entry) throw new Error(`Unknown Crew mutation ${mutationId}`);
     if (heldByAnotherLiveProcess(entry)) throw new Error('MUTATION_PENDING');
-    if (entry.stage !== 'finalized') entry.lease = mutationLease();
+    const activeToken = activeMutationTokens.get(mutationId);
+    if (!allowClaim && activeToken && entry.lease?.owner_token !== activeToken) throw new Error('MUTATION_PENDING');
+    if (entry.stage !== 'finalized') entry.lease = mutationLease(mutationId, entry.lease?.owner_token);
     update(entry);
     entry.updated_at = new Date().toISOString();
     if (entry.stage === 'finalized') delete entry.lease;
-    else entry.lease = mutationLease();
+    else entry.lease = mutationLease(mutationId, entry.lease?.owner_token);
     assertEntry(entry);
     durableWrite(journalPath(ctxRoot), entries);
     return entry;
@@ -258,7 +284,7 @@ function updateEntry(
 }
 
 export function claimCrewMutationLease(ctxRoot: string, mutationId: string): CrewMutationJournalEntry {
-  return updateEntry(ctxRoot, mutationId, () => {});
+  return updateEntry(ctxRoot, mutationId, () => {}, true);
 }
 
 export function getCrewMutation(ctxRoot: string, mutationId: string): CrewMutationJournalEntry | null {
@@ -386,12 +412,15 @@ function certifyEmployeeCreate(
       || receipt.receipt_digest !== digestCrewAuditValue(canonical)) return null;
     if (receipt.started === true && receipt.disposition === 'running'
       && Number.isSafeInteger(receipt.pid) && typeof receipt.process_started_at === 'string') {
-      if (probeProcessIdentity({ pid: receipt.pid as number, started_at: receipt.process_started_at }) !== 'alive') return 'pending';
       return { result: 'success', after_digest: entry.intended_after_digest };
     }
     if (receipt.started === false && receipt.disposition === 'configured'
       && receipt.pid === null && receipt.process_started_at === null) {
       return { result: 'indeterminate', after_digest: entry.intended_after_digest, error_code: 'EMPLOYEE_NOT_STARTED', sanitized_error: 'Employee configured but runtime not started' };
+    }
+    if (receipt.started === false && receipt.disposition === 'failed'
+      && receipt.pid === null && receipt.process_started_at === null) {
+      return { result: 'failure', after_digest: entry.intended_after_digest, error_code: 'EMPLOYEE_START_FAILED', sanitized_error: 'Employee runtime did not become ready' };
     }
     if (receipt.started === false && receipt.disposition === 'exited'
       && Number.isSafeInteger(receipt.pid) && typeof receipt.process_started_at === 'string'
@@ -633,10 +662,12 @@ function reconcileRuntimeExit(ctxRoot: string, entry: CrewMutationJournalEntry):
 
 export function reconcileCrewMutationJournal(
   ctxRoot: string,
-  options: { frameworkRoot?: string } = {},
+  options: { frameworkRoot?: string; ownerToken?: string } = {},
 ): { finalized: number; pending: number } {
   let finalized = 0;
   for (const entry of listPendingCrewMutations(ctxRoot)) {
+    const activeToken = activeMutationTokens.get(entry.mutation_id);
+    if (activeToken && activeToken !== options.ownerToken) continue;
     if (heldByAnotherLiveProcess(entry)) {
       continue;
     }

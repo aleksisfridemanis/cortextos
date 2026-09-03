@@ -67,6 +67,6 @@ export interface WorkSessionRuntimeStatus {
   ownership?: 'attached' | 'detached' | 'dead' | 'unknown';
 }
 
-interface ProcessIdentity { pid: number; started_at: string }
+interface ProcessIdentity { pid: number; started_at: string; process_group_id?: number | null }
 
 export type WorkSessionEmployeeInput = Omit<CreateEmployeeInput, 'working_directory' | 'room_id' | 'telegram_polling'>;

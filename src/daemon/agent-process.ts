@@ -230,6 +230,7 @@ export class AgentProcess {
       }
       if (onRuntimeReady) {
         try {
+          await this.awaitRuntimeBootstrap();
           const pid = this.pty.getPid();
           if (!pid) throw new Error('EMPLOYEE_START_NOT_READY');
           await onRuntimeReady(pid);
@@ -280,6 +281,16 @@ export class AgentProcess {
       await this.stopInFlight;
     } finally {
       this.stopInFlight = null;
+    }
+  }
+
+  private async awaitRuntimeBootstrap(timeoutMs = 45_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.pty && !this.pty.getOutputBuffer().isBootstrapped() && Date.now() < deadline) {
+      await sleep(100);
+    }
+    if (!this.pty || !this.pty.getOutputBuffer().isBootstrapped()) {
+      throw new Error('EMPLOYEE_START_NOT_READY');
     }
   }
 
