@@ -119,7 +119,7 @@ export async function GET() {
   }
 
   try {
-    const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard' });
+    const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard', data: { actor: `owner:${identity.canonicalUser}` } });
     if (result.success && Array.isArray(result.data)) {
       for (const value of result.data) {
         const session = value as { id?: string; display_name?: string; harness?: CrewMember['harness']; lifecycle?: CrewMember['lifecycle']; room_id?: string; org?: string; resume_handle?: unknown };

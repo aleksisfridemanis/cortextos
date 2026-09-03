@@ -587,7 +587,7 @@ export class IPCServer {
     try {
       switch (request.type) {
         case 'list-work-sessions':
-          response = { success: true, data: this.agentManager.workSessions.list() };
+          response = { success: true, data: this.agentManager.workSessions.list(String(request.data?.actor ?? '')) };
           break;
 
         case 'create-work-session': {

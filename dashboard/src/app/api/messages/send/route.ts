@@ -59,7 +59,7 @@ export async function POST(request: NextRequest) {
       data: { id, text, actor },
     });
     if (!result.success) {
-      const status = result.code === 'NOT_FOUND' ? 404 : result.code === 'INVALID_TRANSITION' ? 409 : result.code === 'REGISTRY_CORRUPT' ? 503 : 500;
+      const status = result.code === 'NOT_FOUND' ? 404 : result.code === 'FORBIDDEN' ? 403 : result.code === 'INVALID_TRANSITION' ? 409 : result.code === 'REGISTRY_CORRUPT' ? 503 : 500;
       return Response.json({ error: status === 409 ? 'Resume the Work Session before sending' : 'Unable to send Work Session message', code: result.code }, { status });
     }
     return Response.json({ success: true, messageId: mutationId }, { status: 200 });

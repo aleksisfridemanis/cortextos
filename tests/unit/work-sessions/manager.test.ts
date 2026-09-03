@@ -96,6 +96,27 @@ describe('WorkSessionManager', () => {
     await expect(manager.send(created.id, 'different', 'owner:test', '22222222-2222-4222-8222-222222222222')).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
   });
 
+  it('enforces creator ownership for reads and every lifecycle action', async () => {
+    const { manager, adapter, cwd } = fixture();
+    const created = await manager.create({
+      display_name: 'Alice only', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:alice',
+    }, 'c1111111-1111-4111-8111-111111111111');
+    expect(manager.list('owner:alice')).toHaveLength(1);
+    expect(manager.list('owner:bob')).toEqual([]);
+    await expect(manager.send(created.id, 'intrude', 'owner:bob', 'c2111111-1111-4111-8111-111111111111'))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(manager.stop(created.id, 'owner:bob', 'c3111111-1111-4111-8111-111111111111'))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(manager.resume(created.id, 'owner:bob', 'c4111111-1111-4111-8111-111111111111'))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(manager.promote(created.id, {
+      name: 'intruder', org: 'platform', runtime: 'claude-code', actor: 'owner:bob',
+    }, 'c5111111-1111-4111-8111-111111111111')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(adapter.send).not.toHaveBeenCalled();
+    expect(adapter.stop).not.toHaveBeenCalled();
+    expect(manager.get(created.id)?.lifecycle).toBe('active');
+  });
+
   it('joins only identical in-flight mutation bindings before any effect can run', async () => {
     const { manager, adapter, cwd } = fixture();
     let releaseStart!: () => void;

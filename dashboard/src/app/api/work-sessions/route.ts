@@ -29,6 +29,7 @@ export async function readBoundedJson(request: NextRequest): Promise<Record<stri
 function statusFor(code?: string): number {
   if (code === 'CONTEXT_BUDGET_EXCEEDED') return 413;
   if (code === 'NOT_FOUND' || code === 'CWD_NOT_FOUND') return 404;
+  if (code === 'FORBIDDEN') return 403;
   if (code === 'CWD_LEASE_CONFLICT' || code === 'INVALID_TRANSITION' || code === 'RESUME_HANDLE_MISSING') return 409;
   if (code === 'REGISTRY_CORRUPT' || code === 'RECOVERY_REQUIRED') return 503;
   if (code?.endsWith('_FAILED') || code === 'RESUME_HANDLE_UNAVAILABLE') return 500;
@@ -38,17 +39,27 @@ function statusFor(code?: string): number {
 export function publicWorkSession(value: unknown) {
   const row = value as Record<string, unknown>;
   if (!row || typeof row !== 'object') return value;
-  const { resume_handle: _resumeHandle, ...safe } = row;
-  return {
-    ...safe,
-    resumable: ['archived', 'failed'].includes(String(row.lifecycle)) && Boolean(_resumeHandle),
+  const projected = {
+    id: row.id,
+    display_name: row.display_name,
+    org: row.org,
+    harness: row.harness,
+    model: row.model,
+    room_id: row.room_id,
+    lifecycle: row.lifecycle,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    last_error: row.last_error,
+    promoted_employee: row.promoted_employee,
+    resumable: ['archived', 'failed'].includes(String(row.lifecycle)) && Boolean(row.resume_handle),
   };
+  return Object.fromEntries(Object.entries(projected).filter(([, field]) => field !== undefined));
 }
 
 export async function GET() {
   try {
-    await actor();
-    const response = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard' });
+    const owner = await actor();
+    const response = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard', data: { actor: owner } });
     if (!response.success) throw new RouteError(response.code ?? 'LIST_FAILED', statusFor(response.code), 'Unable to list Work Sessions');
     return Response.json({ sessions: Array.isArray(response.data) ? response.data.map(publicWorkSession) : [] });
   } catch (error) {

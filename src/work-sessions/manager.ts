@@ -67,8 +67,17 @@ export class WorkSessionManager {
   private readonly now: () => string;
   constructor(private readonly dependencies: Dependencies) { this.now = dependencies.now ?? (() => new Date().toISOString()); }
 
-  list(): WorkSessionRecord[] { return readWorkSessions(this.dependencies.ctxRoot); }
+  list(actor?: string): WorkSessionRecord[] {
+    const records = readWorkSessions(this.dependencies.ctxRoot);
+    return actor === undefined ? records : records.filter(record => record.created_by === actor);
+  }
   get(id: string): WorkSessionRecord | undefined { return this.list().find(row => row.id === id); }
+
+  private authorize(id: string, actor: string): void {
+    const record = this.get(id);
+    if (!record) throw new WorkSessionRegistryError('NOT_FOUND', 'Work Session not found');
+    if (record.created_by !== actor) throw new WorkSessionRegistryError('FORBIDDEN', 'Work Session is owned by another actor');
+  }
 
   /** Drive durable Work Session mutations during daemon startup, before IPC opens. */
   async reconcilePending(): Promise<{ finalized: number; pending: number }> {
@@ -423,6 +432,7 @@ export class WorkSessionManager {
 
   send(id: string, text: string, actor: string, mutationId: string = randomUUID()): Promise<void> {
     validateMutationActor(mutationId, actor);
+    try { this.authorize(id, actor); } catch (error) { return Promise.reject(error); }
     return this.runMutation(mutationId, {
       actor,
       action: 'message',
@@ -474,6 +484,7 @@ export class WorkSessionManager {
 
   stop(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
     validateMutationActor(mutationId, actor);
+    try { this.authorize(id, actor); } catch (error) { return Promise.reject(error); }
     return this.runMutation(mutationId, {
       actor,
       action: 'stop',
@@ -551,6 +562,7 @@ export class WorkSessionManager {
 
   resume(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
     validateMutationActor(mutationId, actor);
+    try { this.authorize(id, actor); } catch (error) { return Promise.reject(error); }
     const handle = this.get(id)?.resume_handle ?? null;
     return this.runMutation(mutationId, {
       actor,
@@ -642,6 +654,7 @@ export class WorkSessionManager {
 
   promote(id: string, input: WorkSessionEmployeeInput, mutationId: string = randomUUID()): Promise<void> {
     validateMutationActor(mutationId, input?.actor);
+    try { this.authorize(id, input.actor); } catch (error) { return Promise.reject(error); }
     return this.runMutation(mutationId, {
       actor: input.actor,
       action: 'promote',

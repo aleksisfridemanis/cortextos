@@ -32,6 +32,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type, source: 'dashboard', mutation_id: mutationId, data: { id, actor: owner, employee } });
     if (!result.success) {
       const status = result.code === 'NOT_FOUND' ? 404
+        : result.code === 'FORBIDDEN' ? 403
         : ['INVALID_TRANSITION', 'RESUME_HANDLE_MISSING'].includes(result.code ?? '') ? 409
           : ['REGISTRY_CORRUPT', 'RECOVERY_REQUIRED', 'MUTATION_PENDING'].includes(result.code ?? '') ? 503
             : 400;

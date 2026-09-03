@@ -55,12 +55,20 @@ describe('Work Session routes', () => {
 
   it('exposes resumability without exposing the native continuation handle', async () => {
     const { publicWorkSession } = await import('../route');
-    expect(publicWorkSession({ lifecycle: 'archived', resume_handle: { thread_id: 'secret-thread' } }))
+    expect(publicWorkSession({ lifecycle: 'archived', resume_handle: { thread_id: 'secret-thread' }, runtime_owner: { pid: 42, started_at: 'private', mutation_id: 'private' }, requested_cwd: '/private' }))
       .toEqual({ lifecycle: 'archived', resumable: true });
     expect(publicWorkSession({ lifecycle: 'failed', resume_handle: null }))
       .toEqual({ lifecycle: 'failed', resumable: false });
     expect(publicWorkSession({ lifecycle: 'starting', resume_handle: { thread_id: 'secret-thread' } }))
       .toEqual({ lifecycle: 'starting', resumable: false });
+  });
+
+  it('binds list reads to the authenticated owner', async () => {
+    const { GET } = await import('../route');
+    expect((await GET()).status).toBe(200);
+    expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'list-work-sessions', data: { actor: 'owner:42' },
+    }));
   });
 
   it('rejects unauthenticated and oversized create requests', async () => {
@@ -93,6 +101,15 @@ describe('Work Session routes', () => {
     }), { params: Promise.resolve({ id: 'ws-one' }) });
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ code });
+  });
+
+  it('maps cross-owner lifecycle rejection to 403', async () => {
+    const { POST } = await import('../[id]/route');
+    sendMock.mockResolvedValueOnce({ success: false, code: 'FORBIDDEN' } as never);
+    const response = await POST(request({ action: 'stop' }, {
+      'x-cortext-intent': 'stop-work-session',
+    }), { params: Promise.resolve({ id: 'ws-one' }) });
+    expect(response.status).toBe(403);
   });
 });
 
