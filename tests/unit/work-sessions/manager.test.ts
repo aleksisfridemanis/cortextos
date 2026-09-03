@@ -92,6 +92,36 @@ describe('WorkSessionManager', () => {
     await expect(manager.send(created.id, 'different', 'owner:test', '22222222-2222-4222-8222-222222222222')).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
   });
 
+  it('joins only identical in-flight mutation bindings before any effect can run', async () => {
+    const { manager, adapter, cwd } = fixture();
+    let releaseStart!: () => void;
+    vi.mocked(adapter.startFresh).mockImplementationOnce(() => new Promise(resolve => {
+      releaseStart = () => resolve({ resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' } });
+    }));
+    const mutationId = 'b1111111-2222-4333-8444-555555555555';
+    const input = { display_name: 'Bound', org: 'platform', harness: 'codex-app-server' as const, requested_cwd: cwd, actor: 'owner:test' };
+    const first = manager.create(input, mutationId);
+    const identical = manager.create(input, mutationId);
+    const conflicting = manager.create({ ...input, display_name: 'Different' }, mutationId);
+    expect(identical).toBe(first);
+    await expect(conflicting).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await vi.waitFor(() => expect(adapter.startFresh).toHaveBeenCalledTimes(1));
+    releaseStart();
+    const created = await first;
+
+    let releaseSend!: () => void;
+    vi.mocked(adapter.send).mockImplementationOnce(() => new Promise(resolve => { releaseSend = resolve; }));
+    const sendId = 'b2111111-2222-4333-8444-555555555555';
+    const sent = manager.send(created.id, 'same', 'owner:test', sendId);
+    const joined = manager.send(created.id, 'same', 'owner:test', sendId);
+    const wrong = manager.stop(created.id, 'owner:test', sendId);
+    expect(joined).toBe(sent);
+    await expect(wrong).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await vi.waitFor(() => expect(adapter.send).toHaveBeenCalledTimes(1));
+    releaseSend();
+    await sent;
+  });
+
   it('rejects a new mutation while the same Work Session has unresolved ownership', async () => {
     const { manager, adapter, cwd } = fixture();
     const created = await manager.create({ display_name: 'Pending', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'd1111111-1111-4111-8111-111111111111');

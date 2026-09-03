@@ -56,7 +56,13 @@ function resultSnapshot(record: WorkSessionRecord): Record<string, unknown> {
 
 export class WorkSessionManager {
   private readonly adapters = new Map<string, WorkSessionRuntimeAdapter>();
-  private readonly mutationRuns = new Map<string, Promise<unknown>>();
+  private readonly mutationRuns = new Map<string, {
+    actor: string;
+    action: string;
+    target: string;
+    requestDigest: string;
+    promise: Promise<unknown>;
+  }>();
   private readonly now: () => string;
   constructor(private readonly dependencies: Dependencies) { this.now = dependencies.now ?? (() => new Date().toISOString()); }
 
@@ -186,16 +192,37 @@ export class WorkSessionManager {
     return { ...record, resume_handle: current.resume_handle } as unknown as WorkSessionRecord;
   }
 
-  create(input: CreateWorkSessionInput, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
-    const current = this.mutationRuns.get(mutationId) as Promise<WorkSessionRecord> | undefined;
-    if (current) return current;
-    const run = this.createOnce(input, mutationId);
-    this.mutationRuns.set(mutationId, run);
-    void run.then(
-      () => { if (this.mutationRuns.get(mutationId) === run) this.mutationRuns.delete(mutationId); },
-      () => { if (this.mutationRuns.get(mutationId) === run) this.mutationRuns.delete(mutationId); },
+  private runMutation<T>(
+    mutationId: string,
+    binding: { actor: string; action: string; target: string; requestDigest: string },
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const current = this.mutationRuns.get(mutationId);
+    if (current) {
+      if (current.actor !== binding.actor || current.action !== binding.action
+        || current.target !== binding.target || current.requestDigest !== binding.requestDigest) {
+        return Promise.reject(new WorkSessionRegistryError('IDEMPOTENCY_CONFLICT', 'Mutation id is already bound to another request'));
+      }
+      return current.promise as Promise<T>;
+    }
+    const promise = Promise.resolve().then(operation);
+    const descriptor = { ...binding, promise: promise as Promise<unknown> };
+    this.mutationRuns.set(mutationId, descriptor);
+    void promise.then(
+      () => { if (this.mutationRuns.get(mutationId) === descriptor) this.mutationRuns.delete(mutationId); },
+      () => { if (this.mutationRuns.get(mutationId) === descriptor) this.mutationRuns.delete(mutationId); },
     );
-    return run;
+    return promise;
+  }
+
+  create(input: CreateWorkSessionInput, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
+    validateMutationActor(mutationId, input?.actor);
+    return this.runMutation(mutationId, {
+      actor: input.actor,
+      action: 'create',
+      target: safeId(mutationId),
+      requestDigest: digestCrewAuditValue({ ...input, actor: undefined }),
+    }, () => this.createOnce(input, mutationId));
   }
 
   private async createOnce(input: CreateWorkSessionInput, mutationId: string): Promise<WorkSessionRecord> {
@@ -370,7 +397,17 @@ export class WorkSessionManager {
     }
   }
 
-  async send(id: string, text: string, actor: string, mutationId: string = randomUUID()): Promise<void> {
+  send(id: string, text: string, actor: string, mutationId: string = randomUUID()): Promise<void> {
+    validateMutationActor(mutationId, actor);
+    return this.runMutation(mutationId, {
+      actor,
+      action: 'message',
+      target: id,
+      requestDigest: digestCrewAuditValue({ text_digest: digestCrewAuditValue(text) }),
+    }, () => this.sendOnce(id, text, actor, mutationId));
+  }
+
+  private async sendOnce(id: string, text: string, actor: string, mutationId: string): Promise<void> {
     validateMutationActor(mutationId, actor);
     if (typeof text !== 'string' || !text || Buffer.byteLength(text, 'utf8') > 65_536) throw new WorkSessionRegistryError('INVALID_MESSAGE', 'Invalid Work Session message');
     const request = { text_digest: digestCrewAuditValue(text) };
@@ -411,7 +448,17 @@ export class WorkSessionManager {
     }
   }
 
-  async stop(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
+  stop(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
+    validateMutationActor(mutationId, actor);
+    return this.runMutation(mutationId, {
+      actor,
+      action: 'stop',
+      target: id,
+      requestDigest: digestCrewAuditValue({ id }),
+    }, () => this.stopOnce(id, actor, mutationId));
+  }
+
+  private async stopOnce(id: string, actor: string, mutationId: string): Promise<WorkSessionRecord> {
     validateMutationActor(mutationId, actor);
     const prior = this.priorMutation(mutationId, actor, 'stop', id, { id });
     if (prior?.stage === 'finalized') return this.originalResult(prior);
@@ -479,15 +526,14 @@ export class WorkSessionManager {
   }
 
   resume(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
-    const current = this.mutationRuns.get(mutationId) as Promise<WorkSessionRecord> | undefined;
-    if (current) return current;
-    const run = this.resumeOnce(id, actor, mutationId);
-    this.mutationRuns.set(mutationId, run);
-    void run.then(
-      () => { if (this.mutationRuns.get(mutationId) === run) this.mutationRuns.delete(mutationId); },
-      () => { if (this.mutationRuns.get(mutationId) === run) this.mutationRuns.delete(mutationId); },
-    );
-    return run;
+    validateMutationActor(mutationId, actor);
+    const handle = this.get(id)?.resume_handle ?? null;
+    return this.runMutation(mutationId, {
+      actor,
+      action: 'resume',
+      target: id,
+      requestDigest: digestCrewAuditValue({ id, handle_digest: digestCrewAuditValue(handle) }),
+    }, () => this.resumeOnce(id, actor, mutationId));
   }
 
   private async resumeOnce(id: string, actor: string, mutationId: string): Promise<WorkSessionRecord> {
@@ -566,7 +612,17 @@ export class WorkSessionManager {
     }
   }
 
-  async promote(id: string, input: WorkSessionEmployeeInput, mutationId: string = randomUUID()): Promise<void> {
+  promote(id: string, input: WorkSessionEmployeeInput, mutationId: string = randomUUID()): Promise<void> {
+    validateMutationActor(mutationId, input?.actor);
+    return this.runMutation(mutationId, {
+      actor: input.actor,
+      action: 'promote',
+      target: id,
+      requestDigest: digestCrewAuditValue({ id, employee: { ...input, actor: undefined } }),
+    }, () => this.promoteOnce(id, input, mutationId));
+  }
+
+  private async promoteOnce(id: string, input: WorkSessionEmployeeInput, mutationId: string): Promise<void> {
     validateMutationActor(mutationId, input?.actor);
     const request = { id, employee: { ...input, actor: undefined } };
     const prior = this.priorMutation(mutationId, input.actor, 'promote', id, request);
