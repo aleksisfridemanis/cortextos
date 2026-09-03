@@ -1,7 +1,9 @@
 import { NextRequest } from 'next/server';
-import { auth } from '@/lib/auth';
 import { IPCClient } from '@/lib/ipc-client';
 import { checkCrewRateLimit } from '@/lib/rate-limit';
+import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
+import { publicWorkSession } from '@/lib/public-work-session';
+export { publicWorkSession } from '@/lib/public-work-session';
 
 export const dynamic = 'force-dynamic';
 const BODY_MAX = 131_072;
@@ -10,9 +12,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 export class RouteError extends Error { constructor(readonly code: string, readonly status: number, message: string) { super(message); } }
 
 async function actor(): Promise<string> {
-  const session = await auth();
-  if (!session?.user?.id) throw new RouteError('UNAUTHENTICATED', 401, 'Authentication required');
-  return `owner:${session.user.id}`;
+  const principal = await authenticatedWorkSessionOwner();
+  if (!principal) throw new RouteError('UNAUTHENTICATED', 401, 'Authentication required');
+  return principal;
 }
 
 export async function readBoundedJson(request: NextRequest): Promise<Record<string, unknown>> {
@@ -34,26 +36,6 @@ function statusFor(code?: string): number {
   if (code === 'REGISTRY_CORRUPT' || code === 'RECOVERY_REQUIRED') return 503;
   if (code?.endsWith('_FAILED') || code === 'RESUME_HANDLE_UNAVAILABLE') return 500;
   return 400;
-}
-
-export function publicWorkSession(value: unknown) {
-  const row = value as Record<string, unknown>;
-  if (!row || typeof row !== 'object') return value;
-  const projected = {
-    id: row.id,
-    display_name: row.display_name,
-    org: row.org,
-    harness: row.harness,
-    model: row.model,
-    room_id: row.room_id,
-    lifecycle: row.lifecycle,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    last_error: row.last_error,
-    promoted_employee: row.promoted_employee,
-    resumable: ['archived', 'failed'].includes(String(row.lifecycle)) && Boolean(row.resume_handle),
-  };
-  return Object.fromEntries(Object.entries(projected).filter(([, field]) => field !== undefined));
 }
 
 export async function GET() {

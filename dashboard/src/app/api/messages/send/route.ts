@@ -4,6 +4,7 @@ import path from 'path';
 import { getCTXRoot, getAllAgents } from '@/lib/config';
 import { IPCClient } from '@/lib/ipc-client';
 import { checkCrewRateLimit } from '@/lib/rate-limit';
+import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 
 export const dynamic = 'force-dynamic';
 
@@ -39,10 +40,8 @@ export async function POST(request: NextRequest) {
   }
 
   if (body.target_kind === 'work_session') {
-    const { auth } = await import('@/lib/auth');
-    const session = await auth();
-    if (!session?.user?.id) return Response.json({ error: 'Authentication required' }, { status: 401 });
-    const actor = `owner:${session.user.id}`;
+    const actor = await authenticatedWorkSessionOwner();
+    if (!actor) return Response.json({ error: 'Authentication required' }, { status: 401 });
     const rate = checkCrewRateLimit(actor, 'message');
     if (!rate.allowed) return Response.json({ error: 'Rate limit exceeded' }, { status: 429, headers: { 'Retry-After': String(rate.retryAfter ?? 60) } });
     const id = typeof body.work_session_id === 'string' ? body.work_session_id : '';

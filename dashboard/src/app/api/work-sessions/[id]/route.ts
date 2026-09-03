@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
-import { auth } from '@/lib/auth';
 import { IPCClient } from '@/lib/ipc-client';
 import { checkCrewRateLimit } from '@/lib/rate-limit';
+import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 import { publicWorkSession, readBoundedJson, RouteError } from '../route';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -10,9 +10,8 @@ type Action = 'stop' | 'resume' | 'promote';
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const session = await auth();
-    if (!session?.user?.id) return Response.json({ error: 'Authentication required', code: 'UNAUTHENTICATED' }, { status: 401 });
-    const owner = `owner:${session.user.id}`;
+    const owner = await authenticatedWorkSessionOwner();
+    if (!owner) return Response.json({ error: 'Authentication required', code: 'UNAUTHENTICATED' }, { status: 401 });
     const rate = checkCrewRateLimit(owner, 'lifecycle');
     if (!rate.allowed) return Response.json({ error: 'Rate limit exceeded', code: 'RATE_LIMITED' }, { status: 429, headers: { 'Retry-After': String(rate.retryAfter ?? 60) } });
     const id = (await params).id;

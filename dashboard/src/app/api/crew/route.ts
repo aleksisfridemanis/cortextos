@@ -5,6 +5,7 @@ import { resolveIdentity } from '@/lib/comms-identity';
 import { readPairSummary, readRoomLog } from '@/lib/rooms';
 import { findAvatarFile } from '@/lib/crew-avatars';
 import { IPCClient } from '@/lib/ipc-client';
+import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
 
 export const dynamic = 'force-dynamic';
 
@@ -59,6 +60,8 @@ const DEFAULT_TAGLINES: Record<string, string> = {
  * just confusing on this surface.
  */
 export async function GET() {
+  const owner = await authenticatedWorkSessionOwner();
+  if (!owner) return Response.json({ error: 'Authentication required', code: 'UNAUTHENTICATED' }, { status: 401 });
   const ctxRoot = getCTXRoot();
   const identity = resolveIdentity(ctxRoot);
 
@@ -119,7 +122,7 @@ export async function GET() {
   }
 
   try {
-    const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard', data: { actor: `owner:${identity.canonicalUser}` } });
+    const result = await new IPCClient(process.env.CTX_INSTANCE_ID ?? 'default').send({ type: 'list-work-sessions', source: 'dashboard', data: { actor: owner } });
     if (result.success && Array.isArray(result.data)) {
       for (const value of result.data) {
         const session = value as { id?: string; display_name?: string; harness?: CrewMember['harness']; lifecycle?: CrewMember['lifecycle']; room_id?: string; org?: string; resume_handle?: unknown };
