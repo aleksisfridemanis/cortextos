@@ -13,6 +13,10 @@ import os from 'os';
 import path from 'path';
 import { NextRequest } from 'next/server';
 
+vi.mock('@/lib/work-session-owner', () => ({ authenticatedWorkSessionOwner: vi.fn(async () => 'owner:test') }));
+vi.mock('@/lib/ipc-client', () => ({ IPCClient: class { send = vi.fn(async () => ({ success: true })); } }));
+vi.mock('@/lib/rate-limit', () => ({ checkCrewRateLimit: () => ({ allowed: true }) }));
+
 const rootTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'send-reply-to-'));
 process.env.CTX_ROOT = rootTmp;
 process.env.ADMIN_USERNAME = 'james';
