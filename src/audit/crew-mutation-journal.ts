@@ -25,7 +25,7 @@ import {
   type CrewTarget,
 } from './crew-lifecycle-audit.js';
 import { withFileLockSync } from '../utils/lock.js';
-import { removeStartingWorkSessionRecord } from '../work-sessions/registry.js';
+import { readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession } from '../work-sessions/registry.js';
 
 export type CrewMutationStage =
   | 'prepared'
@@ -522,6 +522,41 @@ function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): R
   return null;
 }
 
+function reconcileRuntimeExit(ctxRoot: string, entry: CrewMutationJournalEntry): boolean {
+  if (entry.target.kind !== 'work_session' || entry.action !== 'stop' || entry.actor !== 'system:pty-exit') return false;
+  let current = getCrewMutation(ctxRoot, entry.mutation_id)!;
+  let record = readWorkSessions(ctxRoot).find(item => item.id === entry.target.id);
+  if (!record) return false;
+  if (current.stage === 'prepared') {
+    if (record.mutation_id !== entry.mutation_id) {
+      if (!['starting', 'active', 'stopping'].includes(record.lifecycle)) return false;
+      record = transitionWorkSession(ctxRoot, record.id, ['starting', 'active', 'stopping'], 'archived', {}, entry.mutation_id);
+    } else if (record.lifecycle !== 'archived') return false;
+    commitCrewMutationState(ctxRoot, entry.mutation_id, workSessionDigest(record as unknown as Record<string, unknown>));
+    current = getCrewMutation(ctxRoot, entry.mutation_id)!;
+  }
+  if (current.stage === 'state_committed') {
+    startCrewMutationEffect(ctxRoot, entry.mutation_id);
+    current = getCrewMutation(ctxRoot, entry.mutation_id)!;
+  }
+  if (current.stage === 'effect_started') {
+    recordCrewMutationEffect(ctxRoot, entry.mutation_id, {
+      mutation_id: entry.mutation_id, stopped: true, process_exited: true,
+    });
+    current = getCrewMutation(ctxRoot, entry.mutation_id)!;
+  }
+  if (current.stage === 'effect_recorded') {
+    record = readWorkSessions(ctxRoot).find(item => item.id === entry.target.id);
+    if (!record || record.lifecycle !== 'archived' || record.mutation_id !== entry.mutation_id) return false;
+    finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, {
+      result: 'success', after_digest: workSessionDigest(record as unknown as Record<string, unknown>),
+      result_snapshot: workSessionSnapshot(record as unknown as Record<string, unknown>),
+    });
+    return true;
+  }
+  return current.stage === 'finalized';
+}
+
 export function reconcileCrewMutationJournal(
   ctxRoot: string,
   options: { frameworkRoot?: string } = {},
@@ -530,6 +565,10 @@ export function reconcileCrewMutationJournal(
   for (const entry of listPendingCrewMutations(ctxRoot)) {
     if (entry.stage === 'audit_written' && entry.final_result) {
       updateEntry(ctxRoot, entry.mutation_id, current => { current.stage = 'finalized'; });
+      finalized += 1;
+      continue;
+    }
+    if (reconcileRuntimeExit(ctxRoot, entry)) {
       finalized += 1;
       continue;
     }

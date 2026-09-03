@@ -6,6 +6,7 @@ import { WorkSessionManager } from '../../../src/work-sessions/manager.js';
 import type { WorkSessionRuntimeAdapter } from '../../../src/work-sessions/types.js';
 import {
   commitCrewMutationState, getCrewMutation, prepareCrewMutation, startCrewMutationEffect,
+  reconcileCrewMutationJournal,
 } from '../../../src/audit/crew-mutation-journal.js';
 import { digestCrewAuditValue } from '../../../src/audit/crew-lifecycle-audit.js';
 import { createWorkSessionRecord, transitionWorkSession } from '../../../src/work-sessions/registry.js';
@@ -15,7 +16,7 @@ describe('WorkSessionManager', () => {
   const roots: string[] = [];
   afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 
-  function fixture() {
+  function fixture(failAt?: ConstructorParameters<typeof WorkSessionManager>[0]['failAt']) {
     const root = mkdtempSync(join(tmpdir(), 'cortext-work-manager-'));
     roots.push(root);
     const ctxRoot = join(root, 'ctx');
@@ -31,7 +32,7 @@ describe('WorkSessionManager', () => {
       getResumeHandle: vi.fn(() => null),
     };
     const createEmployee = vi.fn(async () => ({ status: 'created' as const }));
-    const manager = new WorkSessionManager({ ctxRoot, adapterFactory: () => adapter, createEmployee });
+    const manager = new WorkSessionManager({ ctxRoot, adapterFactory: () => adapter, createEmployee, failAt });
     return { manager, adapter, createEmployee, cwd, ctxRoot };
   }
 
@@ -265,6 +266,29 @@ describe('WorkSessionManager', () => {
     expect(createEmployee).toHaveBeenCalledTimes(1);
     expect(createEmployee.mock.calls[0][1]).toMatch(/^[0-9a-f-]{36}$/);
     expect(getCrewMutation(ctxRoot, mutationId)?.stage).toBe('finalized');
+  });
+
+  it.each([
+    'after-runtime-exit-prepare',
+    'after-runtime-exit-state',
+    'after-runtime-exit-state-commit',
+    'after-runtime-exit-effect-start',
+    'after-runtime-exit-receipt',
+    'after-runtime-exit-audit',
+  ] as const)('reconciles runtime exit after a crash at %s', async failAt => {
+    const { manager, cwd, ctxRoot } = fixture(failAt);
+    const created = await manager.create({ display_name: 'Exit crash', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' });
+    expect(() => manager.handleRuntimeExit(created.id)).toThrow(/injected/i);
+
+    expect(reconcileCrewMutationJournal(ctxRoot).pending).toBe(0);
+    const exit = JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'))
+      .find((entry: { actor: string }) => entry.actor === 'system:pty-exit');
+    expect(exit).toMatchObject({
+      stage: 'finalized',
+      effect_receipt: { mutation_id: expect.any(String), stopped: true, process_exited: true },
+      final_result: { result: 'success', result_snapshot: expect.any(Object) },
+    });
+    expect(manager.get(created.id)?.lifecycle).toBe('archived');
   });
 
   it('archives before promotion and creates an Employee in the same room and cwd', async () => {

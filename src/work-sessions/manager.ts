@@ -39,7 +39,9 @@ interface Dependencies {
   createEmployee?: (input: CreateEmployeeInput, mutationId: string) => Promise<unknown>;
   startEmployee?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt>;
   now?: () => string;
-  failAt?: 'after-session-record';
+  failAt?: 'after-session-record' | 'after-runtime-exit-prepare' | 'after-runtime-exit-state'
+    | 'after-runtime-exit-state-commit' | 'after-runtime-exit-effect-start'
+    | 'after-runtime-exit-receipt' | 'after-runtime-exit-audit';
 }
 
 function safeId(mutationId: string): string { return `ws-${mutationId}`; }
@@ -590,11 +592,18 @@ export class WorkSessionManager {
     const mutationId = randomUUID();
     const prepared = this.prepare(record, 'system:pty-exit', 'stop', mutationId, { id, reason: 'pty_exit' });
     if (prepared.entry.stage === 'finalized') return;
+    if (this.dependencies.failAt === 'after-runtime-exit-prepare') throw new Error('injected after runtime exit prepare');
     const archived = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active', 'stopping'], 'archived', {}, mutationId);
+    if (this.dependencies.failAt === 'after-runtime-exit-state') throw new Error('injected after runtime exit state');
     commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(archived));
+    if (this.dependencies.failAt === 'after-runtime-exit-state-commit') throw new Error('injected after runtime exit state commit');
     startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
-    recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { process_exited: true });
-    finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(archived) });
+    if (this.dependencies.failAt === 'after-runtime-exit-effect-start') throw new Error('injected after runtime exit effect start');
+    recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { mutation_id: mutationId, stopped: true, process_exited: true });
+    if (this.dependencies.failAt === 'after-runtime-exit-receipt') throw new Error('injected after runtime exit receipt');
+    finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+      result: 'success', after_digest: stateDigest(archived), result_snapshot: resultSnapshot(archived),
+    }, { failAfterAppend: this.dependencies.failAt === 'after-runtime-exit-audit' });
     this.adapters.delete(id);
   }
 }
