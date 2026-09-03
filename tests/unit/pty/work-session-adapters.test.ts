@@ -49,7 +49,7 @@ describe('Work Session harness contracts', () => {
     const adapter = createWorkSessionAdapter('opencode', transport);
     await expect(adapter.resumeExact(
       { runtime: 'opencode', session_id: 'requested-session' },
-      { id: 'ws-one', cwd: '/project' },
+      { id: 'ws-one', mutation_id: '11111111-1111-4111-8111-111111111111', cwd: '/project' },
     )).rejects.toThrow('RESUME_HANDLE_UNAVAILABLE');
   });
 });

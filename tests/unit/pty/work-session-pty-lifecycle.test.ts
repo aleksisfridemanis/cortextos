@@ -76,7 +76,7 @@ describe('WorkSessionPTY owned lifecycle', () => {
     vi.spyOn(adapter as never, 'startCodex' as never).mockResolvedValue({ resume_handle: handle } as never);
     vi.spyOn(adapter, 'send').mockRejectedValue(new Error('injection failed'));
     const stop = vi.spyOn(adapter, 'stop').mockResolvedValue();
-    await expect(adapter.startFresh({ id: 'ws-one', cwd, context: 'initial context' })).rejects.toThrow('injection failed');
+    await expect(adapter.startFresh({ id: 'ws-one', mutation_id: '11111111-1111-4111-8111-111111111111', cwd, context: 'initial context' })).rejects.toThrow('injection failed');
     expect(adapter.getResumeHandle()).toEqual(handle);
     expect(stop).toHaveBeenCalledOnce();
   });

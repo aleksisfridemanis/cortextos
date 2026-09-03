@@ -43,18 +43,20 @@ export interface CreateWorkSessionInput {
 
 export interface WorkSessionLaunchInput {
   id: string;
+  mutation_id: string;
   cwd: string;
   model?: string;
   context?: string;
 }
 
 export interface WorkSessionRuntimeAdapter {
-  startFresh(input: WorkSessionLaunchInput): Promise<{ resume_handle: WorkSessionResumeHandle }>;
-  resumeExact(handle: WorkSessionResumeHandle, input: WorkSessionLaunchInput): Promise<void>;
+  startFresh(input: WorkSessionLaunchInput): Promise<{ resume_handle: WorkSessionResumeHandle; runtime_owner: ProcessIdentity & { mutation_id: string } }>;
+  resumeExact(handle: WorkSessionResumeHandle, input: WorkSessionLaunchInput): Promise<{ runtime_owner: ProcessIdentity & { mutation_id: string } }>;
   send(text: string): Promise<void>;
   stop(): Promise<void>;
   status(): WorkSessionRuntimeStatus;
   getResumeHandle(): WorkSessionResumeHandle | null;
+  getRuntimeOwner?(): (ProcessIdentity & { mutation_id: string }) | null;
 }
 
 export interface WorkSessionRuntimeStatus {

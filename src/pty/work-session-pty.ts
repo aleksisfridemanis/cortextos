@@ -5,8 +5,9 @@ import {
 import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
 import type { WorkSessionRecord } from '../work-sessions/types.js';
-import type { WorkSessionResumeHandle, WorkSessionRuntimeAdapter } from '../work-sessions/types.js';
-import { captureProcessIdentity, probeProcessIdentity } from '../utils/process-identity.js';
+import type { WorkSessionLaunchInput, WorkSessionResumeHandle, WorkSessionRuntimeAdapter } from '../work-sessions/types.js';
+import { captureProcessIdentity, probeProcessIdentity, type ProcessIdentity } from '../utils/process-identity.js';
+import { atomicWriteSync } from '../utils/atomic.js';
 
 const CHILD_ENV_ALLOWLIST = ['PATH', 'HOME', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'] as const;
 
@@ -102,45 +103,67 @@ export function openCodePermissionConfig(): Record<string, unknown> {
 export function createWorkSessionAdapter(
   harness: 'claude-code' | 'codex-app-server' | 'opencode',
   transport: {
-    launch(spec: ReturnType<typeof buildClaudeWorkSessionLaunch> | ReturnType<typeof buildCodexWorkSessionLaunch> | ReturnType<typeof buildOpenCodeWorkSessionLaunch>): Promise<{ session_id?: string; thread_id?: string }>;
+    launch(spec: ReturnType<typeof buildClaudeWorkSessionLaunch> | ReturnType<typeof buildCodexWorkSessionLaunch> | ReturnType<typeof buildOpenCodeWorkSessionLaunch>): Promise<{
+      session_id?: string;
+      thread_id?: string;
+      runtime_owner?: ProcessIdentity & { mutation_id: string };
+    }>;
     send(text: string): Promise<void>;
     stop(): Promise<void>;
   },
 ): WorkSessionRuntimeAdapter {
+  let currentOwner: (ProcessIdentity & { mutation_id: string }) | null = null;
+  const owner = (value: (ProcessIdentity & { mutation_id: string }) | undefined, mutationId: string) => {
+    currentOwner = requireTransportOwner(value, mutationId);
+    return currentOwner;
+  };
   return {
     async startFresh(input) {
       if (harness === 'claude-code') {
         const sessionId = randomUUID();
-        await transport.launch(buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId, resume: false }));
-        return { resume_handle: { runtime: harness, session_id: sessionId } };
+        const receipt = await transport.launch(buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId, resume: false }));
+        return { resume_handle: { runtime: 'claude-code', session_id: sessionId }, runtime_owner: owner(receipt.runtime_owner, input.mutation_id) };
       }
       if (harness === 'codex-app-server') {
         const receipt = await transport.launch(buildCodexWorkSessionLaunch({ cwd: input.cwd, model: input.model }));
         if (!receipt.thread_id) throw new Error('CODEX_THREAD_START_UNACKNOWLEDGED');
-        return { resume_handle: { runtime: harness, thread_id: receipt.thread_id } };
+        return { resume_handle: { runtime: 'codex-app-server', thread_id: receipt.thread_id }, runtime_owner: owner(receipt.runtime_owner, input.mutation_id) };
       }
       const receipt = await transport.launch(buildOpenCodeWorkSessionLaunch({ cwd: input.cwd, model: input.model }));
       if (!receipt.session_id) throw new Error('OPENCODE_SESSION_UNACKNOWLEDGED');
-      return { resume_handle: { runtime: harness, session_id: receipt.session_id } };
+      return { resume_handle: { runtime: 'opencode', session_id: receipt.session_id }, runtime_owner: owner(receipt.runtime_owner, input.mutation_id) };
     },
     async resumeExact(handle, input) {
       if (handle.runtime !== harness) throw new Error('RESUME_HANDLE_HARNESS_MISMATCH');
+      let receipt: { session_id?: string; thread_id?: string; runtime_owner?: ProcessIdentity & { mutation_id: string } };
       if (handle.runtime === 'claude-code') {
-        const receipt = await transport.launch(buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId: handle.session_id, resume: true }));
+        receipt = await transport.launch(buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId: handle.session_id, resume: true }));
         if (receipt.session_id !== handle.session_id) throw new Error('RESUME_HANDLE_UNAVAILABLE');
       } else if (handle.runtime === 'codex-app-server') {
-        const receipt = await transport.launch(buildCodexWorkSessionLaunch({ cwd: input.cwd, model: input.model, threadId: handle.thread_id }));
+        receipt = await transport.launch(buildCodexWorkSessionLaunch({ cwd: input.cwd, model: input.model, threadId: handle.thread_id }));
         if (receipt.thread_id !== handle.thread_id) throw new Error('RESUME_HANDLE_UNAVAILABLE');
       } else {
-        const receipt = await transport.launch(buildOpenCodeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId: handle.session_id }));
+        receipt = await transport.launch(buildOpenCodeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId: handle.session_id }));
         if (receipt.session_id !== handle.session_id) throw new Error('RESUME_HANDLE_UNAVAILABLE');
       }
+      return { runtime_owner: owner(receipt.runtime_owner, input.mutation_id) };
     },
     send: text => transport.send(text),
     stop: () => transport.stop(),
     status: () => ({ running: true, pid: null, error_code: null }),
     getResumeHandle: () => null,
+    getRuntimeOwner: () => currentOwner,
   };
+}
+
+function requireTransportOwner(
+  owner: (ProcessIdentity & { mutation_id: string }) | undefined,
+  mutationId: string,
+): ProcessIdentity & { mutation_id: string } {
+  if (!owner || owner.mutation_id !== mutationId || probeProcessIdentity(owner) !== 'alive') {
+    throw new Error('PROCESS_IDENTITY_UNAVAILABLE');
+  }
+  return owner;
 }
 
 interface NativePty {
@@ -188,14 +211,19 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private currentHandle: WorkSessionResumeHandle | null;
   private exitPromise: Promise<void> | null = null;
   private resolveExit: (() => void) | null = null;
+  private currentOwner: (ProcessIdentity & { mutation_id: string }) | null = null;
+  private spawningMutationId: string | null = null;
 
   constructor(private readonly options: NativeWorkSessionOptions) {
     this.timeoutMs = options.timeoutMs ?? 10_000;
-    this.currentHandle = options.record.resume_handle;
+    const receipt = this.readRuntimeReceipt();
+    this.currentHandle = receipt?.resume_handle ?? options.record.resume_handle;
+    this.currentOwner = receipt?.runtime_owner ?? options.record.runtime_owner ?? null;
   }
 
-  async startFresh(input: { id: string; cwd: string; model?: string; context?: string }): Promise<{ resume_handle: WorkSessionResumeHandle }> {
+  async startFresh(input: WorkSessionLaunchInput): Promise<{ resume_handle: WorkSessionResumeHandle; runtime_owner: ProcessIdentity & { mutation_id: string } }> {
     this.assertCanonicalCwd(input.cwd);
+    this.spawningMutationId = input.mutation_id;
     const result = this.options.record.harness === 'claude-code'
       ? await this.startClaude(input, undefined)
       : this.options.record.harness === 'codex-app-server'
@@ -209,17 +237,23 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       throw error;
     }
     this.ready = true;
-    return result;
+    const owner = this.requireCurrentOwner(input.mutation_id);
+    this.persistRuntimeReceipt(owner, result.resume_handle);
+    return { ...result, runtime_owner: owner };
   }
 
-  async resumeExact(handle: WorkSessionResumeHandle, input: { id: string; cwd: string; model?: string }): Promise<void> {
+  async resumeExact(handle: WorkSessionResumeHandle, input: { id: string; mutation_id: string; cwd: string; model?: string }): Promise<{ runtime_owner: ProcessIdentity & { mutation_id: string } }> {
     this.assertCanonicalCwd(input.cwd);
+    this.spawningMutationId = input.mutation_id;
     if (handle.runtime !== this.options.record.harness) throw new Error('RESUME_HANDLE_HARNESS_MISMATCH');
     if (handle.runtime === 'claude-code') await this.startClaude(input, handle.session_id);
     else if (handle.runtime === 'codex-app-server') await this.startCodex(input, handle.thread_id);
     else await this.startOpenCode(input, handle.session_id);
     this.currentHandle = handle;
     this.ready = true;
+    const owner = this.requireCurrentOwner(input.mutation_id);
+    this.persistRuntimeReceipt(owner, handle);
+    return { runtime_owner: owner };
   }
 
   async send(text: string): Promise<void> {
@@ -242,17 +276,43 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const pty = this.pty;
     this.intentionalStop = true;
     this.ready = false;
-    if (!pty) return;
+    if (!pty) {
+      const owner = this.currentOwner ?? this.options.record.runtime_owner;
+      if (!owner) return;
+      const before = probeProcessIdentity(owner);
+      if (before === 'dead') { this.clearRuntimeReceipt(); return; }
+      if (before === 'unknown') throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
+      try { process.kill(owner.pid, 'SIGTERM'); } catch { /* probe below is authoritative */ }
+      try {
+        await waitFor(() => {
+          const state = probeProcessIdentity(owner);
+          return state === 'dead' ? true : undefined;
+        }, this.timeoutMs);
+      } catch {
+        if (probeProcessIdentity(owner) !== 'alive') throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
+        try { process.kill(owner.pid, 'SIGKILL'); } catch { /* probe below is authoritative */ }
+        try {
+          await waitFor(() => {
+            const state = probeProcessIdentity(owner);
+            return state === 'dead' ? true : undefined;
+          }, this.timeoutMs);
+        } catch { throw new Error('WORK_SESSION_STOP_UNCONFIRMED'); }
+      }
+      this.clearRuntimeReceipt();
+      return;
+    }
     const exit = this.exitPromise;
     if (!exit) throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
     try { pty.kill('SIGTERM'); } catch { /* confirm via the exit signal below */ }
     try {
       await this.awaitExit(exit, this.timeoutMs);
+      this.clearRuntimeReceipt();
       return;
     } catch { /* bounded graceful stop elapsed; escalate */ }
     try { pty.kill('SIGKILL'); } catch { /* confirm via the exit signal below */ }
     try {
       await this.awaitExit(exit, this.timeoutMs);
+      this.clearRuntimeReceipt();
     } catch {
       throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
     }
@@ -269,7 +329,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         ownership: identity ? 'attached' as const : 'unknown' as const,
       };
     }
-    const owner = this.options.record.runtime_owner;
+    const owner = this.currentOwner ?? this.options.record.runtime_owner;
     if (!owner) return { running: false, pid: null, error_code: null, process_started_at: null, ownership: 'dead' as const };
     const state = probeProcessIdentity(owner);
     if (state === 'dead') return { running: false, pid: owner.pid, error_code: null, process_started_at: owner.started_at, ownership: 'dead' as const };
@@ -282,6 +342,38 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     };
   }
   getResumeHandle(): WorkSessionResumeHandle | null { return this.currentHandle; }
+  getRuntimeOwner(): (ProcessIdentity & { mutation_id: string }) | null { return this.currentOwner; }
+
+  private runtimeReceiptPath(): string {
+    return join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id, 'runtime-owner.json');
+  }
+
+  private readRuntimeReceipt(): { runtime_owner: ProcessIdentity & { mutation_id: string }; resume_handle: WorkSessionResumeHandle | null } | null {
+    try {
+      const value = JSON.parse(readFileSync(this.runtimeReceiptPath(), 'utf8'));
+      if (value?.session_id !== this.options.record.id || !value.runtime_owner) return null;
+      return { runtime_owner: value.runtime_owner, resume_handle: value.resume_handle ?? null };
+    } catch { return null; }
+  }
+
+  private persistRuntimeReceipt(owner: ProcessIdentity & { mutation_id: string }, resumeHandle: WorkSessionResumeHandle | null): void {
+    atomicWriteSync(this.runtimeReceiptPath(), JSON.stringify({
+      schema_version: 1,
+      session_id: this.options.record.id,
+      runtime_owner: owner,
+      resume_handle: resumeHandle,
+    }, null, 2));
+  }
+
+  private clearRuntimeReceipt(): void {
+    this.currentOwner = null;
+    try { unlinkSync(this.runtimeReceiptPath()); } catch { /* already absent */ }
+  }
+
+  private requireCurrentOwner(mutationId: string): ProcessIdentity & { mutation_id: string } {
+    if (!this.currentOwner || this.currentOwner.mutation_id !== mutationId) throw new Error('PROCESS_IDENTITY_UNAVAILABLE');
+    return this.currentOwner;
+  }
 
   private assertCanonicalCwd(cwd: string): void {
     if (realpathSync(cwd) !== this.options.record.canonical_cwd) throw new Error('CWD_CHANGED');
@@ -302,6 +394,19 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const pty = nodePty.spawn(command, args, { name: 'xterm-256color', cols: 120, rows: 40, cwd, env });
     this.intentionalStop = false;
     this.pty = pty;
+    const identity = captureProcessIdentity(pty.pid);
+    if (!identity) {
+      try { pty.kill('SIGKILL'); } catch { /* fail closed below */ }
+      this.pty = null;
+      throw new Error('PROCESS_IDENTITY_UNAVAILABLE');
+    }
+    if (!this.spawningMutationId) {
+      try { pty.kill('SIGKILL'); } catch { /* fail closed below */ }
+      this.pty = null;
+      throw new Error('PROCESS_IDENTITY_UNAVAILABLE');
+    }
+    this.currentOwner = { ...identity, mutation_id: this.spawningMutationId };
+    this.persistRuntimeReceipt(this.currentOwner, null);
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve; });
     pty.onData(data => this.capture(data));
     pty.onExit(event => {
@@ -334,8 +439,10 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     this.buffer = lines.pop() ?? '';
     for (const line of lines) {
       try {
-        const value = JSON.parse(line) as { id?: unknown };
-        if (typeof value.id === 'number') this.responses.set(value.id, value);
+        const value = JSON.parse(line) as { id?: unknown; method?: unknown; result?: unknown; error?: unknown };
+        if (typeof value.id === 'number' && value.method === undefined && ('result' in value || 'error' in value)) {
+          this.responses.set(value.id, value);
+        }
       } catch { /* normal TUI output */ }
     }
   }

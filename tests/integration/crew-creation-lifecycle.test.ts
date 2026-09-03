@@ -12,6 +12,10 @@ import { WorkSessionManager } from '../../src/work-sessions/manager.js';
 import { transitionWorkSession } from '../../src/work-sessions/registry.js';
 import { promotionEmployeeMutationId } from '../../src/work-sessions/promotion.js';
 import { digestCrewAuditValue } from '../../src/audit/crew-lifecycle-audit.js';
+import { captureProcessIdentity } from '../../src/utils/process-identity.js';
+
+const integrationProcess = captureProcessIdentity(process.pid)!;
+const integrationOwner = (mutationId: string) => ({ ...integrationProcess, mutation_id: mutationId });
 
 describe('Crew Employee creation lifecycle', () => {
   const roots: string[] = [];
@@ -39,7 +43,7 @@ describe('Crew Employee creation lifecycle', () => {
       frameworkRoot,
       instanceId: 'test',
       now: () => '2026-09-03T00:00:00.000Z',
-      startEmployee: async request => ({ mutation_id: request.mutation_id, started: true }),
+      startEmployee: async request => ({ mutation_id: request.mutation_id, name: request.name, started: true, pid: integrationProcess.pid, process_started_at: integrationProcess.started_at, disposition: 'running' }),
     });
 
     expect(result.status).toBe('created');
@@ -66,8 +70,8 @@ describe('Crew Work Session lifecycle', () => {
     const manager = new WorkSessionManager({
       ctxRoot,
       adapterFactory: () => ({
-        startFresh: async () => ({ resume_handle: { runtime: 'claude-code', session_id: '66666666-6666-4666-8666-666666666666' } }),
-        resumeExact: async () => undefined,
+        startFresh: async input => ({ resume_handle: { runtime: 'claude-code', session_id: '66666666-6666-4666-8666-666666666666' }, runtime_owner: integrationOwner(input.mutation_id) }),
+        resumeExact: async (_handle, input) => ({ runtime_owner: integrationOwner(input.mutation_id) }),
         send: async () => undefined,
         stop: async () => undefined,
         status: () => ({ running: true, pid: 1, error_code: null }),
@@ -98,19 +102,20 @@ describe('Crew Work Session lifecycle', () => {
     writeFileSync(join(frameworkRoot, 'templates', 'context', 'work-session.md'), 'Work safely.');
     writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), '{}');
     writeFileSync(join(ctxRoot, 'config', 'rooms.json'), '[]');
+    let running = true;
     const adapter = {
-      startFresh: async () => ({ resume_handle: { runtime: 'claude-code' as const, session_id: '66666666-6666-4666-8666-666666666666' } }),
-      resumeExact: async () => undefined,
+      startFresh: async (input: { mutation_id: string }) => ({ resume_handle: { runtime: 'claude-code' as const, session_id: '66666666-6666-4666-8666-666666666666' }, runtime_owner: integrationOwner(input.mutation_id) }),
+      resumeExact: async (_handle: unknown, input: { mutation_id: string }) => ({ runtime_owner: integrationOwner(input.mutation_id) }),
       send: async () => undefined,
-      stop: async () => undefined,
-      status: () => ({ running: true, pid: 1, error_code: null }),
+      stop: async () => { running = false; },
+      status: () => ({ running, pid: running ? integrationProcess.pid : null, error_code: null, ownership: running ? 'attached' as const : 'dead' as const }),
       getResumeHandle: () => null,
     };
     const manager = new WorkSessionManager({
       ctxRoot,
       frameworkRoot,
       adapterFactory: () => adapter,
-      startEmployee: async request => ({ mutation_id: request.mutation_id, started: true }),
+      startEmployee: async request => ({ mutation_id: request.mutation_id, name: request.name, started: true, pid: integrationProcess.pid, process_started_at: integrationProcess.started_at, disposition: 'running' }),
     });
     const created = await manager.create({
       display_name: 'Promote real', org: 'platform', harness: 'claude-code', requested_cwd: cwd, actor: 'owner:test',
@@ -154,9 +159,9 @@ describe('Crew Work Session lifecycle', () => {
     writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), '{}');
     writeFileSync(join(ctxRoot, 'config', 'rooms.json'), '[]');
     const adapter = {
-      startFresh: async () => ({ resume_handle: { runtime: 'claude-code' as const, session_id: '76666666-6666-4666-8666-666666666666' } }),
-      resumeExact: async () => undefined, send: async () => undefined, stop: async () => undefined,
-      status: () => ({ running: false, pid: null, error_code: null }), getResumeHandle: () => null,
+      startFresh: async (input: { mutation_id: string }) => ({ resume_handle: { runtime: 'claude-code' as const, session_id: '76666666-6666-4666-8666-666666666666' }, runtime_owner: integrationOwner(input.mutation_id) }),
+      resumeExact: async (_handle: unknown, input: { mutation_id: string }) => ({ runtime_owner: integrationOwner(input.mutation_id) }), send: async () => undefined, stop: async () => undefined,
+      status: () => ({ running: false, pid: null, error_code: null, ownership: 'dead' as const }), getResumeHandle: () => null,
     };
     const manager = new WorkSessionManager({ ctxRoot, frameworkRoot, adapterFactory: () => adapter });
     const created = await manager.create({ display_name: 'Crash child', org: 'platform', harness: 'claude-code', requested_cwd: cwd, actor: 'owner:test' }, 'a051a223-4111-46fb-b4f2-27870567d55d');
@@ -174,7 +179,7 @@ describe('Crew Work Session lifecycle', () => {
       name: 'crash-child', org: 'platform', runtime: 'claude-code', actor: 'owner:test', telegram_polling: false,
       working_directory: parent.canonical_cwd, room_id: parent.room_id,
     }, childId, { sourceWorkSessionId: parent.id, parentMutationId: parentId }, {
-      ctxRoot, frameworkRoot, failAt: 'after-publication', startEmployee: async request => ({ mutation_id: request.mutation_id, started: true }),
+      ctxRoot, frameworkRoot, failAt: 'after-publication', startEmployee: async request => ({ mutation_id: request.mutation_id, name: request.name, started: true, pid: integrationProcess.pid, process_started_at: integrationProcess.started_at, disposition: 'running' }),
     })).rejects.toMatchObject({ code: 'MUTATION_PENDING' });
 
     reconcileCrewMutationJournal(ctxRoot, { frameworkRoot });

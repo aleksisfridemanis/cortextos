@@ -14,10 +14,12 @@ import { digestCrewAuditValue } from '../../../src/audit/crew-lifecycle-audit.js
 import { createWorkSessionRecord, transitionWorkSession } from '../../../src/work-sessions/registry.js';
 import { upsertRoom } from '../../../src/rooms/registry.js';
 import { WorkSessionPTY } from '../../../src/pty/work-session-pty.js';
-import { captureProcessIdentity } from '../../../src/utils/process-identity.js';
+import { captureProcessIdentity, probeProcessIdentity } from '../../../src/utils/process-identity.js';
 
 describe('WorkSessionManager', () => {
   const roots: string[] = [];
+  const testProcess = captureProcessIdentity(process.pid)!;
+  const runtimeOwner = (mutationId: string) => ({ ...testProcess, mutation_id: mutationId });
   afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 
   function fixture(failAt?: ConstructorParameters<typeof WorkSessionManager>[0]['failAt']) {
@@ -27,12 +29,16 @@ describe('WorkSessionManager', () => {
     const cwd = join(root, 'project');
     mkdirSync(join(ctxRoot, 'config'), { recursive: true });
     mkdirSync(cwd);
+    let running = false;
     const adapter: WorkSessionRuntimeAdapter = {
-      startFresh: vi.fn(async () => ({ resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' } })),
-      resumeExact: vi.fn(async () => undefined),
+      startFresh: vi.fn(async input => {
+        running = true;
+        return { resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' }, runtime_owner: runtimeOwner(input.mutation_id) };
+      }),
+      resumeExact: vi.fn(async (_handle, input) => { running = true; return { runtime_owner: runtimeOwner(input.mutation_id) }; }),
       send: vi.fn(async () => undefined),
-      stop: vi.fn(async () => undefined),
-      status: vi.fn(() => ({ running: true, pid: 1, error_code: null })),
+      stop: vi.fn(async () => { running = false; }),
+      status: vi.fn(() => ({ running, pid: running ? testProcess.pid : null, error_code: null, process_started_at: running ? testProcess.started_at : null, ownership: running ? 'attached' : 'dead' })),
       getResumeHandle: vi.fn(() => null),
     };
     const createEmployee = vi.fn(async () => ({ status: 'created' as const }));
@@ -121,7 +127,7 @@ describe('WorkSessionManager', () => {
     const { manager, adapter, cwd } = fixture();
     let releaseStart!: () => void;
     vi.mocked(adapter.startFresh).mockImplementationOnce(() => new Promise(resolve => {
-      releaseStart = () => resolve({ resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' } });
+      releaseStart = () => resolve({ resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' }, runtime_owner: runtimeOwner(mutationId) });
     }));
     const mutationId = 'b1111111-2222-4333-8444-555555555555';
     const input = { display_name: 'Bound', org: 'platform', harness: 'codex-app-server' as const, requested_cwd: cwd, actor: 'owner:test' };
@@ -145,6 +151,25 @@ describe('WorkSessionManager', () => {
     await vi.waitFor(() => expect(adapter.send).toHaveBeenCalledTimes(1));
     releaseSend();
     await sent;
+  });
+
+  it('joins an identical mutation across manager instances before launching a second effect', async () => {
+    const { manager, adapter, cwd, ctxRoot } = fixture();
+    let release!: () => void;
+    vi.mocked(adapter.startFresh).mockImplementationOnce(() => new Promise(resolve => {
+      release = () => resolve({ resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' }, runtime_owner: runtimeOwner(mutationId) });
+    }));
+    const secondAdapter = { ...adapter, startFresh: vi.fn(async () => { throw new Error('second adapter must not start'); }) };
+    const second = new WorkSessionManager({ ctxRoot, adapterFactory: () => secondAdapter });
+    const mutationId = 'b3111111-2222-4333-8444-555555555555';
+    const input = { display_name: 'Cross manager', org: 'platform', harness: 'codex-app-server' as const, requested_cwd: cwd, actor: 'owner:test' };
+    const first = manager.create(input, mutationId);
+    const joined = second.create(input, mutationId);
+    expect(joined).toBe(first);
+    await vi.waitFor(() => expect(adapter.startFresh).toHaveBeenCalledTimes(1));
+    expect(secondAdapter.startFresh).not.toHaveBeenCalled();
+    release();
+    await first;
   });
 
   it('rejects a new mutation while the same Work Session has unresolved ownership', async () => {
@@ -174,6 +199,17 @@ describe('WorkSessionManager', () => {
     expect(adapter.startFresh).toHaveBeenCalledTimes(1);
     await expect(manager.create({ display_name: 'Second', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'a2222222-2222-4222-8222-222222222222'))
       .rejects.toMatchObject({ code: 'CWD_LEASE_CONFLICT' });
+  });
+
+  it('rejects a successful adapter response that omits mandatory process identity', async () => {
+    const { manager, adapter, cwd } = fixture();
+    vi.mocked(adapter.startFresh).mockResolvedValueOnce({
+      resume_handle: { runtime: 'codex-app-server', thread_id: 'unowned' },
+    } as never);
+    await expect(manager.create({
+      display_name: 'Missing owner', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test',
+    }, 'a3111111-1111-4111-8111-111111111111')).rejects.toMatchObject({ code: 'PROCESS_IDENTITY_UNAVAILABLE' });
+    expect(manager.list()[0]).toMatchObject({ lifecycle: 'failed', runtime_owner: null });
   });
 
   it('retains the cwd lease when stop cannot confirm process death', async () => {
@@ -209,9 +245,9 @@ describe('WorkSessionManager', () => {
     const root = roots.at(-1)!;
     const ctxRoot = join(root, 'ctx');
     const adapter: WorkSessionRuntimeAdapter = {
-      startFresh: vi.fn(async () => ({ resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' } })),
-      resumeExact: vi.fn(async () => undefined), send: vi.fn(async () => undefined), stop: vi.fn(async () => undefined),
-      status: vi.fn(() => ({ running: true, pid: 1, error_code: null })), getResumeHandle: vi.fn(() => null),
+      startFresh: vi.fn(async input => ({ resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' }, runtime_owner: runtimeOwner(input.mutation_id) })),
+      resumeExact: vi.fn(async (_handle, input) => ({ runtime_owner: runtimeOwner(input.mutation_id) })), send: vi.fn(async () => undefined), stop: vi.fn(async () => undefined),
+      status: vi.fn(() => ({ running: false, pid: null, error_code: null, ownership: 'dead' })), getResumeHandle: vi.fn(() => null),
     };
     const failing = new WorkSessionManager({ ctxRoot, adapterFactory: () => adapter, failAt: 'after-session-record' });
     await expect(failing.create({ display_name: 'First', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '61111111-1111-4111-8111-111111111111')).rejects.toThrow();
@@ -421,6 +457,10 @@ describe('WorkSessionManager', () => {
         process_started_at: identity.started_at,
         ownership: 'attached',
       });
+      vi.mocked(adapter.startFresh).mockResolvedValueOnce({
+        resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-exact' },
+        runtime_owner: { ...identity, mutation_id: 'f2111111-1111-4111-8111-111111111111' },
+      });
       const created = await manager.create({
         display_name: 'Restart ownership', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test',
       }, 'f2111111-1111-4111-8111-111111111111');
@@ -433,13 +473,41 @@ describe('WorkSessionManager', () => {
           ctxRoot, frameworkRoot: roots.at(-1)!, instanceId: 'test', record,
         }),
       });
-      await expect(restarted.reconcilePending()).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+      await expect(restarted.reconcilePending()).resolves.toMatchObject({ pending: 0 });
       expect(restarted.get(created.id)?.lifecycle).toBe('active');
 
       child.kill('SIGTERM');
       if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
       await expect(restarted.reconcilePending()).resolves.toMatchObject({ pending: 0 });
       expect(restarted.get(created.id)).toMatchObject({ lifecycle: 'archived', runtime_owner: null });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  }, 15_000);
+
+  it('terminates the exact detached child before archiving on stop after manager restart', async () => {
+    const { manager, adapter, cwd, ctxRoot } = fixture();
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      const identity = await vi.waitFor(() => {
+        const value = captureProcessIdentity(child.pid!);
+        expect(value).not.toBeNull();
+        return value!;
+      }, { timeout: 5_000 });
+      vi.mocked(adapter.startFresh).mockResolvedValueOnce({
+        resume_handle: { runtime: 'codex-app-server', thread_id: 'thread-detached' },
+        runtime_owner: { ...identity, mutation_id: 'f3111111-1111-4111-8111-111111111111' },
+      });
+      const created = await manager.create({
+        display_name: 'Detached stop', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test',
+      }, 'f3111111-1111-4111-8111-111111111111');
+      const restarted = new WorkSessionManager({
+        ctxRoot,
+        adapterFactory: record => new WorkSessionPTY({ ctxRoot, frameworkRoot: roots.at(-1)!, instanceId: 'test', record, timeoutMs: 2_000 }),
+      });
+      const stopped = await restarted.stop(created.id, 'owner:test', 'f3222222-2222-4222-8222-222222222222');
+      expect(stopped).toMatchObject({ lifecycle: 'archived', runtime_owner: null });
+      await vi.waitFor(() => expect(probeProcessIdentity(identity)).toBe('dead'), { timeout: 5_000 });
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
