@@ -88,6 +88,9 @@ export class WorkSessionManager {
 
   /** Drive durable Work Session mutations during daemon startup, before IPC opens. */
   async reconcilePending(): Promise<{ finalized: number; pending: number }> {
+    // Completed harness output is spooled before room publication. Drain every
+    // surviving spool before mutation reconciliation opens the daemon to IPC.
+    for (const record of this.list()) this.adapter(record).reconcileOutputInbox?.();
     reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
     for (const record of this.list()) {
       if (!['starting', 'active', 'stopping'].includes(record.lifecycle)) continue;

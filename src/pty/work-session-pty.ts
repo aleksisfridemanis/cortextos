@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync,
+  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, readdirSync, unlinkSync, writeFileSync,
 } from 'fs';
 import { execFileSync } from 'child_process';
 import { join } from 'path';
@@ -558,12 +558,66 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
 
   private emitOutput(output: WorkSessionRuntimeOutput): void {
     try {
-      this.options.onOutput?.(output);
+      this.enqueueOutput(output);
+      this.reconcileOutputInbox();
     } catch (error) {
       // PTY data events execute outside the request promise. A persistence
       // failure must be observable without escaping as a daemon-fatal throw.
+      try {
+        atomicWriteSync(this.outputRecoveryPath(), JSON.stringify({
+          schema_version: 1, session_id: this.options.record.id,
+          error_code: 'OUTPUT_RECOVERY_REQUIRED', updated_at: new Date().toISOString(),
+        }, null, 2));
+      } catch { /* the original durable failure remains authoritative */ }
       console.error(`[work-session] output persistence failed: ${(error as Error).message}`);
     }
+  }
+
+  private outputInboxPath(): string {
+    return join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id, 'output-inbox');
+  }
+
+  private outputRecoveryPath(): string {
+    return join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id, 'output-recovery-required.json');
+  }
+
+  private enqueueOutput(output: WorkSessionRuntimeOutput): void {
+    if (!output.id || !output.text.trim()) return;
+    const directory = this.outputInboxPath();
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const path = join(directory, `${createHash('sha256').update(output.id).digest('hex')}.json`);
+    const body = JSON.stringify({ schema_version: 1, session_id: this.options.record.id, output }, null, 2);
+    if (existsSync(path)) {
+      const prior = JSON.parse(readFileSync(path, 'utf8')) as { session_id?: unknown; output?: unknown };
+      if (prior.session_id !== this.options.record.id || JSON.stringify(prior.output) !== JSON.stringify(output)) {
+        throw new Error('OUTPUT_ID_CONFLICT');
+      }
+      return;
+    }
+    atomicWriteSync(path, body);
+  }
+
+  /** Publish durable completed output and remove each inbox item only after success. */
+  reconcileOutputInbox(): number {
+    const directory = this.outputInboxPath();
+    if (!existsSync(directory)) return 0;
+    if (!this.options.onOutput) return readdirSync(directory).filter(name => name.endsWith('.json')).length;
+    let published = 0;
+    for (const name of readdirSync(directory).filter(entry => entry.endsWith('.json')).sort()) {
+      const path = join(directory, name);
+      const envelope = JSON.parse(readFileSync(path, 'utf8')) as {
+        schema_version?: unknown; session_id?: unknown; output?: WorkSessionRuntimeOutput;
+      };
+      if (envelope.schema_version !== 1 || envelope.session_id !== this.options.record.id
+        || !envelope.output || typeof envelope.output.id !== 'string' || typeof envelope.output.text !== 'string') {
+        throw new Error('OUTPUT_INBOX_CORRUPT');
+      }
+      this.options.onOutput(envelope.output);
+      unlinkSync(path);
+      published += 1;
+    }
+    try { unlinkSync(this.outputRecoveryPath()); } catch { /* no recovery marker */ }
+    return published;
   }
 
   private completedOutput(value: Record<string, unknown>): WorkSessionRuntimeOutput | null {

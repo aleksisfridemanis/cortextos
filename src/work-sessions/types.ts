@@ -57,6 +57,7 @@ export interface WorkSessionRuntimeAdapter {
   status(): WorkSessionRuntimeStatus;
   getResumeHandle(): WorkSessionResumeHandle | null;
   getRuntimeOwner?(): (ProcessIdentity & { mutation_id: string }) | null;
+  reconcileOutputInbox?(): number;
 }
 
 export interface WorkSessionRuntimeOutput {

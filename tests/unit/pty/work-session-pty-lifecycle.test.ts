@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,13 +14,14 @@ const native = vi.hoisted(() => ({
 describe('WorkSessionPTY owned lifecycle', () => {
   let cwd: string;
   let adapter: WorkSessionPTY;
+  let record: WorkSessionRecord;
 
   beforeEach(() => {
     cwd = realpathSync(mkdtempSync(join(tmpdir(), 'work-session-pty-')));
     native.exit = undefined;
     native.kill.mockReset();
     native.write.mockReset();
-    const record: WorkSessionRecord = {
+    record = {
       schema_version: 1, kind: 'work_session', id: 'ws-one', display_name: 'One', org: 'platform',
       harness: 'codex-app-server', model: null, requested_cwd: cwd, canonical_cwd: cwd, room_id: 'room-one',
       lifecycle: 'active', resume_handle: null, mutation_id: '11111111-1111-4111-8111-111111111111',
@@ -111,5 +112,29 @@ describe('WorkSessionPTY owned lifecycle', () => {
     internals.options.onOutput = output;
     internals.capture('> prompt echo\rstatus redraw\rtool chrome\n');
     expect(output).not.toHaveBeenCalled();
+  });
+
+  it('replays a durably spooled completion after room publication fails and the daemon restarts', () => {
+    const publish = vi.fn(() => { throw new Error('room unavailable'); });
+    const internals = adapter as unknown as {
+      options: { onOutput?: (value: { id: string; text: string }) => void };
+      emitOutput(value: { id: string; text: string }): void;
+    };
+    internals.options.onOutput = publish;
+    internals.emitOutput({ id: 'native-completion-1', text: 'durable answer' });
+
+    const state = join(cwd, 'ctx', 'state', 'work-sessions', record.id);
+    expect(readdirSync(join(state, 'output-inbox'))).toHaveLength(1);
+    expect(existsSync(join(state, 'output-recovery-required.json'))).toBe(true);
+
+    const recovered = vi.fn();
+    const restarted = new WorkSessionPTY({
+      ctxRoot: join(cwd, 'ctx'), frameworkRoot: cwd, instanceId: 'test', record,
+      onOutput: recovered,
+    });
+    expect(restarted.reconcileOutputInbox()).toBe(1);
+    expect(recovered).toHaveBeenCalledWith({ id: 'native-completion-1', text: 'durable answer' });
+    expect(readdirSync(join(state, 'output-inbox'))).toEqual([]);
+    expect(existsSync(join(state, 'output-recovery-required.json'))).toBe(false);
   });
 });
