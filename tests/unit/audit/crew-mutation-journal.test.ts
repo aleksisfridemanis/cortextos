@@ -167,4 +167,36 @@ describe('Crew mutation journal', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('does not certify an old lifecycle receipt against state owned by a later mutation', () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-stale-receipt-'));
+    const cwd = join(root, 'project');
+    mkdirSync(cwd);
+    try {
+      const createId = 'a1111111-1111-4111-8111-111111111111';
+      const stopId = 'a2222222-2222-4222-8222-222222222222';
+      const laterId = 'a3333333-3333-4333-8333-333333333333';
+      const target = `ws-${createId}`;
+      createWorkSessionRecord(root, {
+        id: target, display_name: 'Owned', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd,
+        room_id: `work-${createId}`, mutation_id: createId, created_by: 'owner:1',
+      });
+      prepareCrewMutation(root, {
+        mutation_id: stopId, idempotency_key: stopId, actor: 'owner:1', target: { kind: 'work_session', id: target }, action: 'stop',
+        request_digest: '1'.repeat(64), before_digest: '2'.repeat(64), intended_after_digest: '3'.repeat(64),
+      });
+      commitCrewMutationState(root, stopId, '4'.repeat(64));
+      startCrewMutationEffect(root, stopId);
+      recordCrewMutationEffect(root, stopId, { mutation_id: stopId, stopped: true });
+      const records = readWorkSessions(root);
+      records[0].lifecycle = 'archived';
+      records[0].mutation_id = laterId;
+      writeFileSync(join(root, 'config', 'work-sessions.json'), JSON.stringify(records));
+
+      expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 0, pending: 1 });
+      expect(getCrewMutation(root, stopId)?.stage).toBe('effect_recorded');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

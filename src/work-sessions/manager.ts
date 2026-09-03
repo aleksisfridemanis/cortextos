@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync } from 'fs';
 import { digestCrewAuditValue } from '../audit/crew-lifecycle-audit.js';
 import {
   commitCrewMutationState, finalizeCrewMutationAudit, getCrewMutation, prepareCrewMutation,
-  recordCrewMutationEffect, startCrewMutationEffect,
+  listPendingCrewMutations, reconcileCrewMutationJournal, recordCrewMutationEffect, startCrewMutationEffect,
 } from '../audit/crew-mutation-journal.js';
 import { createEmployee as createEmployeeService, type CreateEmployeeInput } from '../agents/create-employee.js';
 import { createWorkSessionRecord, readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession, WorkSessionRegistryError } from './registry.js';
@@ -59,6 +59,13 @@ export class WorkSessionManager {
     const created = this.dependencies.adapterFactory(record);
     this.adapters.set(record.id, created);
     return created;
+  }
+
+  private assertTargetAvailable(targetId: string, mutationId: string): void {
+    reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+    const pending = listPendingCrewMutations(this.dependencies.ctxRoot)
+      .find(entry => entry.target.kind === 'work_session' && entry.target.id === targetId && entry.mutation_id !== mutationId);
+    if (pending) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session has a pending mutation');
   }
 
   private prepare(record: WorkSessionRecord, actor: string, action: 'stop' | 'resume' | 'promote' | 'message', mutationId: string, request: unknown) {
@@ -133,6 +140,7 @@ export class WorkSessionManager {
       if (prior.stage === 'finalized' && prior.final_result?.result === 'success') return this.originalResult(prior);
       throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session mutation requires reconciliation');
     }
+    this.assertTargetAvailable(id, mutationId);
     const prepared = prepareCrewMutation(this.dependencies.ctxRoot, {
       mutation_id: mutationId, idempotency_key: mutationId, actor: input.actor,
       target: { kind: 'work_session', id }, action: 'create',
@@ -210,6 +218,7 @@ export class WorkSessionManager {
     if (typeof text !== 'string' || !text || Buffer.byteLength(text, 'utf8') > 65_536) throw new WorkSessionRegistryError('INVALID_MESSAGE', 'Invalid Work Session message');
     const request = { text_digest: digestCrewAuditValue(text) };
     if (this.priorMutation(mutationId, actor, 'message', id, request)) return;
+    this.assertTargetAvailable(id, mutationId);
     const record = this.require(id, ['active']);
     const prepared = this.prepare(record, actor, 'message', mutationId, request);
     if (prepared.reused) {
@@ -237,6 +246,7 @@ export class WorkSessionManager {
     validateMutationActor(mutationId, actor);
     const prior = this.priorMutation(mutationId, actor, 'stop', id, { id });
     if (prior) return this.originalResult(prior);
+    this.assertTargetAvailable(id, mutationId);
     let record = this.require(id, ['starting', 'active', 'archived']);
     const prepared = this.prepare(record, actor, 'stop', mutationId, { id });
     if (prepared.reused && prepared.entry.stage === 'finalized') return record;
@@ -282,6 +292,7 @@ export class WorkSessionManager {
     const request = { id, handle_digest: digestCrewAuditValue(handle) };
     const prior = this.priorMutation(mutationId, actor, 'resume', id, request);
     if (prior) return this.originalResult(prior);
+    this.assertTargetAvailable(id, mutationId);
     record = this.require(id, ['archived', 'failed']);
     const prepared = this.prepare(record, actor, 'resume', mutationId, request);
     if (prepared.reused && prepared.entry.stage === 'finalized') return record;
@@ -313,6 +324,7 @@ export class WorkSessionManager {
     validateMutationActor(mutationId, input?.actor);
     const request = { id, employee: input.name };
     if (this.priorMutation(mutationId, input.actor, 'promote', id, request)) return;
+    this.assertTargetAvailable(id, mutationId);
     let record = this.require(id, ['active']);
     const prepared = this.prepare(record, input.actor, 'promote', mutationId, request);
     if (prepared.reused && prepared.entry.stage === 'finalized') return;

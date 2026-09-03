@@ -4,6 +4,8 @@ import { join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkSessionManager } from '../../../src/work-sessions/manager.js';
 import type { WorkSessionRuntimeAdapter } from '../../../src/work-sessions/types.js';
+import { prepareCrewMutation } from '../../../src/audit/crew-mutation-journal.js';
+import { digestCrewAuditValue } from '../../../src/audit/crew-lifecycle-audit.js';
 
 describe('WorkSessionManager', () => {
   const roots: string[] = [];
@@ -79,6 +81,21 @@ describe('WorkSessionManager', () => {
     const created = await manager.create({ display_name: 'Fix release', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '11111111-1111-4111-8111-111111111111');
     await manager.send(created.id, 'first', 'owner:test', '22222222-2222-4222-8222-222222222222');
     await expect(manager.send(created.id, 'different', 'owner:test', '22222222-2222-4222-8222-222222222222')).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+  });
+
+  it('rejects a new mutation while the same Work Session has unresolved ownership', async () => {
+    const { manager, adapter, cwd } = fixture();
+    const created = await manager.create({ display_name: 'Pending', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'd1111111-1111-4111-8111-111111111111');
+    const pending = 'd2222222-2222-4222-8222-222222222222';
+    prepareCrewMutation(roots.at(-1)! + '/ctx', {
+      mutation_id: pending, idempotency_key: pending, actor: 'owner:test', target: { kind: 'work_session', id: created.id }, action: 'message',
+      request_digest: digestCrewAuditValue({ text_digest: digestCrewAuditValue('pending') }),
+      before_digest: '1'.repeat(64), intended_after_digest: '2'.repeat(64),
+    });
+
+    await expect(manager.stop(created.id, 'owner:test', 'd3333333-3333-4333-8333-333333333333'))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(adapter.stop).not.toHaveBeenCalled();
   });
 
   it('retains the cwd lease when startup cleanup cannot confirm process death', async () => {

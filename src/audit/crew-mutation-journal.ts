@@ -448,7 +448,8 @@ function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): R
     record = Array.isArray(records) ? records.find(item => item.id === entry.target.id) : undefined;
   } catch { return null; }
   if (!record) return null;
-  if (entry.action === 'create' && record.mutation_id !== entry.mutation_id) return null;
+  if (['create', 'stop', 'resume', 'promote'].includes(entry.action)
+    && record.mutation_id !== entry.mutation_id) return null;
   const receipt = entry.effect_receipt;
   if (entry.stage !== 'effect_recorded' || !receipt) return 'pending';
   const afterDigest = workSessionDigest(record);
@@ -488,6 +489,7 @@ function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): R
   }
   if (entry.action === 'message') {
     if (receipt.mutation_id !== entry.mutation_id || receipt.delivered !== true || typeof record.room_id !== 'string') return null;
+    if (entry.state_digest !== afterDigest) return null;
     try {
       const lines = readFileSync(join(ctxRoot, 'rooms', record.room_id, 'log.jsonl'), 'utf8').split('\n');
       if (!lines.some(line => {
