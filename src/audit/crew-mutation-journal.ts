@@ -116,7 +116,7 @@ function heldByAnotherLiveProcess(entry: CrewMutationJournalEntry): boolean {
   if (exists === false) return false;
   const observed = processStartedAt(lease.owner_pid);
   if (observed === lease.owner_process_started_at) return lease.owner_pid !== process.pid;
-  if (exists !== false && observed === null && Date.parse(lease.expires_at) > Date.now()) return lease.owner_pid !== process.pid;
+  if (observed === null && Date.parse(lease.expires_at) > Date.now()) return lease.owner_pid !== process.pid;
   return false;
 }
 

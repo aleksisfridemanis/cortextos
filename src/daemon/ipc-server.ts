@@ -12,7 +12,6 @@ import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
 import { createEmployee, CrewServiceError, type CreateEmployeeInput } from '../agents/create-employee.js';
 import { homedir } from 'os';
 import { applyContextOwnerDecision, getContextOwnershipReview, resolveEmployeeContextPaths } from '../context/owner-controls.js';
-import { reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
 import { WorkSessionRegistryError } from '../work-sessions/registry.js';
 import type { CreateWorkSessionInput, WorkSessionEmployeeInput } from '../work-sessions/types.js';
 
@@ -636,8 +635,10 @@ export class IPCServer {
         }
 
         case 'reconcile-crew': {
-          const ctxRoot = process.env.CTX_ROOT ?? join(homedir(), '.cortextos', this.instanceId);
-          response = { success: true, data: reconcileCrewMutationJournal(ctxRoot) };
+          const result = await this.agentManager.reconcileCrewMutations();
+          response = result.pending === 0
+            ? { success: true, data: result }
+            : { success: false, data: result, error: 'Crew recovery remains pending', code: 'CREW_RECOVERY_REQUIRED' };
           break;
         }
 

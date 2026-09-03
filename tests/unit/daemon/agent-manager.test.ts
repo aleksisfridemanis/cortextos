@@ -83,6 +83,25 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     })).resolves.toMatchObject({ started: true, pid: 4242, process_started_at: '2026-09-03T00:00:00.000Z' });
   });
 
+  it('returns stable unresolved recovery reasons instead of declaring startup safe', async () => {
+    mkdirSync(join(frameworkRoot, 'templates', 'agent'), { recursive: true });
+    writeFileSync(join(frameworkRoot, 'templates', 'agent', 'config.json'), '{}');
+    writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), '{}');
+    writeFileSync(join(ctxRoot, 'config', 'rooms.json'), '[]');
+    const { createEmployee } = await import('../../../src/agents/create-employee.js');
+    await expect(createEmployee({
+      name: 'pending', org: 'acme', runtime: 'claude-code', telegram_polling: false, actor: 'owner:test',
+    }, '33333333-3333-4333-8333-333333333333', {
+      ctxRoot, frameworkRoot, failAt: 'after-effect-start',
+    })).rejects.toMatchObject({ code: 'MUTATION_PENDING' });
+
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    await expect(am.reconcileCrewMutations()).resolves.toMatchObject({
+      pending: 1,
+      reasons: [expect.stringContaining('employee:pending:')],
+    });
+  });
+
   it('skips agents marked enabled: false in enabled-agents.json', async () => {
     // Mark alice as disabled at the instance level (the file the CLI writes to)
     writeFileSync(

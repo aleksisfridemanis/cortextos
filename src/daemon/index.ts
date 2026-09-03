@@ -263,7 +263,10 @@ class Daemon {
     // Finish or classify every durable Crew mutation before accepting new IPC
     // traffic. A corrupt journal fails startup closed instead of hiding an
     // applied-but-unaudited lifecycle or owner decision.
-    await this.agentManager.reconcileCrewMutations();
+    const recovery = await this.agentManager.reconcileCrewMutations();
+    if (recovery.pending > 0) {
+      throw new Error(`CREW_RECOVERY_REQUIRED: ${recovery.reasons.join(', ')}`);
+    }
 
     // Start IPC server
     this.ipcServer = new IPCServer(this.agentManager, this.instanceId);

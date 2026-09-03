@@ -31,7 +31,7 @@ import {
   type EmployeeStartReceipt,
   type EmployeeStartRequest,
 } from '../agents/create-employee.js';
-import { listPendingCrewMutations, reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
+import { listPendingCrewMutations, readCrewMutationJournal, reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
 import { promotionEmployeeMutationId } from '../work-sessions/promotion.js';
 
 type LogFn = (msg: string) => void;
@@ -171,7 +171,8 @@ export class AgentManager {
   }
 
   /** Complete restart-safe Crew recovery before the daemon accepts IPC. */
-  async reconcileCrewMutations(): Promise<void> {
+  async reconcileCrewMutations(): Promise<{ finalized: number; pending: number; reasons: string[] }> {
+    const reasons: string[] = [];
     reconcileCrewMutationJournal(this.ctxRoot, { frameworkRoot: this.frameworkRoot });
     for (const entry of listPendingCrewMutations(this.ctxRoot)) {
       if (entry.target.kind !== 'employee' || entry.action !== 'create'
@@ -209,11 +210,23 @@ export class AgentManager {
           });
         }
       } catch (error) {
+        const reason = `employee:${entry.target.id}:${(error as Error).message}`;
+        reasons.push(reason);
         console.error(`[agent-manager] Crew Employee recovery remains pending for ${entry.target.id}: ${(error as Error).message}`);
       }
     }
     await this.workSessions.reconcilePending();
     reconcileCrewMutationJournal(this.ctxRoot, { frameworkRoot: this.frameworkRoot });
+    const pending = listPendingCrewMutations(this.ctxRoot);
+    for (const entry of pending) {
+      const prefix = `${entry.target.kind}:${entry.target.id}:${entry.action}:${entry.stage}`;
+      if (!reasons.some(reason => reason.startsWith(`${entry.target.kind}:${entry.target.id}:`))) reasons.push(prefix);
+    }
+    return {
+      finalized: readCrewMutationJournal(this.ctxRoot).filter(entry => entry.stage === 'finalized').length,
+      pending: pending.length,
+      reasons: [...new Set(reasons)].sort(),
+    };
   }
 
   async startEmployeeForMutation(request: EmployeeStartRequest): Promise<EmployeeStartReceipt> {
