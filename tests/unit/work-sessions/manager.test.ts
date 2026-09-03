@@ -113,6 +113,9 @@ describe('WorkSessionManager', () => {
     await expect(manager.create({ display_name: 'Unsafe start', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'a1111111-1111-4111-8111-111111111111'))
       .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
     expect(manager.list()[0]).toMatchObject({ lifecycle: 'starting', last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' });
+    await expect(manager.create({ display_name: 'Unsafe start', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'a1111111-1111-4111-8111-111111111111'))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(adapter.startFresh).toHaveBeenCalledTimes(1);
     await expect(manager.create({ display_name: 'Second', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'a2222222-2222-4222-8222-222222222222'))
       .rejects.toMatchObject({ code: 'CWD_LEASE_CONFLICT' });
   });
@@ -138,6 +141,9 @@ describe('WorkSessionManager', () => {
     await expect(manager.resume(created.id, 'owner:test', 'c3333333-3333-4333-8333-333333333333'))
       .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
     expect(manager.get(created.id)).toMatchObject({ lifecycle: 'starting', last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' });
+    await expect(manager.resume(created.id, 'owner:test', 'c3333333-3333-4333-8333-333333333333'))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(adapter.resumeExact).toHaveBeenCalledTimes(1);
     await expect(manager.create({ display_name: 'Blocked', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'c4444444-4444-4444-8444-444444444444'))
       .rejects.toMatchObject({ code: 'CWD_LEASE_CONFLICT' });
   });

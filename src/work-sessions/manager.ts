@@ -54,6 +54,7 @@ function resultSnapshot(record: WorkSessionRecord): Record<string, unknown> {
 
 export class WorkSessionManager {
   private readonly adapters = new Map<string, WorkSessionRuntimeAdapter>();
+  private readonly mutationRuns = new Map<string, Promise<unknown>>();
   private readonly now: () => string;
   constructor(private readonly dependencies: Dependencies) { this.now = dependencies.now ?? (() => new Date().toISOString()); }
 
@@ -118,7 +119,19 @@ export class WorkSessionManager {
     return { ...record, resume_handle: current.resume_handle } as unknown as WorkSessionRecord;
   }
 
-  async create(input: CreateWorkSessionInput, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
+  create(input: CreateWorkSessionInput, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
+    const current = this.mutationRuns.get(mutationId) as Promise<WorkSessionRecord> | undefined;
+    if (current) return current;
+    const run = this.createOnce(input, mutationId);
+    this.mutationRuns.set(mutationId, run);
+    void run.then(
+      () => { if (this.mutationRuns.get(mutationId) === run) this.mutationRuns.delete(mutationId); },
+      () => { if (this.mutationRuns.get(mutationId) === run) this.mutationRuns.delete(mutationId); },
+    );
+    return run;
+  }
+
+  private async createOnce(input: CreateWorkSessionInput, mutationId: string): Promise<WorkSessionRecord> {
     validateMutationActor(mutationId, input?.actor);
     if (!input || typeof input.display_name !== 'string' || input.display_name.length < 1 || input.display_name.length > 64
       || typeof input.requested_cwd !== 'string' || !isAbsolute(input.requested_cwd)
@@ -177,10 +190,8 @@ export class WorkSessionManager {
               const result = await this.adapter(recoveryRecord).startFresh({ id, cwd: recoveryRecord.canonical_cwd, model: input.model, context });
               recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', { resume_handle: result.resume_handle }, mutationId);
             }
-          } else if (recoveryRecord.lifecycle === 'starting') {
-            const handle = this.adapter(recoveryRecord).getResumeHandle();
-            if (!handle) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Running Work Session handle is unavailable');
-            recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', { resume_handle: handle }, mutationId);
+          } else {
+            throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime readiness is not mutation-bound');
           }
           if (!recoveryRecord.resume_handle) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Recovered Work Session handle is unavailable');
           recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, {
@@ -386,7 +397,19 @@ export class WorkSessionManager {
     }
   }
 
-  async resume(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
+  resume(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
+    const current = this.mutationRuns.get(mutationId) as Promise<WorkSessionRecord> | undefined;
+    if (current) return current;
+    const run = this.resumeOnce(id, actor, mutationId);
+    this.mutationRuns.set(mutationId, run);
+    void run.then(
+      () => { if (this.mutationRuns.get(mutationId) === run) this.mutationRuns.delete(mutationId); },
+      () => { if (this.mutationRuns.get(mutationId) === run) this.mutationRuns.delete(mutationId); },
+    );
+    return run;
+  }
+
+  private async resumeOnce(id: string, actor: string, mutationId: string): Promise<WorkSessionRecord> {
     validateMutationActor(mutationId, actor);
     let record = this.get(id);
     if (!record) throw new WorkSessionRegistryError('NOT_FOUND', 'Work Session not found');
@@ -406,9 +429,10 @@ export class WorkSessionManager {
       if (recoveryRecord.mutation_id !== mutationId) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session state is owned by another mutation');
       if (prior.stage === 'state_committed') startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
       try {
-        if (!this.adapter(recoveryRecord).status().running) {
-          await this.adapter(recoveryRecord).resumeExact(handle, { id, cwd: recoveryRecord.canonical_cwd, model: recoveryRecord.model ?? undefined });
+        if (this.adapter(recoveryRecord).status().running) {
+          throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime resume readiness is not mutation-bound');
         }
+        await this.adapter(recoveryRecord).resumeExact(handle, { id, cwd: recoveryRecord.canonical_cwd, model: recoveryRecord.model ?? undefined });
         if (recoveryRecord.lifecycle === 'starting') {
           recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {}, mutationId);
         }
