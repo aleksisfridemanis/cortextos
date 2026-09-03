@@ -168,7 +168,7 @@ export interface PersistedSendIntent {
   uploads: Array<{ url: string; cleanup_token: string }>;
 }
 
-interface PersistedLifecycleIntent {
+export interface PersistedLifecycleIntent {
   version: 1;
   principal: string;
   target: string;
@@ -176,6 +176,41 @@ interface PersistedLifecycleIntent {
   action: 'stop' | 'resume' | 'promote';
   requestDigest: string;
   employee?: Record<string, unknown>;
+}
+
+const MUTATION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function parsePersistedLifecycleIntents(raw: string | null, principal: string, target: string): PersistedLifecycleIntent[] | null {
+  if (!raw) return [];
+  try {
+    const envelope = JSON.parse(raw) as Record<string, unknown>;
+    if (envelope.version !== 1 || envelope.principal !== principal || envelope.target !== target) return null;
+    if (envelope.lifecycle === undefined) return [];
+    if (!Array.isArray(envelope.lifecycle)) return null;
+    const parsed: PersistedLifecycleIntent[] = [];
+    for (const candidate of envelope.lifecycle) {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+      const item = candidate as Record<string, unknown>;
+      if (item.version !== 1 || item.principal !== principal || item.target !== target
+        || typeof item.id !== 'string' || !MUTATION_UUID.test(item.id)
+        || !['stop', 'resume', 'promote'].includes(String(item.action)) || typeof item.requestDigest !== 'string') return null;
+      const action = item.action as PersistedLifecycleIntent['action'];
+      if (action !== 'promote') {
+        if ('employee' in item || item.requestDigest !== `${target}:${action}`) return null;
+      } else {
+        if (!item.employee || typeof item.employee !== 'object' || Array.isArray(item.employee)) return null;
+        const employee = item.employee as Record<string, unknown>;
+        if (Object.keys(employee).some(key => !['name', 'org', 'runtime', 'model'].includes(key))
+          || typeof employee.name !== 'string' || !/^[a-z0-9_-]{1,64}$/.test(employee.name)
+          || typeof employee.org !== 'string' || !/^[a-z0-9_-]{1,64}$/.test(employee.org)
+          || !['claude-code', 'codex-app-server', 'opencode'].includes(String(employee.runtime))
+          || (employee.model !== undefined && (typeof employee.model !== 'string' || employee.model.length < 1 || employee.model.length > 128))
+          || item.requestDigest !== promotionMutationKey(target, employee)) return null;
+      }
+      parsed.push(item as unknown as PersistedLifecycleIntent);
+    }
+    return parsed;
+  } catch { return null; }
 }
 
 export function restoredLifecycleActionLabel(action: PersistedLifecycleIntent['action']): string {
@@ -816,17 +851,14 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
     try {
       const raw = sessionStorage.getItem(workSessionIntentStorageKey(user, agent.targetId));
       const send = parsePersistedSendIntent(raw, user, agent.targetId);
-      const envelope = raw ? JSON.parse(raw) as { lifecycle?: PersistedLifecycleIntent[] } : {};
+      const lifecycle = parsePersistedLifecycleIntents(raw, user, agent.targetId);
+      if (lifecycle === null) {
+        sessionStorage.removeItem(workSessionIntentStorageKey(user, agent.targetId));
+        return;
+      }
       if (send?.state === 'pending') pendingSendRef.current = send;
       if (send?.state === 'terminal') { terminalSendRef.current = send; setRetryAnywayAvailable(true); }
-      for (const item of envelope.lifecycle ?? []) {
-        if (item?.version === 1 && item.principal === user && item.target === agent.targetId
-          && typeof item.id === 'string' && typeof item.requestDigest === 'string'
-          && ['stop', 'resume', 'promote'].includes(item.action)
-          && (item.employee === undefined || (item.employee !== null && typeof item.employee === 'object' && !Array.isArray(item.employee)))) {
-          pendingLifecycleRef.current.set(item.requestDigest, item);
-        }
-      }
+      for (const item of lifecycle) pendingLifecycleRef.current.set(item.requestDigest, item);
       setRestoredLifecycleIntents([...pendingLifecycleRef.current.values()]);
       if (send || pendingLifecycleRef.current.size) {
         setRestoredIntentNotice(`Restored pending operation ${send?.id ?? [...pendingLifecycleRef.current.values()][0]?.id}`);

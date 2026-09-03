@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, parsePersistedSendIntent, promotionMutationKey, restoredLifecycleActionLabel, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionIntentStorageKey, workSessionLifecycleAction } from '../crew-chat';
+import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, parsePersistedLifecycleIntents, parsePersistedSendIntent, promotionMutationKey, restoredLifecycleActionLabel, retainedSendMutationId, sendIntentKey, shouldRefocus, shouldRetainMutationId, shouldSpeakMessage, workSessionIntentStorageKey, workSessionLifecycleAction } from '../crew-chat';
 import { shouldTriggerPullRefresh, resolveInitialSelection } from '../use-crew';
 import { prefetchTargets } from '../crew-roster';
 import type { RosterEntry } from '../crew-roster';
@@ -102,6 +102,19 @@ describe('Work Session message identity and delivery state', () => {
   it('keeps restored lifecycle actions explicitly actionable after lifecycle changes', () => {
     expect(restoredLifecycleActionLabel('stop')).toBe('Resume pending stop');
     expect(restoredLifecycleActionLabel('promote')).toBe('Resume pending promote');
+  });
+  it('accepts only exact action-specific persisted lifecycle bindings', () => {
+    const base = { version: 1, principal: 'owner:alice', target: 'ws-one' };
+    const id = '11111111-1111-4111-8111-111111111111';
+    expect(parsePersistedLifecycleIntents(JSON.stringify({ ...base, lifecycle: [{ ...base, id, action: 'stop', requestDigest: 'ws-one:stop' }] }), base.principal, base.target)).toHaveLength(1);
+    const employee = { name: 'ada', org: 'platform', runtime: 'codex-app-server' };
+    expect(parsePersistedLifecycleIntents(JSON.stringify({ ...base, lifecycle: [{ ...base, id, action: 'promote', employee, requestDigest: promotionMutationKey(base.target, employee) }] }), base.principal, base.target)).toHaveLength(1);
+    for (const lifecycle of [
+      [{ ...base, id: 'not-a-uuid', action: 'stop', requestDigest: 'ws-one:stop' }],
+      [{ ...base, id, action: 'stop', requestDigest: 'ws-one:resume' }],
+      [{ ...base, id, action: 'resume', requestDigest: 'ws-one:resume', employee }],
+      [{ ...base, id, action: 'promote', employee: { ...employee, actor: 'forged' }, requestDigest: promotionMutationKey(base.target, employee) }],
+    ]) expect(parsePersistedLifecycleIntents(JSON.stringify({ ...base, lifecycle }), base.principal, base.target)).toBeNull();
   });
 });
 
