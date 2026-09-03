@@ -291,6 +291,50 @@ describe('WorkSessionManager', () => {
     expect(manager.get(created.id)?.lifecycle).toBe('archived');
   });
 
+  it('converges create, prepared stop, and prepared resume during manager restart', async () => {
+    const { manager, adapter, cwd, ctxRoot } = fixture();
+    const createId = 'f1111111-1111-4111-8111-111111111111';
+    const target = `ws-${createId}`;
+    const input = { display_name: 'Restart create', org: 'platform', harness: 'codex-app-server' as const, requested_cwd: cwd, actor: 'owner:test' };
+    const createdRecord = createWorkSessionRecord(ctxRoot, {
+      id: target, display_name: input.display_name, org: input.org, harness: input.harness, requested_cwd: cwd,
+      room_id: `work-${createId}`, mutation_id: createId, created_by: input.actor,
+    });
+    upsertRoom(ctxRoot, { id: createdRecord.room_id, kind: 'work_session', title: createdRecord.display_name, members: [], work_session_id: target, created_at: createdRecord.created_at, created_by: input.actor, mutation_id: createId });
+    prepareCrewMutation(ctxRoot, {
+      mutation_id: createId, idempotency_key: createId, actor: input.actor, target: { kind: 'work_session', id: target }, action: 'create',
+      request_digest: digestCrewAuditValue({ ...input, actor: undefined }), before_digest: digestCrewAuditValue(null), intended_after_digest: '1'.repeat(64),
+    });
+    vi.mocked(adapter.status).mockReturnValue({ running: false, pid: null, error_code: null });
+    await manager.reconcilePending();
+    expect(manager.get(target)?.lifecycle).toBe('failed');
+    expect(getCrewMutation(ctxRoot, createId)?.stage).toBe('finalized');
+
+    const active = await manager.create({ ...input, display_name: 'Restart transitions' }, 'f1222222-2222-4222-8222-222222222222');
+    const transitionTarget = active.id;
+    const stopId = 'f1333333-3333-4333-8333-333333333333';
+    prepareCrewMutation(ctxRoot, {
+      mutation_id: stopId, idempotency_key: stopId, actor: input.actor, target: { kind: 'work_session', id: transitionTarget }, action: 'stop',
+      request_digest: digestCrewAuditValue({ id: transitionTarget }), before_digest: digest(active), intended_after_digest: '2'.repeat(64),
+    });
+    transitionWorkSession(ctxRoot, transitionTarget, ['active'], 'stopping', {}, stopId);
+    await manager.reconcilePending();
+    expect(manager.get(transitionTarget)?.lifecycle).toBe('archived');
+    expect(getCrewMutation(ctxRoot, stopId)?.stage).toBe('finalized');
+
+    const resumeId = 'f1444444-4444-4444-8444-444444444444';
+    const archived = manager.get(transitionTarget)!;
+    prepareCrewMutation(ctxRoot, {
+      mutation_id: resumeId, idempotency_key: resumeId, actor: input.actor, target: { kind: 'work_session', id: transitionTarget }, action: 'resume',
+      request_digest: digestCrewAuditValue({ id: transitionTarget, handle_digest: digestCrewAuditValue(archived.resume_handle) }),
+      before_digest: digest(archived), intended_after_digest: '3'.repeat(64),
+    });
+    transitionWorkSession(ctxRoot, transitionTarget, ['archived'], 'starting', {}, resumeId);
+    await manager.reconcilePending();
+    expect(manager.get(transitionTarget)?.lifecycle).toBe('active');
+    expect(getCrewMutation(ctxRoot, resumeId)?.stage).toBe('finalized');
+  });
+
   it('archives before promotion and creates an Employee in the same room and cwd', async () => {
     const { manager, createEmployee, cwd } = fixture();
     const created = await manager.create({ display_name: 'Promote me', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '11111111-1111-4111-8111-111111111111');

@@ -5,7 +5,6 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
-import { reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
 import { runClaudeSessionReporter } from '../pty/claude-session-reporter.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
@@ -264,7 +263,7 @@ class Daemon {
     // Finish or classify every durable Crew mutation before accepting new IPC
     // traffic. A corrupt journal fails startup closed instead of hiding an
     // applied-but-unaudited lifecycle or owner decision.
-    reconcileCrewMutationJournal(this.ctxRoot);
+    await this.agentManager.reconcileCrewMutations();
 
     // Start IPC server
     this.ipcServer = new IPCServer(this.agentManager, this.instanceId);

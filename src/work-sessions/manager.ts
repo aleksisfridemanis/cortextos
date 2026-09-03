@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync } from 'fs';
 import { digestCrewAuditValue } from '../audit/crew-lifecycle-audit.js';
 import {
   commitCrewMutationState, finalizeCrewMutationAudit, getCrewMutation, prepareCrewMutation,
-  listPendingCrewMutations, reconcileCrewMutationJournal, recordCrewMutationEffect, startCrewMutationEffect,
+  listPendingCrewMutations, readCrewMutationJournal, reconcileCrewMutationJournal, recordCrewMutationEffect, startCrewMutationEffect,
 } from '../audit/crew-mutation-journal.js';
 import {
   createPromotedEmployee,
@@ -14,7 +14,7 @@ import {
 } from '../agents/create-employee.js';
 import { createWorkSessionRecord, readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession, WorkSessionRegistryError } from './registry.js';
 import { appendRoomMessage } from '../rooms/log.js';
-import { RoomRegistryError, upsertRoom } from '../rooms/registry.js';
+import { getRoom, RoomRegistryError, upsertRoom } from '../rooms/registry.js';
 import { withFileLockSync } from '../utils/lock.js';
 import type {
   CreateWorkSessionInput, WorkSessionEmployeeInput, WorkSessionRecord,
@@ -62,6 +62,71 @@ export class WorkSessionManager {
 
   list(): WorkSessionRecord[] { return readWorkSessions(this.dependencies.ctxRoot); }
   get(id: string): WorkSessionRecord | undefined { return this.list().find(row => row.id === id); }
+
+  /** Drive durable Work Session mutations during daemon startup, before IPC opens. */
+  async reconcilePending(): Promise<{ finalized: number; pending: number }> {
+    reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+    for (const snapshot of listPendingCrewMutations(this.dependencies.ctxRoot)) {
+      if (snapshot.target.kind !== 'work_session') continue;
+      const entry = getCrewMutation(this.dependencies.ctxRoot, snapshot.mutation_id);
+      if (!entry || entry.stage === 'prepared' || entry.stage === 'finalized') continue;
+      try {
+        if (entry.action === 'stop') {
+          await this.stop(entry.target.id, entry.actor, entry.mutation_id);
+        } else if (entry.action === 'resume') {
+          await this.resume(entry.target.id, entry.actor, entry.mutation_id);
+        } else if (entry.action === 'create' && ['state_committed', 'effect_started'].includes(entry.stage)) {
+          let record = this.require(entry.target.id, ['starting', 'active']);
+          if (record.mutation_id !== entry.mutation_id) continue;
+          if (entry.stage === 'state_committed') startCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id);
+          const adapter = this.adapter(record);
+          try { if (adapter.status().running) await adapter.stop(); } catch { /* status below decides */ }
+          if (adapter.status().running) {
+            transitionWorkSession(this.dependencies.ctxRoot, record.id, ['starting', 'active'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, entry.mutation_id);
+            continue;
+          }
+          record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['starting', 'active'], 'failed', { last_error: 'DAEMON_RESTART_DURING_START' }, entry.mutation_id);
+          recordCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id, { mutation_id: entry.mutation_id, runtime_started: false, recovered: true });
+          finalizeCrewMutationAudit(this.dependencies.ctxRoot, entry.mutation_id, {
+            result: 'failure', after_digest: stateDigest(record), error_code: 'DAEMON_RESTART_DURING_START', sanitized_error: 'Daemon restarted before runtime readiness',
+          });
+        } else if (entry.action === 'promote' && ['state_committed', 'effect_started'].includes(entry.stage)) {
+          let record = this.require(entry.target.id, ['stopping', 'archived']);
+          if (record.mutation_id !== entry.mutation_id) continue;
+          if (entry.stage === 'state_committed') startCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id);
+          if (record.lifecycle === 'stopping') {
+            const adapter = this.adapter(record);
+            try { await adapter.stop(); } catch { if (adapter.status().running) continue; }
+            record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['stopping'], 'archived', {}, entry.mutation_id);
+          }
+          const childId = promotionEmployeeMutationId(entry.mutation_id);
+          const child = getCrewMutation(this.dependencies.ctxRoot, childId);
+          const room = getRoom(this.dependencies.ctxRoot, record.room_id);
+          if (child?.stage === 'finalized' && child.final_result?.result === 'success'
+            && room?.kind === 'agent' && typeof room.agent === 'string') {
+            record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['archived'], 'archived', { promoted_employee: room.agent }, entry.mutation_id);
+            recordCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id, {
+              mutation_id: entry.mutation_id, stopped: true, employee_created: true,
+              employee_mutation_digest: digestCrewAuditValue(childId), recovered: true,
+            });
+            finalizeCrewMutationAudit(this.dependencies.ctxRoot, entry.mutation_id, { result: 'success', after_digest: stateDigest(record) });
+          } else if (!child || child.stage === 'finalized') {
+            recordCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id, {
+              mutation_id: entry.mutation_id, stopped: true, employee_created: false, recovered: true,
+            });
+            finalizeCrewMutationAudit(this.dependencies.ctxRoot, entry.mutation_id, {
+              result: 'failure', after_digest: stateDigest(record), error_code: 'PROMOTION_FAILED', sanitized_error: 'Employee promotion did not complete',
+            });
+          }
+        }
+      } catch { /* unresolved ownership remains pending and lease-owning */ }
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+    }
+    return {
+      finalized: readCrewMutationJournal(this.dependencies.ctxRoot).filter(entry => entry.stage === 'finalized').length,
+      pending: listPendingCrewMutations(this.dependencies.ctxRoot).length,
+    };
+  }
 
   private adapter(record: WorkSessionRecord): WorkSessionRuntimeAdapter {
     const existing = this.adapters.get(record.id);

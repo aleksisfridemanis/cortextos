@@ -24,6 +24,9 @@ import { computeDormancy, parseHeartbeatIntervalMs } from '../utils/dormancy.js'
 import { CRONS_DIRECTORY, CRONS_FILENAME } from '../bus/crons-schema.js';
 import { WorkSessionManager } from '../work-sessions/manager.js';
 import { WorkSessionPTY } from '../pty/work-session-pty.js';
+import { createEmployee, createPromotedEmployee, type CrewEmployeeRuntime } from '../agents/create-employee.js';
+import { listPendingCrewMutations, reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
+import { promotionEmployeeMutationId } from '../work-sessions/promotion.js';
 
 type LogFn = (msg: string) => void;
 
@@ -160,6 +163,54 @@ export class AgentManager {
     if (this.daemonJustCrashed) {
       console.log('[agent-manager] Detected .daemon-crashed marker(s) — previous daemon exited abnormally. Will quiet BUG-011 alarm for this startup cycle.');
     }
+  }
+
+  /** Complete restart-safe Crew recovery before the daemon accepts IPC. */
+  async reconcileCrewMutations(): Promise<void> {
+    reconcileCrewMutationJournal(this.ctxRoot, { frameworkRoot: this.frameworkRoot });
+    for (const entry of listPendingCrewMutations(this.ctxRoot)) {
+      if (entry.target.kind !== 'employee' || entry.action !== 'create'
+        || !['state_committed', 'effect_started'].includes(entry.stage)) continue;
+      try {
+        const registry = JSON.parse(readFileSync(join(this.ctxRoot, 'config', 'enabled-agents.json'), 'utf8'));
+        const rooms = JSON.parse(readFileSync(join(this.ctxRoot, 'config', 'rooms.json'), 'utf8')) as Array<Record<string, unknown>>;
+        const record = registry[entry.target.id];
+        if (!record || record.mutation_id !== entry.mutation_id) continue;
+        const input = {
+          name: entry.target.id,
+          org: record.org,
+          runtime: record.runtime as CrewEmployeeRuntime,
+          ...(record.model ? { model: record.model } : {}),
+          ...(record.working_directory ? { working_directory: record.working_directory } : {}),
+          room_id: record.room_id,
+          telegram_polling: false as const,
+          actor: entry.actor,
+        };
+        const startEmployee = async (request: { name: string; agent_dir: string; org: string; mutation_id: string }) => {
+          await this.startAgent(request.name, request.agent_dir, undefined, request.org);
+          return { mutation_id: request.mutation_id, started: true };
+        };
+        const room = rooms.find(item => item.id === record.room_id);
+        const parent = listPendingCrewMutations(this.ctxRoot).find(candidate => candidate.target.kind === 'work_session'
+          && candidate.action === 'promote'
+          && promotionEmployeeMutationId(candidate.mutation_id) === entry.mutation_id
+          && candidate.target.id === room?.work_session_id);
+        if (parent) {
+          await createPromotedEmployee(input, entry.mutation_id, {
+            sourceWorkSessionId: parent.target.id,
+            parentMutationId: parent.mutation_id,
+          }, { ctxRoot: this.ctxRoot, frameworkRoot: this.frameworkRoot, instanceId: this.instanceId, startEmployee });
+        } else {
+          await createEmployee(input, entry.mutation_id, {
+            ctxRoot: this.ctxRoot, frameworkRoot: this.frameworkRoot, instanceId: this.instanceId, startEmployee,
+          });
+        }
+      } catch (error) {
+        console.error(`[agent-manager] Crew Employee recovery remains pending for ${entry.target.id}: ${(error as Error).message}`);
+      }
+    }
+    await this.workSessions.reconcilePending();
+    reconcileCrewMutationJournal(this.ctxRoot, { frameworkRoot: this.frameworkRoot });
   }
 
   /**

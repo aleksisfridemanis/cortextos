@@ -88,7 +88,8 @@ export interface CreateEmployeeDependencies {
   instanceId?: string;
   now?: () => string;
   startEmployee?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt>;
-  failAt?: 'before-state-commit' | 'after-directory-publish' | 'after-enabled-write' | 'after-state-commit' | 'after-effect-start' | 'after-effect' | 'after-audit';
+  failAt?: 'before-state-commit' | 'after-directory-publish' | 'after-enabled-write' | 'after-publication'
+    | 'after-state-commit' | 'after-effect-start' | 'after-effect' | 'after-audit';
 }
 
 interface PromotionGrant {
@@ -530,6 +531,7 @@ async function createEmployeeInternal(
         throw publicationError;
       }
     });
+    if (dependencies.failAt === 'after-publication') throw new Error('injected after publication');
     stateCommitted = true;
     commitCrewMutationState(ctxRoot, mutationId, intendedAfterDigest);
     if (dependencies.failAt === 'after-state-commit') throw new Error('injected after state commit');
