@@ -252,9 +252,16 @@ export function isClaudeDirOperation(
   // Canonicalize the agent dir first (resolves legitimate symlinks on the install
   // path, e.g. /tmp -> /private/tmp), so the .claude subtree below it is the only
   // thing left to vet.
-  const canonAgentDir = canonicalizePath(resolve(base));
+  const resolvedAgentDir = resolve(base);
+  const canonAgentDir = canonicalizePath(resolvedAgentDir);
   const claudeRoot = join(canonAgentDir, '.claude');
-  const target = resolve(canonAgentDir, filePath);
+  // Resolve the caller-provided path against the same lexical base first, then
+  // canonicalize both sides. On macOS, tmpdir() commonly returns /var/... while
+  // realpath exposes the same directory as /private/var/...; mixing one form on
+  // each side would incorrectly reject a legitimate write. Canonicalizing the
+  // target also rejects live symlink escapes, while hasSymlinkComponent below
+  // still catches dangling symlinks that realpath cannot follow.
+  const target = canonicalizePath(resolve(resolvedAgentDir, filePath));
 
   // Lexical containment within the agent's own .claude/.
   if (target !== claudeRoot && !target.startsWith(claudeRoot + sep)) return false;
