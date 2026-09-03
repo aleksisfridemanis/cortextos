@@ -3,14 +3,19 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
+  readdirSync,
   renameSync,
+  rmSync,
   unlinkSync,
   writeSync,
 } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
+import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 import {
   appendCrewLifecycleAuditEvent,
@@ -20,6 +25,7 @@ import {
   type CrewTarget,
 } from './crew-lifecycle-audit.js';
 import { withFileLockSync } from '../utils/lock.js';
+import { removeStartingWorkSessionRecord } from '../work-sessions/registry.js';
 
 export type CrewMutationStage =
   | 'prepared'
@@ -322,6 +328,119 @@ function certifyEmployeeCreate(
   } catch { return null; }
 }
 
+function reconcilePartialEmployeeCreate(
+  ctxRoot: string,
+  entry: CrewMutationJournalEntry,
+  frameworkRoot?: string,
+): 'rolled_back' | 'pending' | null {
+  if (entry.stage !== 'prepared' || !frameworkRoot) return null;
+  const configDir = join(ctxRoot, 'config');
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  return withFileLockSync(configDir, () => {
+    let registry: Record<string, Record<string, unknown>> = {};
+    let rooms: Array<Record<string, unknown>> = [];
+    try {
+      const registryPath = join(configDir, 'enabled-agents.json');
+      const roomsPath = join(configDir, 'rooms.json');
+      if (existsSync(registryPath)) registry = readJson(registryPath) as Record<string, Record<string, unknown>>;
+      if (existsSync(roomsPath)) rooms = readJson(roomsPath) as Array<Record<string, unknown>>;
+      if (!registry || typeof registry !== 'object' || Array.isArray(registry) || !Array.isArray(rooms)) return 'pending';
+    } catch { return 'pending'; }
+
+    const employee = registry[entry.target.id];
+    if (employee && employee.mutation_id !== entry.mutation_id) return 'pending';
+    const matchingRooms = rooms.filter(room => room.id === employee?.room_id || room.mutation_id === entry.mutation_id);
+    if (matchingRooms.some(room => room.mutation_id !== entry.mutation_id)) return 'pending';
+
+    const orgsDir = join(frameworkRoot, 'orgs');
+    const finalDirs: string[] = [];
+    const stageDirs: string[] = [];
+    try {
+      for (const org of readdirSync(orgsDir, { withFileTypes: true })) {
+        if (!org.isDirectory()) continue;
+        const agentsDir = join(orgsDir, org.name, 'agents');
+        const finalDir = join(agentsDir, entry.target.id);
+        const stageDir = join(agentsDir, `.creating-${entry.target.id}-${entry.mutation_id}`);
+        if (existsSync(stageDir)) stageDirs.push(stageDir);
+        if (!existsSync(finalDir)) continue;
+        let config: Record<string, unknown>;
+        try { config = readJson(join(finalDir, 'config.json')) as Record<string, unknown>; } catch { return 'pending'; }
+        if (config.mutation_id !== entry.mutation_id) return 'pending';
+        finalDirs.push(finalDir);
+      }
+    } catch { return 'pending'; }
+    if (finalDirs.length > 1) return 'pending';
+
+    const ownedRoomIndexes = rooms
+      .map((room, index) => room.mutation_id === entry.mutation_id ? index : -1)
+      .filter(index => index >= 0);
+    const hasOwnedArtifacts = !!employee || finalDirs.length > 0 || stageDirs.length > 0 || ownedRoomIndexes.length > 0;
+    if (!hasOwnedArtifacts) return null;
+
+    if (employee) delete registry[entry.target.id];
+    const sessionsPath = join(configDir, 'work-sessions.json');
+    let sessions: Array<Record<string, unknown>> = [];
+    try {
+      if (existsSync(sessionsPath)) sessions = readJson(sessionsPath) as Array<Record<string, unknown>>;
+    } catch { return 'pending'; }
+    rooms = rooms.flatMap(room => {
+      if (room.mutation_id !== entry.mutation_id) return [room];
+      if (typeof room.work_session_id === 'string') {
+        const source = sessions.find(session => session.id === room.work_session_id);
+        if (!source || source.room_id !== room.id || typeof source.display_name !== 'string') return [];
+        return [{
+          ...room,
+          kind: 'work_session',
+          title: source.display_name,
+          members: (Array.isArray(room.members) ? room.members : []).filter(member => member !== entry.target.id),
+          agent: undefined,
+          mutation_id: source.mutation_id,
+        }];
+      }
+      return [];
+    });
+    durableWrite(join(configDir, 'enabled-agents.json'), registry);
+    durableWrite(join(configDir, 'rooms.json'), rooms);
+    const finalTargets = new Set(finalDirs);
+    for (const stageDir of stageDirs) finalTargets.add(join(dirname(stageDir), entry.target.id));
+    const hostSkillsDir = join(homedir(), '.codex', 'skills');
+    if (existsSync(hostSkillsDir)) {
+      for (const item of readdirSync(hostSkillsDir, { withFileTypes: true })) {
+        if (!item.name.startsWith(`${entry.target.id}__`)) continue;
+        const link = join(hostSkillsDir, item.name);
+        let target: string;
+        try {
+          if (!lstatSync(link).isSymbolicLink()) continue;
+          target = resolve(dirname(link), readlinkSync(link));
+        } catch { continue; }
+        if ([...finalTargets].some(finalDir => target === finalDir || target.startsWith(`${finalDir}/`))) unlinkSync(link);
+      }
+    }
+    for (const dir of [...finalDirs, ...stageDirs]) rmSync(dir, { recursive: true, force: true });
+    return 'rolled_back';
+  });
+}
+
+function reconcilePreparedWorkSessionCreate(ctxRoot: string, entry: CrewMutationJournalEntry): 'rolled_back' | 'pending' | null {
+  if (entry.stage !== 'prepared' || entry.action !== 'create') return null;
+  let records: Array<Record<string, unknown>>;
+  let rooms: Array<Record<string, unknown>>;
+  try {
+    records = readJson(join(ctxRoot, 'config', 'work-sessions.json')) as Array<Record<string, unknown>>;
+    rooms = existsSync(join(ctxRoot, 'config', 'rooms.json'))
+      ? readJson(join(ctxRoot, 'config', 'rooms.json')) as Array<Record<string, unknown>>
+      : [];
+    if (!Array.isArray(records) || !Array.isArray(rooms)) return 'pending';
+  } catch { return 'pending'; }
+  const record = records.find(item => item.id === entry.target.id);
+  if (!record) return null;
+  if (record.mutation_id !== entry.mutation_id || record.lifecycle !== 'starting') return 'pending';
+  const room = rooms.find(item => item.id === record.room_id);
+  if (room) return room.mutation_id === entry.mutation_id && room.work_session_id === record.id ? null : 'pending';
+  removeStartingWorkSessionRecord(ctxRoot, entry.target.id, entry.mutation_id);
+  return 'rolled_back';
+}
+
 function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): ReconciliationCertification {
   let record: Record<string, unknown> | undefined;
   try {
@@ -418,6 +537,34 @@ export function reconcileCrewMutationJournal(
         finalized += 1;
       }
       continue;
+    }
+    if (entry.target.kind === 'employee' && entry.action === 'create') {
+      const partial = reconcilePartialEmployeeCreate(
+        ctxRoot,
+        entry,
+        options.frameworkRoot ?? process.env.CTX_FRAMEWORK_ROOT ?? process.env.CTX_PROJECT_ROOT,
+      );
+      if (partial === 'pending') continue;
+      if (partial === 'rolled_back') {
+        finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, {
+          result: 'failure', after_digest: entry.before_digest,
+          error_code: 'INTERRUPTED_PUBLICATION', sanitized_error: 'Interrupted Employee publication was rolled back',
+        });
+        finalized += 1;
+        continue;
+      }
+    }
+    if (entry.target.kind === 'work_session' && entry.action === 'create') {
+      const partial = reconcilePreparedWorkSessionCreate(ctxRoot, entry);
+      if (partial === 'pending') continue;
+      if (partial === 'rolled_back') {
+        finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, {
+          result: 'failure', after_digest: entry.before_digest,
+          error_code: 'INTERRUPTED_PUBLICATION', sanitized_error: 'Interrupted Work Session publication was rolled back',
+        });
+        finalized += 1;
+        continue;
+      }
     }
     const certified = entry.target.kind === 'employee' && entry.action === 'create'
       ? certifyEmployeeCreate(ctxRoot, entry, options.frameworkRoot ?? process.env.CTX_FRAMEWORK_ROOT ?? process.env.CTX_PROJECT_ROOT)

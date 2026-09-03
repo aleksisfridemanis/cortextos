@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -13,6 +13,7 @@ import {
   startCrewMutationEffect,
 } from '../../../src/audit/crew-mutation-journal';
 import { digestCrewAuditValue } from '../../../src/audit/crew-lifecycle-audit.js';
+import { createWorkSessionRecord, readWorkSessions } from '../../../src/work-sessions/registry.js';
 
 describe('Crew mutation journal', () => {
   it('persists prepare before state/effect/audit and converges idempotently', () => {
@@ -110,6 +111,58 @@ describe('Crew mutation journal', () => {
       startCrewMutationEffect(root, missing);
       recordCrewMutationEffect(root, missing, { mutation_id: missing, runtime_started: true, handle_digest: digestCrewAuditValue(handle) });
       expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 0, pending: 1 });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls back mutation-owned Employee files left by process death during publication', () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-employee-crash-'));
+    const frameworkRoot = join(root, 'framework');
+    const ctxRoot = join(root, 'ctx');
+    try {
+      const id = '88888888-8888-4888-8888-888888888888';
+      prepareCrewMutation(ctxRoot, {
+        mutation_id: id, idempotency_key: id, actor: 'owner:1', target: { kind: 'employee', id: 'ada' }, action: 'create',
+        request_digest: '1'.repeat(64), before_digest: digestCrewAuditValue(null), intended_after_digest: '3'.repeat(64),
+      });
+      const agentDir = join(frameworkRoot, 'orgs', 'platform', 'agents', 'ada');
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(join(agentDir, 'config.json'), JSON.stringify({ mutation_id: id }));
+      mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+      writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), JSON.stringify({ ada: {
+        org: 'platform', room_id: 'agent-ada', mutation_id: id,
+      } }));
+      writeFileSync(join(ctxRoot, 'config', 'rooms.json'), '[]');
+
+      expect(reconcileCrewMutationJournal(ctxRoot, { frameworkRoot })).toEqual({ finalized: 1, pending: 0 });
+      expect(existsSync(agentDir)).toBe(false);
+      expect(JSON.parse(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8'))).toEqual({});
+      expect(getCrewMutation(ctxRoot, id)?.final_result).toMatchObject({ result: 'failure', error_code: 'INTERRUPTED_PUBLICATION' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('releases a mutation-owned Work Session cwd lease left before room publication', () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-work-crash-'));
+    const cwd = join(root, 'project');
+    mkdirSync(cwd);
+    try {
+      const id = '99999999-9999-4999-8999-999999999999';
+      const target = `ws-${id}`;
+      prepareCrewMutation(root, {
+        mutation_id: id, idempotency_key: id, actor: 'owner:1', target: { kind: 'work_session', id: target }, action: 'create',
+        request_digest: '1'.repeat(64), before_digest: digestCrewAuditValue(null), intended_after_digest: '3'.repeat(64),
+      });
+      createWorkSessionRecord(root, {
+        id: target, display_name: 'Crashed', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd,
+        room_id: `work-${id}`, mutation_id: id, created_by: 'owner:1',
+      });
+
+      expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 1, pending: 0 });
+      expect(readWorkSessions(root)).toEqual([]);
+      expect(getCrewMutation(root, id)?.final_result).toMatchObject({ result: 'failure', error_code: 'INTERRUPTED_PUBLICATION' });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
