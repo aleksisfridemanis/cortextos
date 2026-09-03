@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { pathToFileURL } from 'url';
+import { spawn } from 'child_process';
+import { once } from 'events';
 import {
   commitCrewMutationState,
   finalizeCrewMutationAudit,
@@ -102,6 +105,42 @@ describe('Crew mutation journal', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('does not reclaim a prepared mutation while its owning OS process is alive', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-process-lease-'));
+    const mutationId = '45444444-4444-4444-8444-444444444444';
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'src', 'audit', 'crew-mutation-journal.ts')).href;
+    const script = `
+      import journal from ${JSON.stringify(moduleUrl)};
+      journal.prepareCrewMutation(process.argv[1], {
+        mutation_id: ${JSON.stringify(mutationId)}, idempotency_key: ${JSON.stringify(mutationId)},
+        actor: 'owner:child', target: { kind: 'employee', id: 'leased' }, action: 'create',
+        request_digest: '1'.repeat(64), before_digest: '2'.repeat(64), intended_after_digest: '3'.repeat(64),
+      });
+      process.stdout.write('ready\\n');
+      setInterval(() => {}, 1000);
+    `;
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script, root], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    try {
+      const [chunk] = await Promise.race([
+        once(child.stdout!, 'data'),
+        once(child, 'exit').then(() => { throw new Error('child lease owner exited before readiness'); }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('child lease setup timed out')), 5_000)),
+      ]);
+      expect(String(chunk)).toContain('ready');
+      expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 0, pending: 1 });
+      expect(getCrewMutation(root, mutationId)?.stage).toBe('prepared');
+    } finally {
+      child.kill('SIGTERM');
+      if (child.exitCode === null && child.signalCode === null) {
+        await Promise.race([once(child, 'exit'), new Promise(resolve => setTimeout(resolve, 5_000))]);
+      }
+      expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 1, pending: 0 });
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it('certifies an effect only when its receipt matches durable lifecycle state', () => {
     const root = mkdtempSync(join(tmpdir(), 'crew-journal-effect-'));

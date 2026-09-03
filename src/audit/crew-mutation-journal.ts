@@ -17,6 +17,7 @@ import {
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
+import { execFileSync } from 'child_process';
 import {
   appendCrewLifecycleAuditEvent,
   digestCrewAuditValue,
@@ -63,6 +64,11 @@ export interface CrewMutationJournalEntry {
     before_digest: string;
   };
   effect_receipt: Record<string, unknown> | null;
+  lease?: {
+    owner_pid: number;
+    owner_process_started_at: string;
+    expires_at: string;
+  };
   final_result?: CrewMutationFinalResult;
   created_at: string;
   updated_at: string;
@@ -73,6 +79,46 @@ export type PrepareCrewMutationInput = Pick<CrewMutationJournalEntry,
   'request_digest' | 'before_digest' | 'intended_after_digest'> &
   Partial<Pick<CrewMutationJournalEntry, 'stage' | 'state_digest' | 'pending_audit' |
   'effect_receipt' | 'created_at' | 'updated_at' | 'schema_version' | 'final_result'>>;
+
+const MUTATION_LEASE_MS = 30_000;
+
+function processStartedAt(pid: number): string | null {
+  try {
+    const value = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8', timeout: 1_000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return value || null;
+  } catch { return null; }
+}
+
+function processExists(pid: number): boolean | null {
+  try { process.kill(pid, 0); return true; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    if ((error as NodeJS.ErrnoException).code === 'EPERM') return true;
+    return null;
+  }
+}
+
+function mutationLease(now = Date.now()): NonNullable<CrewMutationJournalEntry['lease']> {
+  const identity = processStartedAt(process.pid);
+  if (!identity) throw new Error('Crew mutation process identity is unavailable');
+  return {
+    owner_pid: process.pid,
+    owner_process_started_at: identity,
+    expires_at: new Date(now + MUTATION_LEASE_MS).toISOString(),
+  };
+}
+
+function heldByAnotherLiveProcess(entry: CrewMutationJournalEntry): boolean {
+  const lease = entry.lease;
+  if (!lease) return false;
+  const exists = processExists(lease.owner_pid);
+  if (exists === false) return false;
+  const observed = processStartedAt(lease.owner_pid);
+  if (observed === lease.owner_process_started_at) return lease.owner_pid !== process.pid;
+  if (exists !== false && observed === null && Date.parse(lease.expires_at) > Date.now()) return lease.owner_pid !== process.pid;
+  return false;
+}
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
@@ -117,6 +163,11 @@ function assertEntry(entry: CrewMutationJournalEntry): void {
   }
   if (entry.state_digest !== null && !DIGEST_PATTERN.test(entry.state_digest)) {
     throw new Error('Invalid Crew mutation state digest');
+  }
+  if (entry.lease && (!Number.isSafeInteger(entry.lease.owner_pid) || entry.lease.owner_pid < 1
+    || typeof entry.lease.owner_process_started_at !== 'string' || !entry.lease.owner_process_started_at
+    || !Number.isFinite(Date.parse(entry.lease.expires_at)))) {
+    throw new Error('Invalid Crew mutation lease');
   }
   const forbiddenKey = /^(?:secret|token|password|credential|authorization|resume_handle|api_key|private_key)$/i;
   const visit = (value: unknown): void => {
@@ -188,6 +239,7 @@ export function prepareCrewMutation(
         before_digest: input.before_digest,
       },
       effect_receipt: null,
+      lease: mutationLease(),
       created_at: timestamp,
       updated_at: timestamp,
     };
@@ -208,6 +260,8 @@ function updateEntry(
     if (!entry) throw new Error(`Unknown Crew mutation ${mutationId}`);
     update(entry);
     entry.updated_at = new Date().toISOString();
+    if (entry.stage === 'finalized') delete entry.lease;
+    else entry.lease = mutationLease();
     assertEntry(entry);
     durableWrite(journalPath(ctxRoot), entries);
     return entry;
@@ -568,6 +622,9 @@ export function reconcileCrewMutationJournal(
 ): { finalized: number; pending: number } {
   let finalized = 0;
   for (const entry of listPendingCrewMutations(ctxRoot)) {
+    if (heldByAnotherLiveProcess(entry)) {
+      continue;
+    }
     if (entry.stage === 'audit_written' && entry.final_result) {
       updateEntry(ctxRoot, entry.mutation_id, current => { current.stage = 'finalized'; });
       finalized += 1;
