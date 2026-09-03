@@ -9,13 +9,18 @@
  * route modules pick them up at evaluation time.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { NextRequest } from 'next/server';
 import { appendRoomMessage } from '../../../../../../src/rooms/log';
 import type { RoomMessage } from '../../../../../../src/types';
+
+vi.mock('@/lib/work-session-owner', () => ({
+  authenticatedWorkSessionOwner: vi.fn(async () => 'owner:test'),
+  ownsWorkSessionRoom: vi.fn(() => true),
+}));
 
 // ---------------------------------------------------------------------------
 // Global setup — one shared tmp root across all tests in this file.
