@@ -296,6 +296,11 @@ export class WorkSessionManager {
       });
       return record;
     } catch (error) {
+      try { await this.adapter(record).stop(); } catch { /* status below is authoritative */ }
+      if (this.adapter(record).status().running) {
+        transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
+        throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
+      }
       record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'failed', { last_error: 'RESUME_HANDLE_UNAVAILABLE' }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { resumed: false, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'failure', after_digest: stateDigest(record), error_code: 'RESUME_HANDLE_UNAVAILABLE', sanitized_error: 'Exact runtime resume failed' });

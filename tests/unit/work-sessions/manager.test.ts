@@ -98,6 +98,21 @@ describe('WorkSessionManager', () => {
     expect(manager.get(created.id)).toMatchObject({ lifecycle: 'stopping', last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' });
   });
 
+  it('retains the cwd lease when failed resume cleanup cannot confirm process death', async () => {
+    const { manager, adapter, cwd } = fixture();
+    const created = await manager.create({ display_name: 'Unsafe resume', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'c1111111-1111-4111-8111-111111111111');
+    await manager.stop(created.id, 'owner:test', 'c2222222-2222-4222-8222-222222222222');
+    vi.mocked(adapter.resumeExact).mockRejectedValueOnce(new Error('resume acknowledgement lost'));
+    vi.mocked(adapter.stop).mockRejectedValueOnce(new Error('death unconfirmed'));
+    vi.mocked(adapter.status).mockReturnValue({ running: true, pid: 99, error_code: null });
+
+    await expect(manager.resume(created.id, 'owner:test', 'c3333333-3333-4333-8333-333333333333'))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(manager.get(created.id)).toMatchObject({ lifecycle: 'starting', last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' });
+    await expect(manager.create({ display_name: 'Blocked', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'c4444444-4444-4444-8444-444444444444'))
+      .rejects.toMatchObject({ code: 'CWD_LEASE_CONFLICT' });
+  });
+
   it('compensates a record when room publication fails so the cwd lease is released', async () => {
     const { cwd } = fixture();
     const root = roots.at(-1)!;
