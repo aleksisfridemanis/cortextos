@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createEmployee } from '../../src/agents/create-employee.js';
 import { readCrewLifecycleAuditEvents } from '../../src/audit/crew-lifecycle-audit.js';
 import { readCrewMutationJournal } from '../../src/audit/crew-mutation-journal.js';
+import { WorkSessionManager } from '../../src/work-sessions/manager.js';
 
 describe('Crew Employee creation lifecycle', () => {
   const roots: string[] = [];
@@ -40,5 +41,35 @@ describe('Crew Employee creation lifecycle', () => {
     expect(readCrewLifecycleAuditEvents(ctxRoot)).toEqual([
       expect.objectContaining({ event_id: mutationId, action: 'create', result: 'success' }),
     ]);
+  });
+});
+
+describe('Crew Work Session lifecycle', () => {
+  const roots: string[] = [];
+  afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
+
+  it('uses one mutation identity through Work Session state, effect, and audit', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cortext-work-lifecycle-'));
+    roots.push(root);
+    const ctxRoot = join(root, 'ctx');
+    const cwd = join(root, 'project');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(cwd);
+    const manager = new WorkSessionManager({
+      ctxRoot,
+      adapterFactory: () => ({
+        startFresh: async () => ({ resume_handle: { harness: 'claude-code', session_id: 'session-exact' } }),
+        resumeExact: async () => undefined,
+        send: async () => undefined,
+        stop: async () => undefined,
+      }),
+    });
+    const mutationId = '7f51a223-4111-46fb-b4f2-27870567d55d';
+
+    const result = await manager.create({ name: 'Investigate', harness: 'claude-code', cwd, actor: 'owner:test' }, mutationId);
+
+    expect(result).toMatchObject({ lifecycle: 'active', mutation_id: mutationId });
+    expect(readCrewMutationJournal(ctxRoot).find(row => row.mutation_id === mutationId)).toMatchObject({ stage: 'finalized' });
+    expect(readCrewLifecycleAuditEvents(ctxRoot).find(row => row.event_id === mutationId)).toMatchObject({ action: 'create_work_session', result: 'success' });
   });
 });
