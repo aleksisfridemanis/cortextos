@@ -96,6 +96,23 @@ describe('WorkSessionManager', () => {
     expect(adapter.stop).toHaveBeenCalledTimes(2);
   });
 
+  it('replays a finalized create before mutable org, cwd, or context validation', async () => {
+    const { manager, adapter, cwd, ctxRoot } = fixture();
+    const mutationId = '92111111-1111-4111-8111-111111111111';
+    const input = { display_name: 'Immutable receipt', org: 'platform', harness: 'codex-app-server' as const, requested_cwd: cwd, actor: 'owner:test' };
+    const created = await manager.create(input, mutationId);
+    rmSync(cwd, { recursive: true, force: true });
+    const unavailableFramework = join(roots.at(-1)!, 'framework-now-unavailable');
+    const restarted = new WorkSessionManager({
+      ctxRoot,
+      frameworkRoot: unavailableFramework,
+      adapterFactory: () => adapter,
+    });
+
+    await expect(restarted.create(input, mutationId)).resolves.toEqual(created);
+    expect(adapter.startFresh).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects reuse of a mutation id for different input', async () => {
     const { manager, cwd } = fixture();
     const created = await manager.create({ display_name: 'Fix release', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '11111111-1111-4111-8111-111111111111');

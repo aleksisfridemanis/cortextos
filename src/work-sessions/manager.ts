@@ -352,14 +352,40 @@ export class WorkSessionManager {
       throw new WorkSessionRegistryError('INVALID_INPUT', 'Invalid Work Session request');
     }
     if (!/^[\x20-\x7e]{1,64}$/.test(input.display_name)) throw new WorkSessionRegistryError('INVALID_INPUT', 'Invalid Work Session display name');
-    if (this.dependencies.frameworkRoot) {
-      const orgPath = join(this.dependencies.frameworkRoot, 'orgs', input.org);
-      if (!existsSync(orgPath) || !lstatSync(orgPath).isDirectory()) throw new WorkSessionRegistryError('ORG_NOT_FOUND', 'Organization not found');
-    }
     if (input.model !== undefined) {
       if (typeof input.model !== 'string') throw new WorkSessionRegistryError('MODEL_UNSUPPORTED', 'Unsupported Work Session model');
       const pattern = input.harness === 'opencode' ? /^[A-Za-z0-9._:-]+\/[A-Za-z0-9._:-]+$/ : /^[A-Za-z0-9._:-]+$/;
       if (input.model.length > 128 || !pattern.test(input.model)) throw new WorkSessionRegistryError('MODEL_UNSUPPORTED', 'Unsupported Work Session model');
+    }
+    const id = safeId(mutationId);
+    const roomId = `work-${id.slice(3)}`;
+    const intended = digestCrewAuditValue({ id, display_name: input.display_name, org: input.org, harness: input.harness, requested_cwd: input.requested_cwd, model: input.model ?? null, room_id: roomId });
+    const requestDigest = digestCrewAuditValue({ ...input, actor: undefined });
+    const prior = getCrewMutation(this.dependencies.ctxRoot, mutationId);
+    if (prior) {
+      const sameRequest = prior.actor === input.actor
+        && prior.action === 'create'
+        && prior.target.kind === 'work_session'
+        && prior.target.id === id
+        && prior.request_digest === requestDigest;
+      if (!sameRequest) throw new WorkSessionRegistryError('IDEMPOTENCY_CONFLICT', 'Mutation id is already bound to another request');
+      // A finalized mutation is an immutable receipt. Replay it before
+      // consulting mutable host state (org files, cwd, composed context, or
+      // harness capability), all of which may legitimately change later.
+      if (prior.stage === 'finalized' && prior.final_result?.result === 'success') return this.originalResult(prior);
+      if (prior.stage === 'finalized') {
+        throw new WorkSessionRegistryError(prior.final_result?.error_code ?? 'RECOVERY_REQUIRED', prior.final_result?.sanitized_error ?? 'Work Session creation failed');
+      }
+      try { claimCrewMutationLease(this.dependencies.ctxRoot, mutationId); } catch (error) {
+        if ((error as Error).message === 'MUTATION_PENDING') {
+          throw new WorkSessionRegistryError('MUTATION_PENDING', 'Mutation is owned by another live process');
+        }
+        throw error;
+      }
+    }
+    if (this.dependencies.frameworkRoot) {
+      const orgPath = join(this.dependencies.frameworkRoot, 'orgs', input.org);
+      if (!existsSync(orgPath) || !lstatSync(orgPath).isDirectory()) throw new WorkSessionRegistryError('ORG_NOT_FOUND', 'Organization not found');
     }
     let launchContext = input.initial_request;
     try {
@@ -379,30 +405,7 @@ export class WorkSessionManager {
       const code = closedApplicationErrorCode(error, 'CONTEXT_SOURCE_UNAVAILABLE');
       throw new WorkSessionRegistryError(code, 'Work Session context is unavailable');
     }
-    const id = safeId(mutationId);
-    const roomId = `work-${id.slice(3)}`;
-    const intended = digestCrewAuditValue({ id, display_name: input.display_name, org: input.org, harness: input.harness, requested_cwd: input.requested_cwd, model: input.model ?? null, room_id: roomId });
-    const requestDigest = digestCrewAuditValue({ ...input, actor: undefined });
-    const prior = getCrewMutation(this.dependencies.ctxRoot, mutationId);
     if (prior) {
-      const sameRequest = prior.actor === input.actor
-        && prior.action === 'create'
-        && prior.target.kind === 'work_session'
-        && prior.target.id === id
-        && prior.request_digest === requestDigest;
-      if (!sameRequest) throw new WorkSessionRegistryError('IDEMPOTENCY_CONFLICT', 'Mutation id is already bound to another request');
-      if (prior.stage !== 'finalized') {
-        try { claimCrewMutationLease(this.dependencies.ctxRoot, mutationId); } catch (error) {
-          if ((error as Error).message === 'MUTATION_PENDING') {
-            throw new WorkSessionRegistryError('MUTATION_PENDING', 'Mutation is owned by another live process');
-          }
-          throw error;
-        }
-      }
-      if (prior.stage === 'finalized' && prior.final_result?.result === 'success') return this.originalResult(prior);
-      if (prior.stage === 'finalized') {
-        throw new WorkSessionRegistryError(prior.final_result?.error_code ?? 'RECOVERY_REQUIRED', prior.final_result?.sanitized_error ?? 'Work Session creation failed');
-      }
       if (['effect_recorded', 'audit_written'].includes(prior.stage)) {
         reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot, ownerToken: currentCrewMutationOperationToken(mutationId) });
         const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
