@@ -22,6 +22,7 @@ export interface WorkSessionRecord {
   room_id: string;
   lifecycle: WorkSessionLifecycle;
   resume_handle: WorkSessionResumeHandle | null;
+  runtime_owner?: (ProcessIdentity & { mutation_id: string }) | null;
   mutation_id: string;
   created_at: string;
   updated_at: string;
@@ -56,6 +57,14 @@ export interface WorkSessionRuntimeAdapter {
   getResumeHandle(): WorkSessionResumeHandle | null;
 }
 
-export interface WorkSessionRuntimeStatus { running: boolean; pid: number | null; error_code: string | null }
+export interface WorkSessionRuntimeStatus {
+  running: boolean;
+  pid: number | null;
+  error_code: string | null;
+  process_started_at?: string | null;
+  ownership?: 'attached' | 'detached' | 'dead' | 'unknown';
+}
+
+interface ProcessIdentity { pid: number; started_at: string }
 
 export type WorkSessionEmployeeInput = Omit<CreateEmployeeInput, 'working_directory' | 'room_id' | 'telegram_polling'>;

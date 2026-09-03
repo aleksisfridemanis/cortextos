@@ -30,6 +30,11 @@ function assertRecord(value: unknown): asserts value is WorkSessionRecord {
     || !['starting', 'active', 'stopping', 'archived', 'failed'].includes(row.lifecycle)) {
     throw new WorkSessionRegistryError('REGISTRY_CORRUPT', 'Work Session registry requires operator recovery');
   }
+  if (row.runtime_owner && (!Number.isSafeInteger(row.runtime_owner.pid) || row.runtime_owner.pid < 1
+    || typeof row.runtime_owner.started_at !== 'string' || !row.runtime_owner.started_at
+    || !UUID.test(row.runtime_owner.mutation_id))) {
+    throw new WorkSessionRegistryError('REGISTRY_CORRUPT', 'Work Session registry requires operator recovery');
+  }
   const handle = row.resume_handle;
   if (handle && !(
     (row.harness === 'claude-code' && handle.runtime === 'claude-code' && typeof handle.session_id === 'string' && UUID.test(handle.session_id))
@@ -109,7 +114,7 @@ export function createWorkSessionRecord(
     const record: WorkSessionRecord = {
       schema_version: 1, kind: 'work_session', id: input.id, display_name: input.display_name.trim(), org: input.org, harness: input.harness,
       model: input.model ?? null, requested_cwd: input.requested_cwd, canonical_cwd: canonical, room_id: input.room_id,
-      lifecycle: 'starting', resume_handle: null, mutation_id: input.mutation_id,
+      lifecycle: 'starting', resume_handle: null, runtime_owner: null, mutation_id: input.mutation_id,
       created_at: timestamp, updated_at: timestamp, last_error: null, promoted_employee: null, created_by: input.created_by,
     };
     records.push(record);
@@ -120,7 +125,7 @@ export function createWorkSessionRecord(
 
 export function transitionWorkSession(
   ctxRoot: string, id: string, from: WorkSessionLifecycle[], to: WorkSessionLifecycle,
-  patch: Partial<Pick<WorkSessionRecord, 'resume_handle' | 'last_error' | 'promoted_employee'>>,
+  patch: Partial<Pick<WorkSessionRecord, 'resume_handle' | 'runtime_owner' | 'last_error' | 'promoted_employee'>>,
   mutationId: string,
 ): WorkSessionRecord {
   return locked(ctxRoot, records => {

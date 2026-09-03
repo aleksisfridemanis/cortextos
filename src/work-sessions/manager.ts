@@ -73,6 +73,16 @@ export class WorkSessionManager {
   /** Drive durable Work Session mutations during daemon startup, before IPC opens. */
   async reconcilePending(): Promise<{ finalized: number; pending: number }> {
     reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+    for (const record of this.list()) {
+      if (!['starting', 'active', 'stopping'].includes(record.lifecycle)) continue;
+      const mutation = getCrewMutation(this.dependencies.ctxRoot, record.mutation_id);
+      if (mutation?.stage !== 'finalized') continue;
+      const runtime = this.adapter(record).status();
+      if (runtime.running) {
+        throw new WorkSessionRegistryError('RECOVERY_REQUIRED', `Runtime ownership for ${record.id} is ${runtime.ownership ?? 'unknown'}`);
+      }
+      this.handleRuntimeExit(record.id);
+    }
     for (const snapshot of listPendingCrewMutations(this.dependencies.ctxRoot)) {
       if (snapshot.target.kind !== 'work_session') continue;
       const entry = getCrewMutation(this.dependencies.ctxRoot, snapshot.mutation_id);
@@ -92,7 +102,7 @@ export class WorkSessionManager {
             transitionWorkSession(this.dependencies.ctxRoot, record.id, ['starting', 'active'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, entry.mutation_id);
             continue;
           }
-          record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['starting', 'active'], 'failed', { last_error: 'DAEMON_RESTART_DURING_START' }, entry.mutation_id);
+          record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['starting', 'active'], 'failed', { last_error: 'DAEMON_RESTART_DURING_START', runtime_owner: null }, entry.mutation_id);
           recordCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id, { mutation_id: entry.mutation_id, runtime_started: false, recovered: true });
           finalizeCrewMutationAudit(this.dependencies.ctxRoot, entry.mutation_id, {
             result: 'failure', after_digest: stateDigest(record), error_code: 'DAEMON_RESTART_DURING_START', sanitized_error: 'Daemon restarted before runtime readiness',
@@ -104,7 +114,7 @@ export class WorkSessionManager {
           if (record.lifecycle === 'stopping') {
             const adapter = this.adapter(record);
             try { await adapter.stop(); } catch { if (adapter.status().running) continue; }
-            record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['stopping'], 'archived', {}, entry.mutation_id);
+            record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['stopping'], 'archived', { runtime_owner: null }, entry.mutation_id);
           }
           const childId = promotionEmployeeMutationId(entry.mutation_id);
           const child = getCrewMutation(this.dependencies.ctxRoot, childId);
@@ -191,6 +201,13 @@ export class WorkSessionManager {
     const currentDigest = current.resume_handle ? digestCrewAuditValue(current.resume_handle) : null;
     if (continuationDigest !== currentDigest) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Original Work Session continuation changed');
     return { ...record, resume_handle: current.resume_handle } as unknown as WorkSessionRecord;
+  }
+
+  private runtimeOwner(adapter: WorkSessionRuntimeAdapter, mutationId: string): WorkSessionRecord['runtime_owner'] {
+    const status = adapter.status();
+    return status.running && status.pid && status.process_started_at
+      ? { pid: status.pid, started_at: status.process_started_at, mutation_id: mutationId }
+      : null;
   }
 
   private runMutation<T>(
@@ -300,7 +317,10 @@ export class WorkSessionManager {
               );
             } else {
               const result = await this.adapter(recoveryRecord).startFresh({ id, cwd: recoveryRecord.canonical_cwd, model: input.model, context });
-              recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', { resume_handle: result.resume_handle }, mutationId);
+              recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {
+                resume_handle: result.resume_handle,
+                runtime_owner: this.runtimeOwner(this.adapter(recoveryRecord), mutationId),
+              }, mutationId);
             }
           } else {
             throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime readiness is not mutation-bound');
@@ -319,7 +339,7 @@ export class WorkSessionManager {
             transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
             throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
           }
-          const failed = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'failed', { last_error: 'RUNTIME_START_FAILED' }, mutationId);
+          const failed = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'failed', { last_error: 'RUNTIME_START_FAILED', runtime_owner: null }, mutationId);
           recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { runtime_started: false, recovered: true, mutation_id: mutationId });
           finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
             result: 'failure', after_digest: stateDigest(failed), error_code: 'RUNTIME_START_FAILED', sanitized_error: 'Runtime start failed',
@@ -380,7 +400,10 @@ export class WorkSessionManager {
     try {
       startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
       const result = await this.adapter(record).startFresh({ id, cwd: record.canonical_cwd, model: input.model, context: launchContext });
-      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', { resume_handle: result.resume_handle }, mutationId);
+      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {
+        resume_handle: result.resume_handle,
+        runtime_owner: this.runtimeOwner(this.adapter(record), mutationId),
+      }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { runtime_started: true, handle_digest: digestCrewAuditValue(result.resume_handle), mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
         result: 'success', after_digest: stateDigest(record), result_snapshot: resultSnapshot(record),
@@ -391,7 +414,7 @@ export class WorkSessionManager {
         transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
         throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
       }
-      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'failed', { last_error: 'RUNTIME_START_FAILED' }, mutationId);
+      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'failed', { last_error: 'RUNTIME_START_FAILED', runtime_owner: null }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { runtime_started: false, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'failure', after_digest: stateDigest(record), error_code: 'RUNTIME_START_FAILED', sanitized_error: 'Runtime start failed' });
       throw error;
@@ -480,7 +503,7 @@ export class WorkSessionManager {
             throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime stop could not be confirmed');
           }
         }
-        recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
+        recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', { runtime_owner: null }, mutationId);
       }
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: true, recovered: true, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
@@ -507,7 +530,7 @@ export class WorkSessionManager {
     startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
     try {
       await this.adapter(record).stop();
-      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
+      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', { runtime_owner: null }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: true, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
         result: 'success', after_digest: stateDigest(record), result_snapshot: resultSnapshot(record),
@@ -519,7 +542,7 @@ export class WorkSessionManager {
         transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'stopping', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
         throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime stop could not be confirmed');
       }
-      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'failed', { last_error: 'RUNTIME_STOP_FAILED' }, mutationId);
+      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'failed', { last_error: 'RUNTIME_STOP_FAILED', runtime_owner: null }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: false, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'failure', after_digest: stateDigest(record), error_code: 'RUNTIME_STOP_FAILED', sanitized_error: 'Runtime stop failed' });
       throw error;
@@ -562,7 +585,9 @@ export class WorkSessionManager {
         }
         await this.adapter(recoveryRecord).resumeExact(handle, { id, cwd: recoveryRecord.canonical_cwd, model: recoveryRecord.model ?? undefined });
         if (recoveryRecord.lifecycle === 'starting') {
-          recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {}, mutationId);
+          recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {
+            runtime_owner: this.runtimeOwner(this.adapter(recoveryRecord), mutationId),
+          }, mutationId);
         }
         recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, {
           resumed: true, recovered: true, handle_digest: digestCrewAuditValue(handle), mutation_id: mutationId,
@@ -577,7 +602,7 @@ export class WorkSessionManager {
           transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
           throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
         }
-        const failed = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'failed', { last_error: 'RESUME_HANDLE_UNAVAILABLE' }, mutationId);
+        const failed = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'failed', { last_error: 'RESUME_HANDLE_UNAVAILABLE', runtime_owner: null }, mutationId);
         recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { resumed: false, recovered: true, mutation_id: mutationId });
         finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
           result: 'failure', after_digest: stateDigest(failed), error_code: 'RESUME_HANDLE_UNAVAILABLE', sanitized_error: 'Exact runtime resume failed',
@@ -594,7 +619,9 @@ export class WorkSessionManager {
     startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
     try {
       await this.adapter(record).resumeExact(handle, { id, cwd: record.canonical_cwd, model: record.model ?? undefined });
-      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {}, mutationId);
+      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {
+        runtime_owner: this.runtimeOwner(this.adapter(record), mutationId),
+      }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { resumed: true, handle_digest: digestCrewAuditValue(handle), mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
         result: 'success', after_digest: stateDigest(record), result_snapshot: resultSnapshot(record),
@@ -606,7 +633,7 @@ export class WorkSessionManager {
         transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
         throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
       }
-      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'failed', { last_error: 'RESUME_HANDLE_UNAVAILABLE' }, mutationId);
+      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'failed', { last_error: 'RESUME_HANDLE_UNAVAILABLE', runtime_owner: null }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { resumed: false, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'failure', after_digest: stateDigest(record), error_code: 'RESUME_HANDLE_UNAVAILABLE', sanitized_error: 'Exact runtime resume failed' });
       throw error;
@@ -645,7 +672,7 @@ export class WorkSessionManager {
             throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime stop could not be confirmed');
           }
         }
-        recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
+        recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', { runtime_owner: null }, mutationId);
       }
       const createEmployee = this.dependencies.createEmployee
         ?? ((employeeInput, employeeMutationId) => createPromotedEmployee(
@@ -685,7 +712,7 @@ export class WorkSessionManager {
         throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime stop could not be confirmed');
       }
     }
-    record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
+    record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', { runtime_owner: null }, mutationId);
     const employeeMutationId = promotionEmployeeMutationId(mutationId);
     const createEmployee = this.dependencies.createEmployee
       ?? ((employeeInput, employeeMutationId) => createPromotedEmployee(
@@ -731,7 +758,7 @@ export class WorkSessionManager {
     const prepared = this.prepare(record, 'system:pty-exit', 'stop', mutationId, { id, reason: 'pty_exit' });
     if (prepared.entry.stage === 'finalized') return;
     if (this.dependencies.failAt === 'after-runtime-exit-prepare') throw new Error('injected after runtime exit prepare');
-    const archived = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active', 'stopping'], 'archived', {}, mutationId);
+    const archived = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active', 'stopping'], 'archived', { runtime_owner: null }, mutationId);
     if (this.dependencies.failAt === 'after-runtime-exit-state') throw new Error('injected after runtime exit state');
     commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(archived));
     if (this.dependencies.failAt === 'after-runtime-exit-state-commit') throw new Error('injected after runtime exit state commit');

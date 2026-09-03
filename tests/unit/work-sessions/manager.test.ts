@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { spawn } from 'child_process';
+import { once } from 'events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkSessionManager } from '../../../src/work-sessions/manager.js';
 import type { WorkSessionRuntimeAdapter } from '../../../src/work-sessions/types.js';
@@ -11,6 +13,8 @@ import {
 import { digestCrewAuditValue } from '../../../src/audit/crew-lifecycle-audit.js';
 import { createWorkSessionRecord, transitionWorkSession } from '../../../src/work-sessions/registry.js';
 import { upsertRoom } from '../../../src/rooms/registry.js';
+import { WorkSessionPTY } from '../../../src/pty/work-session-pty.js';
+import { captureProcessIdentity } from '../../../src/utils/process-identity.js';
 
 describe('WorkSessionManager', () => {
   const roots: string[] = [];
@@ -379,6 +383,46 @@ describe('WorkSessionManager', () => {
     expect(manager.get(transitionTarget)?.lifecycle).toBe('active');
     expect(getCrewMutation(ctxRoot, resumeId)?.stage).toBe('finalized');
   });
+
+  it('retains a live runtime lease across manager restart and releases it only after exact process death', async () => {
+    const { manager, adapter, cwd, ctxRoot } = fixture();
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      const identity = await vi.waitFor(() => {
+        const value = captureProcessIdentity(child.pid!);
+        expect(value).not.toBeNull();
+        return value!;
+      }, { timeout: 5_000 });
+      vi.mocked(adapter.status).mockReturnValue({
+        running: true,
+        pid: identity.pid,
+        error_code: null,
+        process_started_at: identity.started_at,
+        ownership: 'attached',
+      });
+      const created = await manager.create({
+        display_name: 'Restart ownership', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test',
+      }, 'f2111111-1111-4111-8111-111111111111');
+      expect(created.runtime_owner).toEqual({ ...identity, mutation_id: created.mutation_id });
+
+      const restarted = new WorkSessionManager({
+        ctxRoot,
+        frameworkRoot: roots.at(-1)!,
+        adapterFactory: record => new WorkSessionPTY({
+          ctxRoot, frameworkRoot: roots.at(-1)!, instanceId: 'test', record,
+        }),
+      });
+      await expect(restarted.reconcilePending()).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+      expect(restarted.get(created.id)?.lifecycle).toBe('active');
+
+      child.kill('SIGTERM');
+      if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
+      await expect(restarted.reconcilePending()).resolves.toMatchObject({ pending: 0 });
+      expect(restarted.get(created.id)).toMatchObject({ lifecycle: 'archived', runtime_owner: null });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  }, 15_000);
 
   it('archives before promotion and creates an Employee in the same room and cwd', async () => {
     const { manager, createEmployee, cwd } = fixture();

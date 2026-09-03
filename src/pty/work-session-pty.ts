@@ -6,6 +6,7 @@ import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
 import type { WorkSessionRecord } from '../work-sessions/types.js';
 import type { WorkSessionResumeHandle, WorkSessionRuntimeAdapter } from '../work-sessions/types.js';
+import { captureProcessIdentity, probeProcessIdentity } from '../utils/process-identity.js';
 
 const CHILD_ENV_ALLOWLIST = ['PATH', 'HOME', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'] as const;
 
@@ -257,7 +258,29 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     }
   }
 
-  status() { return { running: this.pty !== null, pid: this.pty?.pid ?? null, error_code: null }; }
+  status() {
+    if (this.pty) {
+      const identity = captureProcessIdentity(this.pty.pid);
+      return {
+        running: true,
+        pid: this.pty.pid,
+        error_code: identity ? null : 'RUNTIME_OWNERSHIP_UNCONFIRMED',
+        process_started_at: identity?.started_at ?? null,
+        ownership: identity ? 'attached' as const : 'unknown' as const,
+      };
+    }
+    const owner = this.options.record.runtime_owner;
+    if (!owner) return { running: false, pid: null, error_code: null, process_started_at: null, ownership: 'dead' as const };
+    const state = probeProcessIdentity(owner);
+    if (state === 'dead') return { running: false, pid: owner.pid, error_code: null, process_started_at: owner.started_at, ownership: 'dead' as const };
+    return {
+      running: true,
+      pid: owner.pid,
+      error_code: state === 'unknown' ? 'RUNTIME_OWNERSHIP_UNCONFIRMED' : 'RUNTIME_DETACHED',
+      process_started_at: owner.started_at,
+      ownership: state === 'alive' ? 'detached' as const : 'unknown' as const,
+    };
+  }
   getResumeHandle(): WorkSessionResumeHandle | null { return this.currentHandle; }
 
   private assertCanonicalCwd(cwd: string): void {
