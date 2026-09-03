@@ -550,10 +550,11 @@ export class WorkSessionManager {
         transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
         throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
       }
-      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'failed', { last_error: 'RUNTIME_START_FAILED', runtime_owner: null }, mutationId);
+      const errorCode = closedApplicationErrorCode(error, 'RUNTIME_START_FAILED');
+      record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'failed', { last_error: errorCode, runtime_owner: null }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { runtime_started: false, mutation_id: mutationId });
-      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'failure', after_digest: stateDigest(record), error_code: 'RUNTIME_START_FAILED', sanitized_error: 'Runtime start failed' });
-      throw error;
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'failure', after_digest: stateDigest(record), error_code: errorCode, sanitized_error: 'Runtime start failed' });
+      throw new WorkSessionRegistryError(errorCode, 'Runtime start failed');
     }
   }
 
@@ -648,7 +649,7 @@ export class WorkSessionManager {
     if (readRoomLog(this.dependencies.ctxRoot, record.room_id).some(message => message.id === outputId)) return;
     appendRoomMessage(this.dependencies.ctxRoot, {
       id: outputId, room_id: record.room_id, from: record.id, to: record.created_by,
-      timestamp: this.now(), text: output.text.trim(), reply_to: null, thread_id: outputId,
+      timestamp: output.completed_at ?? this.now(), text: output.text.trim(), reply_to: null, thread_id: outputId,
       source: 'work_session', attachments: [], delivery_state: 'delivered',
     });
   }

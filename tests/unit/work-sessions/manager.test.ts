@@ -113,6 +113,23 @@ describe('WorkSessionManager', () => {
     expect(adapter.startFresh).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['MODEL_UNSUPPORTED', 'POLICY_REJECTED', 'SANDBOX_UNAVAILABLE'])(
+    'replays the exact finalized runtime failure code %s',
+    async code => {
+      const { manager, adapter, cwd } = fixture();
+      vi.mocked(adapter.startFresh).mockRejectedValueOnce(new Error(code));
+      const mutationId = code === 'MODEL_UNSUPPORTED'
+        ? 'b2111111-1111-4111-8111-111111111111'
+        : code === 'POLICY_REJECTED'
+          ? 'b2222222-2222-4222-8222-222222222222'
+          : 'b2333333-3333-4333-8333-333333333333';
+      const input = { display_name: 'Closed failure', org: 'platform', harness: 'codex-app-server' as const, requested_cwd: cwd, actor: 'owner:test' };
+      await expect(manager.create(input, mutationId)).rejects.toMatchObject({ code });
+      await expect(manager.create(input, mutationId)).rejects.toMatchObject({ code });
+      expect(adapter.startFresh).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('rejects reuse of a mutation id for different input', async () => {
     const { manager, cwd } = fixture();
     const created = await manager.create({ display_name: 'Fix release', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, '11111111-1111-4111-8111-111111111111');
