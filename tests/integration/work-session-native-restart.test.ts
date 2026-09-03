@@ -49,6 +49,7 @@ process.stdin.on('data', chunk => {
       } } }) + '\\n');
     }
   }
+
 });
 setInterval(() => {}, 1000);
 `);
@@ -56,6 +57,91 @@ setInterval(() => {}, 1000);
     process.env.PATH = `${bin}:${originalPath ?? ''}`;
     return { root, cwd, ctxRoot };
   }
+
+  function structuredFixture(harness: 'claude-code' | 'opencode') {
+    const root = mkdtempSync(join(tmpdir(), `cortext-native-${harness}-`));
+    roots.push(root);
+    const bin = join(root, 'bin');
+    const cwd = join(root, 'project');
+    const ctxRoot = join(root, 'ctx');
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(cwd);
+    const executable = join(bin, harness === 'claude-code' ? 'claude' : 'opencode');
+    const source = harness === 'claude-code' ? `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const args = process.argv.slice(2);
+fs.writeFileSync(path.join(process.cwd(), 'launch-args.json'), JSON.stringify(args));
+const settingsPath = args[args.indexOf('--settings') + 1];
+const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+const command = settings.hooks.SessionStart[0].hooks[0].command;
+const quoted = command.match(/"([^"]+)"$/);
+const ackPath = quoted && quoted[1];
+const sessionId = args.includes('--resume') ? args[args.indexOf('--resume') + 1] : args[args.indexOf('--session-id') + 1];
+fs.writeFileSync(ackPath, JSON.stringify({ session_id: sessionId }));
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  buffer += chunk;
+  const lines = buffer.split(/\\n/); buffer = lines.pop() || '';
+  for (const line of lines) if (line.trim()) {
+    const request = JSON.parse(line);
+    process.stdout.write(JSON.stringify({ type: 'assistant', uuid: 'claude-native-answer', message: { content: [{ type: 'text', text: 'Claude native answer: ' + request.message.content[0].text }] } }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+` : `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const args = process.argv.slice(2);
+fs.writeFileSync(path.join(process.cwd(), 'launch-args.json'), JSON.stringify(args));
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  buffer += chunk;
+  const lines = buffer.split(/\\n/); buffer = lines.pop() || '';
+  for (const line of lines) if (line.trim()) {
+    const request = JSON.parse(line);
+    if (request.method === 'initialize') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: 1 } }) + '\\n');
+    else if (request.method === 'session/new') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { sessionId: 'opencode-native-session' } }) + '\\n');
+    else if (request.method === 'session/load') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }) + '\\n');
+    else if (request.method === 'session/set_config_option') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }) + '\\n');
+    else if (request.method === 'session/prompt') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: request.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OpenCode native answer' } } } }) + '\\n');
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'end_turn' } }) + '\\n');
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`;
+    writeFileSync(executable, source);
+    chmodSync(executable, 0o755);
+    process.env.PATH = `${bin}:${originalPath ?? ''}`;
+    return { root, cwd, ctxRoot };
+  }
+
+  it.each(['claude-code', 'opencode'] as const)('launches %s through its native structured transport and persists emitted bytes', async harness => {
+    const { root, cwd, ctxRoot } = structuredFixture(harness);
+    const mutationId = harness === 'claude-code' ? 'c4111111-1111-4111-8111-111111111111' : '04111111-1111-4111-8111-111111111111';
+    const record = createWorkSessionRecord(ctxRoot, {
+      id: `ws-${mutationId}`, display_name: 'Structured', org: 'platform', harness, requested_cwd: cwd,
+      room_id: `work-${mutationId}`, mutation_id: mutationId, created_by: 'owner:test',
+    });
+    const manager = new WorkSessionManager({ ctxRoot, adapterFactory: () => { throw new Error('unused'); } });
+    const adapter = new WorkSessionPTY({
+      ctxRoot, frameworkRoot: root, instanceId: 'test', record, timeoutMs: 3_000,
+      onOutput: output => manager.recordRuntimeOutput(record.id, output),
+    });
+    await adapter.startFresh({ id: record.id, mutation_id: mutationId, cwd });
+    await adapter.send('native prompt');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const args = JSON.parse(readFileSync(join(cwd, 'launch-args.json'), 'utf8')) as string[];
+    if (harness === 'claude-code') expect(args).toEqual(expect.arrayContaining(['--print', '--input-format', 'stream-json', '--output-format', 'stream-json']));
+    else expect(args.slice(0, 3)).toEqual(['acp', '--cwd', cwd]);
+    expect(readRoomLog(ctxRoot, record.room_id).filter(message => message.source === 'work_session'))
+      .toEqual([expect.objectContaining({ from: record.id, text: expect.stringContaining('native answer'), delivery_state: 'delivered' })]);
+    await adapter.stop();
+  }, 10_000);
 
   it('persists ownership at native spawn and lets a fresh adapter terminate the exact child', async () => {
     const { root, cwd, ctxRoot } = fixture();

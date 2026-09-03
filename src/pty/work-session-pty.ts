@@ -10,6 +10,7 @@ import {
   captureProcessIdentity, probeProcessGroup, probeProcessIdentity, signalProcessTree, type ProcessIdentity,
 } from '../utils/process-identity.js';
 import { atomicWriteSync } from '../utils/atomic.js';
+import { closedRuntimeErrorCode } from '../utils/application-error.js';
 
 const CHILD_ENV_ALLOWLIST = ['PATH', 'HOME', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'] as const;
 
@@ -36,9 +37,10 @@ export function workSessionChildEnv(source: NodeJS.ProcessEnv, identity?: WorkSe
 }
 
 export function buildClaudeWorkSessionLaunch(input: { cwd: string; sessionId: string; resume: boolean; settingsPath?: string; model?: string }) {
-  const args = input.resume
+  const args = ['--print', '--verbose', '--input-format', 'stream-json', '--output-format', 'stream-json', '--include-partial-messages'];
+  args.push(...(input.resume
     ? ['--resume', input.sessionId]
-    : ['--session-id', input.sessionId];
+    : ['--session-id', input.sessionId]));
   args.push('--permission-mode', 'manual');
   if (input.settingsPath) args.push('--settings', input.settingsPath);
   if (input.model) args.push('--model', input.model);
@@ -63,8 +65,7 @@ export function selectOpenCodeSession(candidates: OpenCodeSessionCandidate[], ca
 }
 
 export function buildOpenCodeWorkSessionLaunch(input: { cwd: string; sessionId?: string; model?: string }) {
-  const args = input.sessionId ? ['--session', input.sessionId, '--auto=false'] : ['--auto=false'];
-  if (input.model) args.push('--model', input.model);
+  const args = ['acp', '--cwd', input.cwd, '--pure'];
   return { command: 'opencode', args, cwd: input.cwd, env: workSessionChildEnv(process.env) };
 }
 
@@ -207,6 +208,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private buffer = '';
   private rpcId = 0;
   private readonly responses = new Map<number, unknown>();
+  private readonly requestMethods = new Map<number, string>();
   private readonly timeoutMs: number;
   private intentionalStop = false;
   private ready = false;
@@ -217,6 +219,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private currentOwner: (ProcessIdentity & { mutation_id: string }) | null = null;
   private spawningMutationId: string | null = null;
   private outputSequence = 0;
+  private acpTurnText = '';
 
   constructor(private readonly options: NativeWorkSessionOptions) {
     this.timeoutMs = options.timeoutMs ?? 10_000;
@@ -241,6 +244,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       // Persist it before the optional initial message introduces another await/crash
       // boundary, so restart can resume rather than treating a known handle as lost.
       this.persistRuntimeReceipt(owner, result.resume_handle);
+      this.ready = true;
       if (input.context) await this.send(input.context);
     } catch (error) {
       await this.stop();
@@ -275,6 +279,22 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'workspaceWrite', writableRoots: [this.options.record.canonical_cwd], networkAccess: false },
       });
+      return;
+    }
+    if (this.options.record.harness === 'opencode') {
+      const sessionId = this.currentHandle?.runtime === 'opencode' ? this.currentHandle.session_id : null;
+      if (!sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      this.acpTurnText = '';
+      await this.rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
+      return;
+    }
+    if (this.options.record.harness === 'claude-code') {
+      const sessionId = this.currentHandle?.runtime === 'claude-code' ? this.currentHandle.session_id : null;
+      if (!sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      this.pty.write(`${JSON.stringify({
+        type: 'user', session_id: sessionId, parent_tool_use_id: null,
+        message: { role: 'user', content: [{ type: 'text', text }] },
+      })}\n`);
       return;
     }
     this.pty.write(`\u001b[200~${text}\u001b[201~\r`);
@@ -462,6 +482,24 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         const value = JSON.parse(line) as { id?: unknown; method?: unknown; result?: unknown; error?: unknown; params?: unknown; type?: unknown; message?: unknown };
         if (typeof value.id === 'number' && value.method === undefined && ('result' in value || 'error' in value)) {
           this.responses.set(value.id, value);
+          if (this.requestMethods.get(value.id) === 'session/prompt' && !value.error) {
+            const text = this.acpTurnText.trim();
+            if (text && this.ready) this.emitOutput({ id: this.fallbackOutputId(text), text });
+            this.acpTurnText = '';
+          }
+        }
+        if (typeof value.id === 'number' && value.method === 'session/request_permission') {
+          this.pty?.write(`${JSON.stringify({ jsonrpc: '2.0', id: value.id, result: { outcome: { outcome: 'cancelled' } } })}\n`);
+        }
+        if (value.method === 'session/update' && value.params && typeof value.params === 'object') {
+          const update = (value.params as Record<string, unknown>).update;
+          if (update && typeof update === 'object') {
+            const updateValue = update as Record<string, unknown>;
+            const content = updateValue.content && typeof updateValue.content === 'object' ? updateValue.content as Record<string, unknown> : null;
+            if (updateValue.sessionUpdate === 'agent_message_chunk' && content?.type === 'text' && typeof content.text === 'string') {
+              this.acpTurnText += content.text;
+            }
+          }
         }
         const output = this.completedOutput(value);
         if (output && this.ready) this.emitOutput(output);
@@ -514,10 +552,12 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private async rpc(method: string, params: Record<string, unknown>): Promise<any> {
     if (!this.pty) throw new Error('WORK_SESSION_NOT_RUNNING');
     const id = ++this.rpcId;
+    this.requestMethods.set(id, method);
     this.pty.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     const response = await waitFor(() => this.responses.get(id), this.timeoutMs) as { error?: unknown; result?: unknown };
     this.responses.delete(id);
-    if (response.error) throw new Error(`${method.toUpperCase().replaceAll('/', '_')}_REJECTED`);
+    this.requestMethods.delete(id);
+    if (response.error) throw new Error(closedRuntimeErrorCode(response.error));
     return response.result;
   }
 
@@ -527,7 +567,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const ackPath = join(stateDir, 'claude-session-ack.json');
     try { unlinkSync(ackPath); } catch {}
-    const reporter = join(__dirname, 'daemon.js');
+    const reporter = join(__dirname, '..', 'daemon.js');
     const settingsPath = join(stateDir, 'claude-session-settings.json');
     const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(reporter)} --claude-session-report ${JSON.stringify(sessionId)} ${JSON.stringify(ackPath)}`;
     writeFileSync(settingsPath, `${JSON.stringify(claudeSessionSettings(input.cwd, command), null, 2)}\n`, { mode: 0o600 });
@@ -580,33 +620,21 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     writeFileSync(join(configDir, 'opencode.json'), `${JSON.stringify(openCodePermissionConfig(), null, 2)}\n`, { mode: 0o600 });
     const dataDir = join(stateDir, 'data');
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    const databasePath = join(dataDir, 'opencode', 'opencode.db');
-    const before = new Set(this.queryOpenCodeSessions(databasePath).map(row => row.id));
-    const start = Date.now();
     const spec = buildOpenCodeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId });
     const env = { ...this.env(), OPENCODE_CONFIG_DIR: configDir, XDG_DATA_HOME: dataDir };
     this.spawn(spec.command, spec.args, spec.cwd, env);
     try {
-      if (sessionId) {
-        const canonicalCwd = realpathSync(input.cwd);
-        const exact = await waitFor(() => {
-          if (!this.pty) throw new Error('RESUME_HANDLE_UNAVAILABLE');
-          const matches = this.queryOpenCodeSessions(databasePath).filter(row => row.id === sessionId);
-          if (matches.length !== 1) return undefined;
-          const candidate = matches[0];
-          if (realpathSync(candidate.cwd) !== canonicalCwd) throw new Error('RESUME_HANDLE_UNAVAILABLE');
-          if ((candidate.updated_at ?? 0) < start) return undefined;
-          return candidate.id;
-        }, this.timeoutMs, 100);
-        if (exact !== sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
-        return { resume_handle: { runtime: 'opencode' as const, session_id: exact } };
-      }
-      const exact = await waitFor(() => {
-        if (!this.pty) throw new Error('RESUME_HANDLE_UNAVAILABLE');
-        const rows = this.queryOpenCodeSessions(databasePath).filter(row => !before.has(row.id));
-        if (!rows.length) return undefined;
-        return selectOpenCodeSession(rows, input.cwd, start, Date.now());
-      }, this.timeoutMs, 100);
+      await this.rpc('initialize', {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+        clientInfo: { name: 'cortextos-work-session', version: '1' },
+      });
+      const result = await this.rpc(sessionId ? 'session/load' : 'session/new', {
+        ...(sessionId ? { sessionId } : {}), cwd: input.cwd, mcpServers: [],
+      }) as { sessionId?: string };
+      const exact = sessionId ?? result?.sessionId;
+      if (!exact || (sessionId && result?.sessionId && result.sessionId !== sessionId)) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      if (input.model) await this.rpc('session/set_config_option', { sessionId: exact, configId: 'model', value: input.model });
       return { resume_handle: { runtime: 'opencode' as const, session_id: exact } };
     } catch (error) { await this.stop(); throw error; }
   }

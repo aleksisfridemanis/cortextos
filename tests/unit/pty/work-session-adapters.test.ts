@@ -10,8 +10,10 @@ import {
 
 describe('Work Session harness contracts', () => {
   it('uses a generated Claude session id for fresh launch and only that id for resume', () => {
-    expect(buildClaudeWorkSessionLaunch({ cwd: '/project', sessionId: 'uuid-exact', resume: false }).args)
-      .toEqual(expect.arrayContaining(['--session-id', 'uuid-exact']));
+    const fresh = buildClaudeWorkSessionLaunch({ cwd: '/project', sessionId: 'uuid-exact', resume: false });
+    expect(fresh.args).toEqual(expect.arrayContaining([
+      '--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--session-id', 'uuid-exact',
+    ]));
     const resumed = buildClaudeWorkSessionLaunch({ cwd: '/project', sessionId: 'uuid-exact', resume: true });
     expect(resumed.args).toEqual(expect.arrayContaining(['--resume', 'uuid-exact']));
     expect(resumed.args).not.toContain('--continue');
@@ -32,7 +34,7 @@ describe('Work Session harness contracts', () => {
       { id: 'other', cwd: '/other', created_at: 105 },
     ], '/project', 100, 110);
     expect(selected).toBe('exact');
-    expect(buildOpenCodeWorkSessionLaunch({ cwd: '/project', sessionId: selected }).args).toEqual(['--session', 'exact', '--auto=false']);
+    expect(buildOpenCodeWorkSessionLaunch({ cwd: '/project', sessionId: selected }).args).toEqual(['acp', '--cwd', '/project', '--pure']);
   });
 
   it('passes only the strict tokenless child environment allowlist', () => {
