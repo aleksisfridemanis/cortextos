@@ -1,11 +1,11 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import {
   chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, readdirSync, unlinkSync, writeFileSync,
 } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
 import type { WorkSessionRecord } from '../work-sessions/types.js';
-import type { WorkSessionLaunchInput, WorkSessionResumeHandle, WorkSessionRuntimeAdapter } from '../work-sessions/types.js';
+import type { WorkSessionLaunchInput, WorkSessionResumeHandle, WorkSessionRuntimeAdapter, WorkSessionRuntimeOutput } from '../work-sessions/types.js';
 import {
   captureProcessIdentity, probeProcessGroup, probeProcessIdentity, signalProcessTree, type ProcessIdentity,
 } from '../utils/process-identity.js';
@@ -181,7 +181,8 @@ export interface NativeWorkSessionOptions {
   frameworkRoot: string;
   instanceId: string;
   record: WorkSessionRecord;
-  onExit?: (event: { exitCode: number; signal?: number }) => void;
+  onExit?: (event: { exitCode: number; signal?: number }) => void | Promise<void>;
+  onOutput?: (output: WorkSessionRuntimeOutput) => void;
   timeoutMs?: number;
 }
 
@@ -215,6 +216,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private resolveExit: (() => void) | null = null;
   private currentOwner: (ProcessIdentity & { mutation_id: string }) | null = null;
   private spawningMutationId: string | null = null;
+  private outputSequence = 0;
 
   constructor(private readonly options: NativeWorkSessionOptions) {
     this.timeoutMs = options.timeoutMs ?? 10_000;
@@ -425,7 +427,15 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       this.resolveExit = null;
       if (!this.intentionalStop && this.ready) {
         this.ready = false;
-        setTimeout(() => this.options.onExit?.(event), 0);
+        setTimeout(() => {
+          try {
+            void Promise.resolve(this.options.onExit?.(event)).catch(error => {
+              console.error(`[work-session] PTY exit recovery failed: ${(error as Error).message}`);
+            });
+          } catch (error) {
+            console.error(`[work-session] PTY exit recovery failed: ${(error as Error).message}`);
+          }
+        }, 0);
       }
     });
     return pty;
@@ -449,12 +459,55 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     this.buffer = lines.pop() ?? '';
     for (const line of lines) {
       try {
-        const value = JSON.parse(line) as { id?: unknown; method?: unknown; result?: unknown; error?: unknown };
+        const value = JSON.parse(line) as { id?: unknown; method?: unknown; result?: unknown; error?: unknown; params?: unknown; type?: unknown; message?: unknown };
         if (typeof value.id === 'number' && value.method === undefined && ('result' in value || 'error' in value)) {
           this.responses.set(value.id, value);
         }
-      } catch { /* normal TUI output */ }
+        const output = this.completedOutput(value);
+        if (output && this.ready) this.emitOutput(output);
+      } catch {
+        if (!this.ready || this.options.record.harness === 'codex-app-server') continue;
+        const text = line.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').trim();
+        if (text) this.emitOutput({ id: this.fallbackOutputId(text), text });
+      }
     }
+  }
+
+  private emitOutput(output: WorkSessionRuntimeOutput): void {
+    try {
+      this.options.onOutput?.(output);
+    } catch (error) {
+      // PTY data events execute outside the request promise. A persistence
+      // failure must be observable without escaping as a daemon-fatal throw.
+      console.error(`[work-session] output persistence failed: ${(error as Error).message}`);
+    }
+  }
+
+  private completedOutput(value: Record<string, unknown>): WorkSessionRuntimeOutput | null {
+    const params = value.params && typeof value.params === 'object' ? value.params as Record<string, unknown> : null;
+    const item = params?.item && typeof params.item === 'object' ? params.item as Record<string, unknown> : null;
+    if (value.method === 'item/completed' && item?.type === 'agentMessage' && typeof item.text === 'string' && item.text.trim()) {
+      return { id: typeof item.id === 'string' ? item.id : this.fallbackOutputId(item.text), text: item.text.trim() };
+    }
+    const message = value.message && typeof value.message === 'object' ? value.message as Record<string, unknown> : null;
+    if (value.type === 'assistant' && Array.isArray(message?.content)) {
+      const text = message.content.flatMap(part => part && typeof part === 'object' && (part as Record<string, unknown>).type === 'text'
+        && typeof (part as Record<string, unknown>).text === 'string' ? [(part as Record<string, unknown>).text as string] : []).join('\n').trim();
+      if (text) return { id: typeof value.uuid === 'string' ? value.uuid : this.fallbackOutputId(text), text };
+    }
+    const properties = value.properties && typeof value.properties === 'object' ? value.properties as Record<string, unknown> : null;
+    const part = properties?.part && typeof properties.part === 'object' ? properties.part as Record<string, unknown> : null;
+    if ((value.type === 'message.part.updated' || value.type === 'message.part.completed') && part?.type === 'text'
+      && typeof part.text === 'string' && part.text.trim()) {
+      return { id: typeof part.id === 'string' ? part.id : this.fallbackOutputId(part.text), text: part.text.trim() };
+    }
+    return null;
+  }
+
+  private fallbackOutputId(text: string): string {
+    this.outputSequence += 1;
+    const generation = this.currentOwner?.started_at ?? this.spawningMutationId ?? 'unknown';
+    return createHash('sha256').update(`${generation}\0${this.outputSequence}\0${text}`).digest('hex');
   }
 
   private async rpc(method: string, params: Record<string, unknown>): Promise<any> {

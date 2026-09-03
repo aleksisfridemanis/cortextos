@@ -67,7 +67,8 @@ export interface RoomAttachment {
 }
 
 /** Which transport delivered the message. */
-export type RoomMessageSource = 'bus' | 'telegram' | 'slack' | 'buzz';
+export type RoomMessageSource = 'bus' | 'telegram' | 'slack' | 'buzz' | 'work_session';
+export type RoomDeliveryState = 'pending' | 'delivered' | 'indeterminate';
 
 /**
  * Marks a message as part of an event-sourced tool run rather than ordinary
@@ -92,6 +93,8 @@ export interface RoomMessage {
   kind?: RoomMessageKind;
   attachments: RoomAttachment[];
   priority?: Priority;
+  /** Append-only state projection; later records with the same id may advance it. */
+  delivery_state?: RoomDeliveryState;
 }
 
 // Task Types

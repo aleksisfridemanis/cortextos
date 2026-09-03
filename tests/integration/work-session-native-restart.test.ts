@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WorkSessionPTY } from '../../src/pty/work-session-pty.js';
 import { createWorkSessionRecord } from '../../src/work-sessions/registry.js';
 import { WorkSessionManager } from '../../src/work-sessions/manager.js';
+import { readRoomLog } from '../../src/rooms/log.js';
 import { commitCrewMutationState, prepareCrewMutation, startCrewMutationEffect } from '../../src/audit/crew-mutation-journal.js';
 import { digestCrewAuditValue } from '../../src/audit/crew-lifecycle-audit.js';
 import { captureProcessIdentity, probeProcessIdentity } from '../../src/utils/process-identity.js';
@@ -42,6 +43,11 @@ process.stdin.on('data', chunk => {
     const request = JSON.parse(line);
     const result = request.method === 'thread/start' ? { thread: { id: 'native-thread' } } : {};
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n');
+    if (request.method === 'turn/start') {
+      process.stdout.write(JSON.stringify({ method: 'item/completed', params: { item: {
+        id: 'native-answer', type: 'agentMessage', text: 'native durable answer'
+      } } }) + '\\n');
+    }
   }
 });
 setInterval(() => {}, 1000);
@@ -76,6 +82,31 @@ setInterval(() => {}, 1000);
     await restarted.stop();
     expect(restarted.status()).toMatchObject({ running: false, ownership: 'dead' });
     expect(probeProcessIdentity(descendant)).toBe('dead');
+  }, 10_000);
+
+  it('persists native completed output once with stable Work Session identity', async () => {
+    const { root, cwd, ctxRoot } = fixture();
+    const mutationId = 'd4111111-1111-4111-8111-111111111111';
+    const record = createWorkSessionRecord(ctxRoot, {
+      id: `ws-${mutationId}`, display_name: 'Native output', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd,
+      room_id: `work-${mutationId}`, mutation_id: mutationId, created_by: 'owner:test',
+    });
+    const manager = new WorkSessionManager({ ctxRoot, adapterFactory: () => { throw new Error('unused'); } });
+    const adapter = new WorkSessionPTY({
+      ctxRoot, frameworkRoot: root, instanceId: 'test', record, timeoutMs: 3_000,
+      onOutput: output => manager.recordRuntimeOutput(record.id, output),
+    });
+    await adapter.startFresh({ id: record.id, mutation_id: mutationId, cwd });
+    await adapter.send('answer me');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    manager.recordRuntimeOutput(record.id, { id: 'native-answer', text: 'native durable answer' });
+
+    const output = readRoomLog(ctxRoot, record.room_id).filter(message => message.source === 'work_session');
+    expect(output).toHaveLength(1);
+    expect(output[0]).toMatchObject({
+      from: record.id, to: record.created_by, text: 'native durable answer', delivery_state: 'delivered',
+    });
+    await adapter.stop();
   }, 10_000);
 
   it('terminates a live exact owner with no discovered handle and finalizes recoverable failure', async () => {

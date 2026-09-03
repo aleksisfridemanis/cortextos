@@ -88,6 +88,7 @@ export interface EmployeeStartReceipt {
   started: boolean;
   pid: number | null;
   process_started_at: string | null;
+  process_group_id?: number | null;
   disposition: 'running' | 'configured' | 'exited' | 'failed';
 }
 
@@ -284,6 +285,7 @@ export function employeeStartReceiptDigest(receipt: EmployeeStartReceipt): strin
     started: receipt.started,
     pid: receipt.pid,
     process_started_at: receipt.process_started_at,
+    process_group_id: receipt.process_group_id ?? null,
     disposition: receipt.disposition,
   });
 }
@@ -293,13 +295,13 @@ function validateStartReceipt(receipt: EmployeeStartReceipt, request: EmployeeSt
     && receipt.disposition === 'running'
     && Number.isSafeInteger(receipt.pid) && (receipt.pid ?? 0) > 0
     && typeof receipt.process_started_at === 'string' && receipt.process_started_at.length > 0
-    && probeProcessIdentity({ pid: receipt.pid!, started_at: receipt.process_started_at! }) === 'alive';
+    && probeProcessIdentity({ pid: receipt.pid!, started_at: receipt.process_started_at!, process_group_id: receipt.process_group_id }) === 'alive';
   const configured = !receipt.started && receipt.disposition === 'configured'
     && receipt.pid === null && receipt.process_started_at === null;
   const exited = !receipt.started && receipt.disposition === 'exited'
     && Number.isSafeInteger(receipt.pid) && (receipt.pid ?? 0) > 0
     && typeof receipt.process_started_at === 'string'
-    && probeProcessIdentity({ pid: receipt.pid!, started_at: receipt.process_started_at }) === 'dead';
+    && probeProcessIdentity({ pid: receipt.pid!, started_at: receipt.process_started_at, process_group_id: receipt.process_group_id }) === 'dead';
   const failed = !receipt.started && receipt.disposition === 'failed'
     && receipt.pid === null && receipt.process_started_at === null;
   if (receipt.mutation_id !== request.mutation_id || receipt.name !== request.name || (!identityMatches && !configured && !exited && !failed)) {

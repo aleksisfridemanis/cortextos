@@ -406,10 +406,20 @@ function certifyEmployeeCreate(
       started: receipt?.started,
       pid: receipt?.pid,
       process_started_at: receipt?.process_started_at,
+      process_group_id: receipt?.process_group_id ?? null,
+      disposition: receipt?.disposition,
+    };
+    const legacyCanonical = {
+      mutation_id: receipt?.mutation_id,
+      name: receipt?.name,
+      started: receipt?.started,
+      pid: receipt?.pid,
+      process_started_at: receipt?.process_started_at,
       disposition: receipt?.disposition,
     };
     if (receipt?.mutation_id !== entry.mutation_id || receipt.name !== entry.target.id
-      || receipt.receipt_digest !== digestCrewAuditValue(canonical)) return null;
+      || (receipt.receipt_digest !== digestCrewAuditValue(canonical)
+        && receipt.receipt_digest !== digestCrewAuditValue(legacyCanonical))) return null;
     if (receipt.started === true && receipt.disposition === 'running'
       && Number.isSafeInteger(receipt.pid) && typeof receipt.process_started_at === 'string') {
       return { result: 'success', after_digest: entry.intended_after_digest };

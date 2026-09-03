@@ -13,13 +13,14 @@ import {
   type EmployeeStartReceipt,
   type EmployeeStartRequest,
 } from '../agents/create-employee.js';
-import { createWorkSessionRecord, readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession, WorkSessionRegistryError } from './registry.js';
-import { appendRoomMessage } from '../rooms/log.js';
+import { createWorkSessionRecord, readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession, updateWorkSessionError, WorkSessionRegistryError } from './registry.js';
+import { appendRoomMessage, readRoomLog } from '../rooms/log.js';
 import { getRoom, RoomRegistryError, upsertRoom } from '../rooms/registry.js';
 import { withFileLockSync } from '../utils/lock.js';
 import type {
   CreateWorkSessionInput, WorkSessionEmployeeInput, WorkSessionRecord,
   WorkSessionResumeHandle, WorkSessionRuntimeAdapter,
+  WorkSessionRuntimeOutput,
 } from './types.js';
 import { composeWorkSessionContext, WORK_SESSION_CONTEXT_MAX_BYTES } from '../context/composer.js';
 import { promotionEmployeeMutationId } from './promotion.js';
@@ -68,6 +69,7 @@ const workSessionMutationRuns = new Map<string, WorkSessionMutationRun>();
 
 export class WorkSessionManager {
   private readonly adapters = new Map<string, WorkSessionRuntimeAdapter>();
+  private readonly runtimeExitRuns = new Map<string, Promise<void>>();
   private readonly now: () => string;
   constructor(private readonly dependencies: Dependencies) { this.now = dependencies.now ?? (() => new Date().toISOString()); }
 
@@ -91,8 +93,15 @@ export class WorkSessionManager {
       const mutation = getCrewMutation(this.dependencies.ctxRoot, record.mutation_id);
       if (mutation?.stage !== 'finalized') continue;
       const runtime = this.adapter(record).status();
+      if (runtime.ownership === 'detached') {
+        const adapter = this.adapter(record);
+        await adapter.stop();
+        this.assertRuntimeStopped(adapter);
+        await this.handleRuntimeExit(record.id);
+        continue;
+      }
       if (runtime.running) {
-        if (record.lifecycle === 'active' && runtime.ownership !== 'unknown') continue;
+        if (record.lifecycle === 'active' && runtime.ownership === 'attached') continue;
         throw new WorkSessionRegistryError('RECOVERY_REQUIRED', `Runtime ownership for ${record.id} is ${runtime.ownership ?? 'unknown'}`);
       }
       this.handleRuntimeExit(record.id);
@@ -112,6 +121,22 @@ export class WorkSessionManager {
           if (entry.stage === 'state_committed') startCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id);
           const adapter = this.adapter(record);
           const runtime = adapter.status();
+          if (runtime.ownership === 'detached') {
+            const handle = adapter.getResumeHandle();
+            await adapter.stop();
+            this.assertRuntimeStopped(adapter);
+            record = transitionWorkSession(this.dependencies.ctxRoot, record.id, ['starting', 'active'], 'failed', {
+              resume_handle: handle, runtime_owner: null, last_error: handle ? 'DAEMON_RESTART_DETACHED_RUNTIME' : 'RESUME_HANDLE_MISSING',
+            }, entry.mutation_id);
+            recordCrewMutationEffect(this.dependencies.ctxRoot, entry.mutation_id, {
+              mutation_id: entry.mutation_id, runtime_started: false, recovered: true, orphan_terminated: true,
+            });
+            finalizeCrewMutationAudit(this.dependencies.ctxRoot, entry.mutation_id, {
+              result: 'failure', after_digest: stateDigest(record), error_code: handle ? 'DAEMON_RESTART_DETACHED_RUNTIME' : 'RESUME_HANDLE_MISSING',
+              sanitized_error: handle ? 'Detached runtime was terminated; exact continuation remains resumable' : 'Detached runtime lacked a continuation handle and was terminated',
+            });
+            continue;
+          }
           if (runtime.running) {
             if (!adapter.getResumeHandle()) {
               this.validateRuntimeOwner(adapter.getRuntimeOwner?.() ?? null, entry.mutation_id);
@@ -542,6 +567,8 @@ export class WorkSessionManager {
     const prior = this.priorMutation(mutationId, actor, 'message', id, request);
     if (prior?.stage === 'finalized') return;
     if (prior?.stage === 'effect_started') {
+      const record = this.require(id, ['active']);
+      this.appendDelivery(record, actor, mutationId, text, 'indeterminate');
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
         result: 'indeterminate', after_digest: prior.state_digest ?? prior.before_digest,
         error_code: 'DELIVERY_RETRY_REQUIRED', sanitized_error: 'Delivery outcome requires owner retry',
@@ -561,19 +588,45 @@ export class WorkSessionManager {
       appendRoomMessage(this.dependencies.ctxRoot, {
         id: mutationId, room_id: record.room_id, from: actor, to: record.id,
         timestamp: this.now(), text, reply_to: null, thread_id: mutationId,
-        source: 'bus', attachments: [],
+        source: 'bus', attachments: [], delivery_state: 'pending',
       });
       commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
     }
     startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
     try {
       await this.adapter(record).send(text);
+      this.appendDelivery(record, actor, mutationId, text, 'delivered');
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { delivered: true, mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(record) });
     } catch {
+      this.appendDelivery(record, actor, mutationId, text, 'indeterminate');
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'indeterminate', after_digest: stateDigest(record), error_code: 'DELIVERY_RETRY_REQUIRED', sanitized_error: 'Delivery outcome requires owner retry' });
       throw new WorkSessionRegistryError('DELIVERY_RETRY_REQUIRED', 'Message delivery outcome is uncertain');
     }
+  }
+
+  private appendDelivery(record: WorkSessionRecord, actor: string, mutationId: string, text: string, deliveryState: 'delivered' | 'indeterminate'): void {
+    appendRoomMessage(this.dependencies.ctxRoot, {
+      id: mutationId, room_id: record.room_id, from: actor, to: record.id,
+      timestamp: this.now(), text, reply_to: null, thread_id: mutationId,
+      source: 'bus', attachments: [], delivery_state: deliveryState,
+    });
+  }
+
+  /** Persist one completed runtime response with immutable Work Session identity. */
+  recordRuntimeOutput(id: string, output: WorkSessionRuntimeOutput): void {
+    const record = this.get(id);
+    if (!record || !output.text.trim()) return;
+    const outputId = `wsout-${digestCrewAuditValue({ session: record.id, output: output.id }).slice(0, 48)}`;
+    // Native harnesses can repeat their completion event during redraw or
+    // reconnect. Keep the append-only room physically idempotent as well as
+    // reader-idempotent so one completed response has one durable record.
+    if (readRoomLog(this.dependencies.ctxRoot, record.room_id).some(message => message.id === outputId)) return;
+    appendRoomMessage(this.dependencies.ctxRoot, {
+      id: outputId, room_id: record.room_id, from: record.id, to: record.created_by,
+      timestamp: this.now(), text: output.text.trim(), reply_to: null, thread_id: outputId,
+      source: 'work_session', attachments: [], delivery_state: 'delivered',
+    });
   }
 
   stop(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
@@ -862,7 +915,27 @@ export class WorkSessionManager {
     return record;
   }
 
-  handleRuntimeExit(id: string): void {
+  handleRuntimeExit(id: string): Promise<void> {
+    const running = this.runtimeExitRuns.get(id);
+    if (running) return running;
+    const active = [...workSessionMutationRuns.entries()].find(([key, value]) =>
+      key.startsWith(`${this.dependencies.ctxRoot}\0`) && value.target === id)?.[1].promise;
+    const task = (active ? active.catch(() => undefined) : Promise.resolve())
+      .then(() => this.handleRuntimeExitOnce(id))
+      .catch(error => {
+        const pending = listPendingCrewMutations(this.dependencies.ctxRoot)
+          .some(entry => entry.target.kind === 'work_session' && entry.target.id === id);
+        if (!pending) {
+          try { updateWorkSessionError(this.dependencies.ctxRoot, id, 'RUNTIME_EXIT_RECOVERY_FAILED'); } catch { /* record may already be terminal */ }
+        }
+        console.error(`[work-session] exit recovery failed for ${id}: ${(error as Error).message}`);
+      })
+      .finally(() => { if (this.runtimeExitRuns.get(id) === task) this.runtimeExitRuns.delete(id); });
+    this.runtimeExitRuns.set(id, task);
+    return task;
+  }
+
+  private handleRuntimeExitOnce(id: string): void {
     const record = this.get(id);
     if (!record || !['starting', 'active', 'stopping'].includes(record.lifecycle)) return;
     const mutationId = randomUUID();

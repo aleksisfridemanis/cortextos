@@ -29,6 +29,7 @@ export interface RoomMessage {
   kind?: string;
   attachments: Array<{ kind: string; path: string; mime?: string; transcript?: string }>;
   priority?: string;
+  delivery_state?: 'pending' | 'delivered' | 'indeterminate';
 }
 
 const ROOM_ID_PATTERN = /^[a-z0-9_-]+$/;
@@ -134,7 +135,7 @@ export function readRoomTail(ctxRoot: string, roomId: string, previewChars = 140
 }
 
 /**
- * Read a room log, first occurrence of each id winning. Corrupt lines are
+ * Read a room log with immutable first-write content and latest delivery state. Corrupt lines are
  * skipped. An absent log, or an id that is not a safe path segment, gives [].
  */
 export function readRoomLog(ctxRoot: string, roomId: string): RoomMessage[] {
@@ -147,14 +148,19 @@ export function readRoomLog(ctxRoot: string, roomId: string): RoomMessage[] {
     return [];
   }
 
-  const seen = new Set<string>();
+  const byId = new Map<string, RoomMessage>();
   const messages: RoomMessage[] = [];
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
     try {
       const msg: RoomMessage = JSON.parse(line);
-      if (!msg.id || !msg.from || !msg.timestamp || seen.has(msg.id)) continue;
-      seen.add(msg.id);
+      if (!msg.id || !msg.from || !msg.timestamp) continue;
+      const existing = byId.get(msg.id);
+      if (existing) {
+        if (msg.delivery_state) existing.delivery_state = msg.delivery_state;
+        continue;
+      }
+      byId.set(msg.id, msg);
       messages.push(msg);
     } catch {
       /* skip corrupt line */

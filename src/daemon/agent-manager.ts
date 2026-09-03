@@ -34,7 +34,7 @@ import {
 import { listPendingCrewMutations, readCrewMutationJournal, reconcileCrewMutationJournal } from '../audit/crew-mutation-journal.js';
 import { promotionEmployeeMutationId } from '../work-sessions/promotion.js';
 import { atomicWriteSync } from '../utils/atomic.js';
-import { captureProcessIdentity, probeProcessIdentity } from '../utils/process-identity.js';
+import { captureProcessIdentity, probeProcessGroup, probeProcessIdentity, signalProcessTree } from '../utils/process-identity.js';
 
 type LogFn = (msg: string) => void;
 
@@ -161,7 +161,8 @@ export class AgentManager {
       frameworkRoot,
       adapterFactory: record => new WorkSessionPTY({
         ctxRoot, frameworkRoot, instanceId, record,
-        onExit: () => this.workSessions.handleRuntimeExit(record.id),
+        onExit: () => { void this.workSessions.handleRuntimeExit(record.id); },
+        onOutput: output => this.workSessions.recordRuntimeOutput(record.id, output),
       }),
       startEmployee: request => this.startEmployeeForMutation(request),
       queryEmployeeStart: request => this.queryEmployeeStart(request),
@@ -249,6 +250,7 @@ export class AgentManager {
         started: true,
         pid: identity.pid,
         process_started_at: identity.started_at,
+        process_group_id: identity.process_group_id ?? null,
         disposition: 'running',
       };
       atomicWriteSync(this.employeeReceiptPath(request.mutation_id), JSON.stringify(spawnedReceipt, null, 2));
@@ -275,6 +277,7 @@ export class AgentManager {
       started: true,
       pid: identity.pid,
       process_started_at: identity.started_at,
+      process_group_id: identity.process_group_id ?? null,
       disposition: 'running',
     } as const;
     atomicWriteSync(this.employeeReceiptPath(request.mutation_id), JSON.stringify(receipt, null, 2));
@@ -293,13 +296,37 @@ export class AgentManager {
       return receipt.disposition === 'failed' && receipt.pid === null && receipt.process_started_at === null ? receipt : null;
     }
     if (receipt.disposition !== 'running' || !receipt.pid || !receipt.process_started_at) return null;
-    const processState = probeProcessIdentity({ pid: receipt.pid, started_at: receipt.process_started_at });
+    const identity = { pid: receipt.pid, started_at: receipt.process_started_at, process_group_id: receipt.process_group_id };
+    const processState = probeProcessIdentity(identity);
     if (processState === 'dead') return { ...receipt, started: false, disposition: 'exited' };
     if (processState !== 'alive') return null;
     const status = this.getAgentStatus(request.name);
     if (status?.status === 'running' && status.pid !== receipt.pid) return null;
+    if (!status || status.status !== 'running' || status.pid !== receipt.pid) {
+      if (!await this.terminateDetachedEmployee(identity)) return null;
+      const exited = { ...receipt, started: false, disposition: 'exited' as const };
+      atomicWriteSync(this.employeeReceiptPath(request.mutation_id), JSON.stringify(exited, null, 2));
+      this.employeeStartReceipts.set(request.mutation_id, exited);
+      return exited;
+    }
     this.employeeStartReceipts.set(request.mutation_id, receipt);
     return receipt;
+  }
+
+  private async terminateDetachedEmployee(identity: { pid: number; started_at: string; process_group_id?: number | null }): Promise<boolean> {
+    try { signalProcessTree(identity, 'SIGTERM'); } catch { return false; }
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (probeProcessGroup(identity) === 'dead') return true;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    try { signalProcessTree(identity, 'SIGKILL'); } catch { return false; }
+    const hardDeadline = Date.now() + 5_000;
+    while (Date.now() < hardDeadline) {
+      if (probeProcessGroup(identity) === 'dead') return true;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return false;
   }
 
   private employeeReceiptPath(mutationId: string): string {

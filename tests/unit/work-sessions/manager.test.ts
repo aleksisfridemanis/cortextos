@@ -15,6 +15,7 @@ import { createWorkSessionRecord, transitionWorkSession } from '../../../src/wor
 import { upsertRoom } from '../../../src/rooms/registry.js';
 import { WorkSessionPTY } from '../../../src/pty/work-session-pty.js';
 import { captureProcessIdentity, probeProcessIdentity } from '../../../src/utils/process-identity.js';
+import { readRoomLog } from '../../../src/rooms/log.js';
 
 describe('WorkSessionManager', () => {
   const roots: string[] = [];
@@ -323,6 +324,32 @@ describe('WorkSessionManager', () => {
     await expect(manager.send(created.id, 'uncertain', 'owner:test', mutationId)).rejects.toMatchObject({ code: 'DELIVERY_RETRY_REQUIRED' });
     expect(adapter.send).not.toHaveBeenCalled();
     expect(getCrewMutation(ctxRoot, mutationId)).toMatchObject({ stage: 'finalized', final_result: { result: 'indeterminate' } });
+    expect(readRoomLog(ctxRoot, created.room_id).find(message => message.id === mutationId))
+      .toMatchObject({ text: 'uncertain', delivery_state: 'indeterminate' });
+  });
+
+  it('serializes PTY exit behind an in-flight send and archives without throwing from the callback', async () => {
+    const { manager, adapter, cwd } = fixture();
+    const created = await manager.create({ display_name: 'Exit send', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'e6111111-1111-4111-8111-111111111111');
+    let rejectSend!: (error: Error) => void;
+    vi.mocked(adapter.send).mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSend = reject; }));
+    const sent = manager.send(created.id, 'in flight', 'owner:test', 'e6222222-2222-4222-8222-222222222222');
+    await vi.waitFor(() => expect(adapter.send).toHaveBeenCalled());
+    const recovered = manager.handleRuntimeExit(created.id);
+    rejectSend(new Error('pty exited'));
+    await expect(sent).rejects.toMatchObject({ code: 'DELIVERY_RETRY_REQUIRED' });
+    await expect(recovered).resolves.toBeUndefined();
+    expect(manager.get(created.id)?.lifecycle).toBe('archived');
+  });
+
+  it('records completed runtime output exactly once under the stable Work Session id', async () => {
+    const { manager, cwd, ctxRoot } = fixture();
+    const created = await manager.create({ display_name: 'Mutable name', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'e7111111-1111-4111-8111-111111111111');
+    manager.recordRuntimeOutput(created.id, { id: 'native-item-1', text: 'Completed answer' });
+    manager.recordRuntimeOutput(created.id, { id: 'native-item-1', text: 'Completed answer' });
+    expect(readRoomLog(ctxRoot, created.room_id).filter(message => message.text === 'Completed answer')).toEqual([
+      expect.objectContaining({ from: created.id, to: 'owner:test', source: 'work_session', delivery_state: 'delivered' }),
+    ]);
   });
 
   it('recovers stop and resume mutations interrupted after effect-start', async () => {
@@ -387,7 +414,7 @@ describe('WorkSessionManager', () => {
   ] as const)('reconciles runtime exit after a crash at %s', async failAt => {
     const { manager, cwd, ctxRoot } = fixture(failAt);
     const created = await manager.create({ display_name: 'Exit crash', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' });
-    expect(() => manager.handleRuntimeExit(created.id)).toThrow(/injected/i);
+    await expect(manager.handleRuntimeExit(created.id)).resolves.toBeUndefined();
 
     expect(reconcileCrewMutationJournal(ctxRoot).pending).toBe(0);
     const exit = JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'))
@@ -477,12 +504,8 @@ describe('WorkSessionManager', () => {
         }),
       });
       await expect(restarted.reconcilePending()).resolves.toMatchObject({ pending: 0 });
-      expect(restarted.get(created.id)?.lifecycle).toBe('active');
-
-      child.kill('SIGTERM');
-      if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
-      await expect(restarted.reconcilePending()).resolves.toMatchObject({ pending: 0 });
       expect(restarted.get(created.id)).toMatchObject({ lifecycle: 'archived', runtime_owner: null });
+      await vi.waitFor(() => expect(probeProcessIdentity(identity)).toBe('dead'));
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }

@@ -120,6 +120,24 @@ interface BusMessage {
   /** 'tool_run' | 'tool_step' | 'tool_run_end' on a tool-run record. */
   kind?: string;
   media_type?: string;
+  delivery_state?: 'pending' | 'delivered' | 'indeterminate';
+}
+
+export function messageIsFromCrewTarget(agent: Pick<CrewChatAgent, 'kind' | 'name' | 'targetId'>, from: string): boolean {
+  return from === (agent.kind === 'work_session' ? agent.targetId : agent.name);
+}
+
+export function deliveryStateLabel(state?: BusMessage['delivery_state']): string {
+  return state === 'pending' ? 'sending' : state === 'indeterminate' ? 'delivery unknown' : '';
+}
+
+export function retainedSendMutationId(
+  pending: { id: string; target: string; text: string } | null,
+  target: string,
+  text: string,
+  create: () => string,
+): string {
+  return pending?.target === target && pending.text === text ? pending.id : create();
 }
 
 /**
@@ -443,7 +461,7 @@ function MessageRow({
             fromAgent ? 'text-muted-foreground' : 'text-primary-foreground/70'
           }`}
         >
-          {formatTime(msg.timestamp)}
+          {deliveryStateLabel(msg.delivery_state) ? `${deliveryStateLabel(msg.delivery_state)} · ` : ''}{formatTime(msg.timestamp)}
         </p>
       </div>
       {fromAgent && (
@@ -697,6 +715,8 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const recorder = useVoiceRecorder();
   const sendingRef = useRef(false);
+  const pendingSendRef = useRef<{ id: string; target: string; text: string } | null>(null);
+  const pendingLifecycleRef = useRef<Map<string, string>>(new Map());
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const forceScrollRef = useRef(true);
@@ -1145,9 +1165,15 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         messageText = buildMessageText(messageText, urls);
       }
 
+      const target = agent.targetId;
+      const pending = pendingSendRef.current;
+      const mutationId = agent.kind === 'work_session'
+        ? retainedSendMutationId(pending, target, messageText, () => crypto.randomUUID())
+        : null;
+      if (mutationId) pendingSendRef.current = { id: mutationId, target, text: messageText };
       const res = await fetch('/api/messages/send', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(agent.kind === 'work_session' ? { 'x-cortext-mutation-id': crypto.randomUUID() } : {}) },
+        headers: { 'Content-Type': 'application/json', ...(mutationId ? { 'x-cortext-mutation-id': mutationId } : {}) },
         body: JSON.stringify({
           ...(agent.kind === 'work_session'
             ? { target_kind: 'work_session', work_session_id: agent.targetId }
@@ -1157,6 +1183,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         }),
       });
       if (res.ok) {
+        pendingSendRef.current = null;
         const sent = await res.json().catch(() => ({}));
         const realId = sent.messageId ?? `local-${Date.now()}`;
         localIdsRef.current.add(realId);
@@ -1172,6 +1199,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
             timestamp: new Date().toISOString(),
             text: messageText,
             reply_to: replyTarget?.id ?? null,
+            ...(agent.kind === 'work_session' ? { delivery_state: 'delivered' as const } : {}),
           },
         ]);
         setDraft('');
@@ -1186,6 +1214,9 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
         setTimeout(fetchMessages, 500);
       } else {
         const data = await res.json().catch(() => ({}));
+        if (!['MUTATION_OUTCOME_UNKNOWN', 'DELIVERY_RETRY_REQUIRED', 'MUTATION_PENDING', 'RECOVERY_REQUIRED'].includes(data.code ?? '')) {
+          pendingSendRef.current = null;
+        }
         setSendError(data.error || 'Failed to send');
       }
     } catch {
@@ -1205,16 +1236,23 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
       if (!name || !org) return;
       employee = { name, org, runtime: agent.harness, model: undefined };
     }
+    const mutationKey = `${agent.targetId}:${action}`;
+    const mutationId = pendingLifecycleRef.current.get(mutationKey) ?? crypto.randomUUID();
+    pendingLifecycleRef.current.set(mutationKey, mutationId);
     const response = await fetch(`/api/work-sessions/${encodeURIComponent(agent.targetId)}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-cortext-intent': `${action}-work-session`, 'x-cortext-mutation-id': crypto.randomUUID() },
+      headers: { 'content-type': 'application/json', 'x-cortext-intent': `${action}-work-session`, 'x-cortext-mutation-id': mutationId },
       body: JSON.stringify({ action, employee }),
     });
     if (!response.ok) {
       const value = await response.json().catch(() => ({}));
+      if (!['MUTATION_OUTCOME_UNKNOWN', 'MUTATION_PENDING', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED'].includes(value.code ?? '')) {
+        pendingLifecycleRef.current.delete(mutationKey);
+      }
       setSendError(value.error ?? 'Work Session operation failed');
       return;
     }
+    pendingLifecycleRef.current.delete(mutationKey);
     onLifecycleChanged?.();
   }
 
@@ -1289,7 +1327,7 @@ export function CrewChat({ agent, user, mood, onBack, onAvatarChanged, onLifecyc
             {foldToolRuns(messages).map((row) => {
               if (row.type === 'tool_run') return <ToolRunRow key={row.id} run={row} />;
               const msg = row.message;
-              const fromAgent = msg.from === agent.name;
+              const fromAgent = messageIsFromCrewTarget(agent, msg.from);
               const parent = msg.reply_to ? messagesById.get(msg.reply_to) : undefined;
               return (
                 <MessageRow

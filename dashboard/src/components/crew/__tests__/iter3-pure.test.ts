@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { copyPayload, shouldRefocus, draftKey, workSessionLifecycleAction } from '../crew-chat';
+import { copyPayload, deliveryStateLabel, draftKey, messageIsFromCrewTarget, retainedSendMutationId, shouldRefocus, workSessionLifecycleAction } from '../crew-chat';
 import { shouldTriggerPullRefresh, resolveInitialSelection } from '../use-crew';
 import { prefetchTargets } from '../crew-roster';
 import type { RosterEntry } from '../crew-roster';
@@ -50,6 +50,24 @@ describe('resolveInitialSelection', () => {
 describe('copyPayload', () => {
   it('is the whole message text', () => {
     expect(copyPayload({ text: 'hello world' })).toBe('hello world');
+  });
+});
+
+describe('Work Session message identity and delivery state', () => {
+  const session = { kind: 'work_session' as const, name: 'Mutable display', targetId: 'ws-stable' };
+  it('classifies runtime output by stable target id', () => {
+    expect(messageIsFromCrewTarget(session, 'ws-stable')).toBe(true);
+    expect(messageIsFromCrewTarget(session, 'Mutable display')).toBe(false);
+  });
+  it('does not render uncertain delivery as confirmed', () => {
+    expect(deliveryStateLabel('pending')).toBe('sending');
+    expect(deliveryStateLabel('indeterminate')).toBe('delivery unknown');
+    expect(deliveryStateLabel('delivered')).toBe('');
+  });
+  it('retains the original mutation id for the same unknown send outcome', () => {
+    const pending = { id: 'original-id', target: 'ws-stable', text: 'hello' };
+    expect(retainedSendMutationId(pending, 'ws-stable', 'hello', () => 'new-id')).toBe('original-id');
+    expect(retainedSendMutationId(pending, 'ws-stable', 'different', () => 'new-id')).toBe('new-id');
   });
 });
 

@@ -59,6 +59,12 @@ export interface WorkSessionRuntimeAdapter {
   getRuntimeOwner?(): (ProcessIdentity & { mutation_id: string }) | null;
 }
 
+export interface WorkSessionRuntimeOutput {
+  /** Harness-native completed-item id when available; otherwise adapter generation + sequence. */
+  id: string;
+  text: string;
+}
+
 export interface WorkSessionRuntimeStatus {
   running: boolean;
   pid: number | null;

@@ -62,6 +62,15 @@ describe('room log', () => {
     expect(read.map(m => m.id)).toEqual(['m1', 'm2']);
   });
 
+  it('advances delivery state without replacing immutable message content', () => {
+    appendRoomMessage(root, message({ id: 'm1', text: 'original', delivery_state: 'pending' }));
+    appendRoomMessage(root, message({ id: 'm1', text: 'replacement', delivery_state: 'delivered' }));
+
+    expect(readRoomLog(root, 'dm-boris--nick')).toEqual([
+      expect.objectContaining({ id: 'm1', text: 'original', delivery_state: 'delivered' }),
+    ]);
+  });
+
   it('skips a corrupt line without losing its neighbours', () => {
     appendRoomMessage(root, message({ id: 'm1' }));
     appendFileSync(roomLogPath(root, 'dm-boris--nick'), '{not json\n', 'utf-8');

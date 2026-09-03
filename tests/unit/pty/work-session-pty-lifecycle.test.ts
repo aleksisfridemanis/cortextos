@@ -87,4 +87,14 @@ describe('WorkSessionPTY owned lifecycle', () => {
     expect(persist.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
     expect(stop).toHaveBeenCalledOnce();
   });
+
+  it('normalizes completed output events from Codex, Claude, and OpenCode', () => {
+    const parser = (adapter as unknown as { completedOutput(value: Record<string, unknown>): { id: string; text: string } | null }).completedOutput.bind(adapter);
+    expect(parser({ method: 'item/completed', params: { item: { id: 'codex-1', type: 'agentMessage', text: 'Codex answer' } } }))
+      .toEqual({ id: 'codex-1', text: 'Codex answer' });
+    expect(parser({ type: 'assistant', uuid: 'claude-1', message: { content: [{ type: 'text', text: 'Claude answer' }] } }))
+      .toEqual({ id: 'claude-1', text: 'Claude answer' });
+    expect(parser({ type: 'message.part.completed', properties: { part: { id: 'open-1', type: 'text', text: 'OpenCode answer' } } }))
+      .toEqual({ id: 'open-1', text: 'OpenCode answer' });
+  });
 });

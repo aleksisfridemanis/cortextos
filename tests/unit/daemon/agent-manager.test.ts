@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { spawn } from 'child_process';
+import { once } from 'events';
 import { buildReplyContext } from '../../../src/daemon/agent-manager.js';
 import { captureProcessIdentity } from '../../../src/utils/process-identity.js';
 
@@ -75,7 +77,8 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     expect(JSON.parse(readFileSync(join(ctxRoot, 'state', 'employee-start-receipts', '11111111-1111-4111-8111-111111111111.json'), 'utf8')))
       .toMatchObject({ started: false, disposition: 'failed', pid: null });
 
-    const identity = captureProcessIdentity(process.pid)!;
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: true });
+    const identity = captureProcessIdentity(child.pid!)!;
     vi.spyOn(am, 'getAgentStatus')
       .mockReturnValueOnce(null)
       .mockReturnValue({
@@ -89,7 +92,9 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     const restarted = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
     await expect(restarted.queryEmployeeStart(request)).resolves.toMatchObject({
       mutation_id: request.mutation_id, pid: identity.pid, process_started_at: identity.started_at,
+      started: false, disposition: 'exited',
     });
+    if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
   });
 
   it('returns stable unresolved recovery reasons instead of declaring startup safe', async () => {

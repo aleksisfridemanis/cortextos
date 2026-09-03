@@ -31,7 +31,8 @@ export function appendRoomMessage(ctxRoot: string, msg: RoomMessage): void {
 }
 
 /**
- * Read a room log in write order, first occurrence of each id winning.
+ * Read a room log in write order. Message content is immutable and the first
+ * occurrence wins; later copies may advance only the delivery-state projection.
  * Corrupt lines are skipped without losing their neighbours. Absent log => [].
  */
 export function readRoomLog(ctxRoot: string, roomId: string): RoomMessage[] {
@@ -42,7 +43,7 @@ export function readRoomLog(ctxRoot: string, roomId: string): RoomMessage[] {
     return [];
   }
 
-  const seen = new Set<string>();
+  const byId = new Map<string, RoomMessage>();
   const messages: RoomMessage[] = [];
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
@@ -51,8 +52,13 @@ export function readRoomLog(ctxRoot: string, roomId: string): RoomMessage[] {
       // Same admission rule as the dashboard's read-only twin
       // (dashboard/src/lib/rooms.ts) — a line missing any of these is not a
       // renderable message, and the two readers must agree on what they drop.
-      if (!msg.id || !msg.from || !msg.timestamp || seen.has(msg.id)) continue;
-      seen.add(msg.id);
+      if (!msg.id || !msg.from || !msg.timestamp) continue;
+      const existing = byId.get(msg.id);
+      if (existing) {
+        if (msg.delivery_state) existing.delivery_state = msg.delivery_state;
+        continue;
+      }
+      byId.set(msg.id, msg);
       messages.push(msg);
     } catch {
       /* skip corrupt line */
