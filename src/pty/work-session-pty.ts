@@ -349,10 +349,19 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       }) as { turn?: { id?: string } };
       const turnId = started?.turn?.id;
       if (!turnId) throw new Error('RUNTIME_REQUEST_REJECTED');
-      const completed = await waitFor(() => {
-        const index = this.codexTurnCompletions.findIndex(item => item instanceof Error || item === turnId || item === '*');
-        return index < 0 ? undefined : this.codexTurnCompletions.splice(index, 1)[0];
-      }, this.turnTimeoutMs, 50, 'RUNTIME_TURN_TIMEOUT');
+      let completed: string | Error;
+      try {
+        completed = await waitFor(() => {
+          if (!this.pty) return new Error('WORK_SESSION_NOT_RUNNING');
+          const index = this.codexTurnCompletions.findIndex(item => item instanceof Error || item === turnId || item === '*');
+          return index < 0 ? undefined : this.codexTurnCompletions.splice(index, 1)[0];
+        }, this.turnTimeoutMs, 50, 'RUNTIME_TURN_TIMEOUT');
+      } catch (error) {
+        if ((error as Error).message === 'RUNTIME_TURN_TIMEOUT') {
+          await this.rpc('turn/interrupt', { threadId: this.currentThreadId, turnId }).catch(() => undefined);
+        }
+        throw error;
+      }
       if (completed instanceof Error) throw completed;
       return;
     }
@@ -360,7 +369,14 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       const sessionId = this.currentHandle?.runtime === 'opencode' ? this.currentHandle.session_id : null;
       if (!sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
       this.acpTurnText = '';
-      await this.rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text }] }, this.turnTimeoutMs);
+      try {
+        await this.rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text }] }, this.turnTimeoutMs);
+      } catch (error) {
+        if ((error as Error).message === 'RUNTIME_TURN_TIMEOUT') {
+          await this.rpc('session/cancel', { sessionId }).catch(() => undefined);
+        }
+        throw error;
+      }
       return;
     }
     if (this.options.record.harness === 'claude-code') {
@@ -372,7 +388,15 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         message: { role: 'user', content: [{ type: 'text', text }] },
       })}\n`);
       if (this.claudeSessionId !== sessionId) await this.awaitClaudeAcknowledgement(sessionId);
-      const result = await waitFor(() => this.claudeTurnResults.shift(), this.turnTimeoutMs, 50, 'RUNTIME_TURN_TIMEOUT');
+      let result: true | Error;
+      try {
+        result = await waitFor(() => !this.pty ? new Error('WORK_SESSION_NOT_RUNNING') : this.claudeTurnResults.shift(), this.turnTimeoutMs, 50, 'RUNTIME_TURN_TIMEOUT');
+      } catch (error) {
+        if ((error as Error).message === 'RUNTIME_TURN_TIMEOUT') {
+          this.pty?.write(`${JSON.stringify({ type: 'control_request', request_id: randomUUID(), request: { subtype: 'interrupt' } })}\n`);
+        }
+        throw error;
+      }
       if (result instanceof Error) throw result;
       return;
     }
