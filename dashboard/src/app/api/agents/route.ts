@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
+import { publicApplicationError } from '@/lib/application-error';
 import { getAllAgents } from '@/lib/config';
 import { getHeartbeat, getHealthStatus } from '@/lib/data/heartbeats';
 import { IPCClient } from '@/lib/ipc-client';
@@ -78,13 +79,10 @@ export async function POST(request: NextRequest) {
       data: { ...body, actor },
     });
     if (!result.success) {
-      const status = result.code === 'CONFLICT' || result.code === 'IDEMPOTENCY_CONFLICT' ? 409
-        : result.code === 'ORG_NOT_FOUND' || result.code === 'CWD_NOT_FOUND' ? 404
-          : ['MUTATION_PENDING', 'MUTATION_OUTCOME_UNKNOWN', 'RECOVERY_REQUIRED', 'CREW_RECOVERY_REQUIRED', 'REGISTRY_CORRUPT'].includes(result.code ?? '') ? 503
-            : result.code === 'CREATE_FAILED' ? 500 : 400;
+      const mapped = publicApplicationError(result.code, 'CREATE_FAILED');
       return Response.json({
-        error: result.error ?? 'Failed to create Employee', code: result.code ?? 'CREATE_FAILED', mutation_id: mutationId,
-      }, { status });
+        error: 'Failed to create Employee', code: mapped.code, mutation_id: mutationId,
+      }, { status: mapped.status });
     }
     return Response.json(result.data, { status: 201 });
   } catch (cause) {

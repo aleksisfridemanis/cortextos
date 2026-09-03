@@ -5,6 +5,7 @@ import { getCTXRoot, getAllAgents } from '@/lib/config';
 import { IPCClient } from '@/lib/ipc-client';
 import { checkCrewRateLimit } from '@/lib/rate-limit';
 import { authenticatedWorkSessionOwner } from '@/lib/work-session-owner';
+import { publicApplicationError } from '@/lib/application-error';
 
 export const dynamic = 'force-dynamic';
 
@@ -62,9 +63,8 @@ export async function POST(request: NextRequest) {
       data: { id, text, actor },
     });
     if (!result.success) {
-      const status = result.code === 'NOT_FOUND' ? 404 : result.code === 'FORBIDDEN' ? 403 : result.code === 'INVALID_TRANSITION' ? 409
-        : ['REGISTRY_CORRUPT', 'RECOVERY_REQUIRED', 'MUTATION_PENDING', 'CREW_RECOVERY_REQUIRED', 'MUTATION_OUTCOME_UNKNOWN', 'DELIVERY_RETRY_REQUIRED'].includes(result.code ?? '') ? 503 : 500;
-      return Response.json({ error: status === 409 ? 'Resume the Work Session before sending' : 'Unable to send Work Session message', code: result.code }, { status });
+      const mapped = publicApplicationError(result.code);
+      return Response.json({ error: mapped.status === 409 ? 'Resume the Work Session before sending' : 'Unable to send Work Session message', code: mapped.code }, { status: mapped.status });
     }
     return Response.json({ success: true, messageId: mutationId }, { status: 200 });
   }
