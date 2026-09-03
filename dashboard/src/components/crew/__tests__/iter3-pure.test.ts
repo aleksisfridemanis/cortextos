@@ -113,6 +113,7 @@ describe('Work Session message identity and delivery state', () => {
       [{ ...base, id: 'not-a-uuid', action: 'stop', requestDigest: 'ws-one:stop' }],
       [{ ...base, id, action: 'stop', requestDigest: 'ws-one:resume' }],
       [{ ...base, id, action: 'resume', requestDigest: 'ws-one:resume', employee }],
+      [{ ...base, id, action: 'stop', requestDigest: 'ws-one:stop', unexpected: true }],
       [{ ...base, id, action: 'promote', employee: { ...employee, actor: 'forged' }, requestDigest: promotionMutationKey(base.target, employee) }],
     ]) expect(parsePersistedLifecycleIntents(JSON.stringify({ ...base, lifecycle }), base.principal, base.target)).toBeNull();
   });

@@ -191,9 +191,11 @@ export function parsePersistedLifecycleIntents(raw: string | null, principal: st
     for (const candidate of envelope.lifecycle) {
       if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
       const item = candidate as Record<string, unknown>;
+      const allowedItemKeys = new Set(['version', 'principal', 'target', 'id', 'action', 'requestDigest', ...(item.action === 'promote' ? ['employee'] : [])]);
       if (item.version !== 1 || item.principal !== principal || item.target !== target
         || typeof item.id !== 'string' || !MUTATION_UUID.test(item.id)
-        || !['stop', 'resume', 'promote'].includes(String(item.action)) || typeof item.requestDigest !== 'string') return null;
+        || !['stop', 'resume', 'promote'].includes(String(item.action)) || typeof item.requestDigest !== 'string'
+        || Object.keys(item).some(key => !allowedItemKeys.has(key))) return null;
       const action = item.action as PersistedLifecycleIntent['action'];
       if (action !== 'promote') {
         if ('employee' in item || item.requestDigest !== `${target}:${action}`) return null;
