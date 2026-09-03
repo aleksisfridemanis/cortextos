@@ -13,7 +13,12 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 import { composeEmployeeContext } from '../context/composer.js';
-import { consumeContextHandoff } from '../context/handoff.js';
+import {
+  acknowledgeContextHandoff,
+  claimContextHandoff,
+  releaseContextHandoff,
+  type ContextHandoffClaim,
+} from '../context/handoff.js';
 
 type LogFn = (msg: string) => void;
 
@@ -88,6 +93,7 @@ export class AgentProcess {
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire runtime-owned lifecycle Telegram directly.
   private lastSpawnWasHandoff = false;
+  private pendingHandoffClaim: ContextHandoffClaim | null = null;
   // opencode --continue wedge auto-recovery state (see the OPENCODE_CONTINUE_WEDGE_*
   // constants). lastSpawnMode/lastStartAtMs let handleExit tell an immediate
   // exit-0-on-continue (wedge) apart from a normal exit; the counter tracks the
@@ -138,9 +144,13 @@ export class AgentProcess {
     // immediate exit-0-on-continue wedge (opencode --continue re-attach loop).
     this.lastSpawnMode = mode;
     this.lastStartAtMs = Date.now();
-    const prompt = mode === 'fresh'
-      ? this.buildStartupPrompt()
-      : this.buildContinuePrompt();
+    let prompt: string;
+    try {
+      prompt = mode === 'fresh' ? this.buildStartupPrompt() : this.buildContinuePrompt();
+    } catch (error) {
+      this.releasePendingHandoffClaim();
+      throw error;
+    }
 
     this.log(`Starting in ${mode} mode`);
     this.status = 'starting';
@@ -214,8 +224,13 @@ export class AgentProcess {
       // this.pty and schedules crash recovery — we must not claim 'running'
       // or call getPid() on null in that window.
       if (!this.pty) {
+        this.releasePendingHandoffClaim();
         this.log('PTY exited during spawn — handleExit will recover');
         return;
+      }
+      if (this.pendingHandoffClaim) {
+        acknowledgeContextHandoff(this.env.ctxRoot, this.name, this.pendingHandoffClaim.token);
+        this.pendingHandoffClaim = null;
       }
       this.status = 'running';
       this.sessionStart = new Date();
@@ -228,6 +243,7 @@ export class AgentProcess {
 
       this.notifyStatusChange();
     } catch (err) {
+      this.releasePendingHandoffClaim();
       this.log(`Failed to start: ${err}`);
       this.status = 'crashed';
       this.notifyStatusChange();
@@ -879,7 +895,9 @@ export class AgentProcess {
     const nowUtc = new Date().toISOString();
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
-    const handoff = consumeContextHandoff(this.env.ctxRoot, this.name);
+    const handoffClaim = claimContextHandoff(this.env.ctxRoot, this.name);
+    this.pendingHandoffClaim = handoffClaim;
+    const handoff = handoffClaim?.content ?? null;
     const handoffBlock = handoff ? ` CONTEXT HANDOFF:\n${handoff}` : '';
     const isHandoffRestart = handoff !== null;
     this.lastSpawnWasHandoff = isHandoffRestart;
@@ -933,6 +951,12 @@ export class AgentProcess {
       projectRoot: this.config.working_directory,
     });
     return `${packet.text}\n\n${operational}`;
+  }
+
+  private releasePendingHandoffClaim(): void {
+    if (!this.pendingHandoffClaim) return;
+    try { releaseContextHandoff(this.env.ctxRoot, this.name, this.pendingHandoffClaim.token); } catch { /* retry can reclaim stale claim */ }
+    this.pendingHandoffClaim = null;
   }
 
   private shouldPromptTelegramOnlineMessage(): boolean {
