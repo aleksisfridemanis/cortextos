@@ -90,11 +90,11 @@ setInterval(() => {}, 1000);
 const fs = require('fs');
 const path = require('path');
 const args = process.argv.slice(2);
-fs.writeFileSync(path.join(process.cwd(), 'launch-args.json'), JSON.stringify(args));
 if (args[0] === 'auth' && args[1] === 'status') {
   process.stdout.write(JSON.stringify({ loggedIn: true, authMethod: 'api_key' }));
   process.exit(0);
 }
+fs.writeFileSync(path.join(process.cwd(), 'launch-args.json'), JSON.stringify(args));
 const settingsPath = args[args.indexOf('--settings') + 1];
 const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
 const command = settings.hooks.SessionStart[0].hooks[0].command;
