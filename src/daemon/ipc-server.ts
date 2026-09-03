@@ -681,6 +681,11 @@ export class IPCServer {
             response = { success: false, error: 'Employee request and mutation id required', code: 'INVALID_INPUT' };
             break;
           }
+          if (Object.prototype.hasOwnProperty.call(request.data, 'source_work_session_id')
+            || Object.prototype.hasOwnProperty.call(request.data, 'parent_mutation_id')) {
+            response = { success: false, error: 'Promotion authority is server-owned', code: 'FORGED_SERVER_FIELD' };
+            break;
+          }
           try {
             const result = await createEmployee(request.data as unknown as CreateEmployeeInput, request.mutation_id, {
               startEmployee: async start => {

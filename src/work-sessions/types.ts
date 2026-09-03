@@ -58,4 +58,4 @@ export interface WorkSessionRuntimeAdapter {
 
 export interface WorkSessionRuntimeStatus { running: boolean; pid: number | null; error_code: string | null }
 
-export type WorkSessionEmployeeInput = Omit<CreateEmployeeInput, 'working_directory' | 'room_id' | 'source_work_session_id' | 'telegram_polling'>;
+export type WorkSessionEmployeeInput = Omit<CreateEmployeeInput, 'working_directory' | 'room_id' | 'telegram_polling'>;

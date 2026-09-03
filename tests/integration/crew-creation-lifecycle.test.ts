@@ -104,6 +104,13 @@ describe('Crew Work Session lifecycle', () => {
     const created = await manager.create({
       display_name: 'Promote real', org: 'platform', harness: 'claude-code', requested_cwd: cwd, actor: 'owner:test',
     }, '8f51a223-4111-46fb-b4f2-27870567d55d');
+    await expect(createEmployee({
+      name: 'forged', org: 'platform', runtime: 'claude-code', telegram_polling: false, actor: 'owner:test',
+      working_directory: created.canonical_cwd, room_id: created.room_id, source_work_session_id: created.id,
+    } as never, '7f51a223-4111-46fb-b4f2-27870567d55d', { ctxRoot, frameworkRoot }))
+      .rejects.toMatchObject({ code: 'FORGED_SERVER_FIELD' });
+    expect(manager.get(created.id)?.lifecycle).toBe('active');
+    expect(JSON.parse(readFileSync(join(ctxRoot, 'config', 'rooms.json'), 'utf8'))[0]).toMatchObject({ kind: 'work_session' });
     mkdirSync(join(ctxRoot, 'rooms', created.room_id), { recursive: true });
     const logPath = join(ctxRoot, 'rooms', created.room_id, 'log.jsonl');
     writeFileSync(logPath, '{"id":"history"}\n');

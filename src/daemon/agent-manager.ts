@@ -24,7 +24,6 @@ import { computeDormancy, parseHeartbeatIntervalMs } from '../utils/dormancy.js'
 import { CRONS_DIRECTORY, CRONS_FILENAME } from '../bus/crons-schema.js';
 import { WorkSessionManager } from '../work-sessions/manager.js';
 import { WorkSessionPTY } from '../pty/work-session-pty.js';
-import { createEmployee } from '../agents/create-employee.js';
 
 type LogFn = (msg: string) => void;
 
@@ -152,13 +151,10 @@ export class AgentManager {
         ctxRoot, frameworkRoot, instanceId, record,
         onExit: () => this.workSessions.handleRuntimeExit(record.id),
       }),
-      createEmployee: (input, mutationId) => createEmployee(input, mutationId, {
-        ctxRoot, frameworkRoot, instanceId,
-        startEmployee: async request => {
-          await this.startAgent(request.name, request.agent_dir, undefined, input.org);
-          return { mutation_id: request.mutation_id, started: true };
-        },
-      }),
+      startEmployee: async request => {
+        await this.startAgent(request.name, request.agent_dir, undefined, request.org);
+        return { mutation_id: request.mutation_id, started: true };
+      },
     });
     this.daemonJustCrashed = this.detectDaemonCrashMarkers();
     if (this.daemonJustCrashed) {

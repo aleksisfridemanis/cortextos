@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import { isAbsolute, join } from 'path';
 import { existsSync, lstatSync, mkdirSync } from 'fs';
 import { digestCrewAuditValue } from '../audit/crew-lifecycle-audit.js';
@@ -6,7 +6,12 @@ import {
   commitCrewMutationState, finalizeCrewMutationAudit, getCrewMutation, prepareCrewMutation,
   listPendingCrewMutations, reconcileCrewMutationJournal, recordCrewMutationEffect, startCrewMutationEffect,
 } from '../audit/crew-mutation-journal.js';
-import { createEmployee as createEmployeeService, type CreateEmployeeInput } from '../agents/create-employee.js';
+import {
+  createPromotedEmployee,
+  type CreateEmployeeInput,
+  type EmployeeStartReceipt,
+  type EmployeeStartRequest,
+} from '../agents/create-employee.js';
 import { createWorkSessionRecord, readWorkSessions, removeStartingWorkSessionRecord, transitionWorkSession, WorkSessionRegistryError } from './registry.js';
 import { appendRoomMessage } from '../rooms/log.js';
 import { RoomRegistryError, upsertRoom } from '../rooms/registry.js';
@@ -16,6 +21,7 @@ import type {
   WorkSessionResumeHandle, WorkSessionRuntimeAdapter,
 } from './types.js';
 import { composeWorkSessionContext } from '../context/composer.js';
+import { promotionEmployeeMutationId } from './promotion.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -31,15 +37,12 @@ interface Dependencies {
   adapterFactory: (record: WorkSessionRecord) => WorkSessionRuntimeAdapter;
   frameworkRoot?: string;
   createEmployee?: (input: CreateEmployeeInput, mutationId: string) => Promise<unknown>;
+  startEmployee?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt>;
   now?: () => string;
   failAt?: 'after-session-record';
 }
 
 function safeId(mutationId: string): string { return `ws-${mutationId}`; }
-function childMutationId(mutationId: string): string {
-  const hex = createHash('sha256').update(`work-session-promotion:${mutationId}`, 'utf8').digest('hex');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
-}
 function stateDigest(record: WorkSessionRecord): string {
   return digestCrewAuditValue({ ...record, resume_handle: record.resume_handle ? digestCrewAuditValue(record.resume_handle) : null });
 }
@@ -483,14 +486,19 @@ export class WorkSessionManager {
         recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
       }
       const createEmployee = this.dependencies.createEmployee
-        ?? ((employeeInput, employeeMutationId) => createEmployeeService(employeeInput, employeeMutationId, {
-          ctxRoot: this.dependencies.ctxRoot,
-          frameworkRoot: this.dependencies.frameworkRoot,
-        }));
-      const employeeMutationId = childMutationId(mutationId);
+        ?? ((employeeInput, employeeMutationId) => createPromotedEmployee(
+          employeeInput,
+          employeeMutationId,
+          { sourceWorkSessionId: recoveryRecord.id, parentMutationId: mutationId },
+          {
+            ctxRoot: this.dependencies.ctxRoot,
+            frameworkRoot: this.dependencies.frameworkRoot,
+            startEmployee: this.dependencies.startEmployee,
+          },
+        ));
+      const employeeMutationId = promotionEmployeeMutationId(mutationId);
       await createEmployee({
-        ...input, working_directory: recoveryRecord.canonical_cwd, room_id: recoveryRecord.room_id,
-        source_work_session_id: recoveryRecord.id, telegram_polling: false,
+        ...input, working_directory: recoveryRecord.canonical_cwd, room_id: recoveryRecord.room_id, telegram_polling: false,
       }, employeeMutationId);
       recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['archived'], 'archived', { promoted_employee: input.name }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, {
@@ -515,18 +523,23 @@ export class WorkSessionManager {
       }
     }
     record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
-    const employeeMutationId = childMutationId(mutationId);
+    const employeeMutationId = promotionEmployeeMutationId(mutationId);
     const createEmployee = this.dependencies.createEmployee
-      ?? ((employeeInput, employeeMutationId) => createEmployeeService(employeeInput, employeeMutationId, {
-        ctxRoot: this.dependencies.ctxRoot,
-        frameworkRoot: this.dependencies.frameworkRoot,
-      }));
+      ?? ((employeeInput, employeeMutationId) => createPromotedEmployee(
+        employeeInput,
+        employeeMutationId,
+        { sourceWorkSessionId: record.id, parentMutationId: mutationId },
+        {
+          ctxRoot: this.dependencies.ctxRoot,
+          frameworkRoot: this.dependencies.frameworkRoot,
+          startEmployee: this.dependencies.startEmployee,
+        },
+      ));
     try {
       await createEmployee({
         ...input,
         working_directory: record.canonical_cwd,
         room_id: record.room_id,
-        source_work_session_id: record.id,
         telegram_polling: false,
       }, employeeMutationId);
     } catch (error) {

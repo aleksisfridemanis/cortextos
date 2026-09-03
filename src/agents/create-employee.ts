@@ -34,6 +34,7 @@ import { agentRoomId, validateRoomId } from '../rooms/id.js';
 import { validateAgentName, validateOrgName } from '../utils/validate.js';
 import { withFileLockSync } from '../utils/lock.js';
 import type { Room } from '../types/index.js';
+import { promotionEmployeeMutationId } from '../work-sessions/promotion.js';
 
 export const CREW_BODY_MAX_BYTES = 131_072;
 export const CREW_NAME_MAX_CHARS = 64;
@@ -48,8 +49,6 @@ export interface CreateEmployeeInput {
   working_directory?: string;
   telegram_polling: false;
   room_id?: string;
-  /** Server-owned link used only when promoting a Work Session in-place. */
-  source_work_session_id?: string;
   actor: string;
 }
 
@@ -91,6 +90,15 @@ export interface CreateEmployeeDependencies {
   startEmployee?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt>;
   failAt?: 'before-state-commit' | 'after-directory-publish' | 'after-enabled-write' | 'after-state-commit' | 'after-effect-start' | 'after-effect' | 'after-audit';
 }
+
+interface PromotionGrant {
+  source_work_session_id: string;
+  parent_mutation_id: string;
+}
+
+const PROMOTION_GRANT = Symbol('cortext-promotion-grant');
+type InternalCreateEmployeeInput = CreateEmployeeInput & Partial<PromotionGrant>;
+type InternalCreateEmployeeDependencies = CreateEmployeeDependencies & { [PROMOTION_GRANT]?: PromotionGrant };
 
 export class CrewServiceError extends Error {
   constructor(
@@ -193,10 +201,6 @@ function validateInput(input: CreateEmployeeInput, frameworkRoot: string): void 
   if (input.room_id !== undefined) {
     try { validateRoomId(input.room_id); } catch { throw new CrewServiceError('INVALID_ROOM', 400, 'Invalid room identifier'); }
   }
-  if (input.source_work_session_id !== undefined
-    && (typeof input.source_work_session_id !== 'string' || !/^[a-z0-9_-]{1,128}$/.test(input.source_work_session_id))) {
-    throw new CrewServiceError('INVALID_INPUT', 400, 'Invalid source Work Session');
-  }
 }
 
 function templateName(runtime: CrewEmployeeRuntime): string {
@@ -259,6 +263,36 @@ export async function createEmployee(
   mutationId: string = randomUUID(),
   dependencies: CreateEmployeeDependencies = {},
 ): Promise<CreateEmployeeResult> {
+  if (input && typeof input === 'object'
+    && (Object.prototype.hasOwnProperty.call(input, 'source_work_session_id')
+      || Object.prototype.hasOwnProperty.call(input, 'parent_mutation_id'))) {
+    throw new CrewServiceError('FORGED_SERVER_FIELD', 400, 'Promotion authority is server-owned');
+  }
+  return createEmployeeInternal(input, mutationId, dependencies);
+}
+
+export async function createPromotedEmployee(
+  input: CreateEmployeeInput,
+  mutationId: string,
+  grant: { sourceWorkSessionId: string; parentMutationId: string },
+  dependencies: CreateEmployeeDependencies = {},
+): Promise<CreateEmployeeResult> {
+  const authorization: PromotionGrant = {
+    source_work_session_id: grant.sourceWorkSessionId,
+    parent_mutation_id: grant.parentMutationId,
+  };
+  return createEmployeeInternal(
+    { ...input, ...authorization },
+    mutationId,
+    Object.assign({}, dependencies, { [PROMOTION_GRANT]: authorization }),
+  );
+}
+
+async function createEmployeeInternal(
+  input: InternalCreateEmployeeInput,
+  mutationId: string = randomUUID(),
+  dependencies: InternalCreateEmployeeDependencies = {},
+): Promise<CreateEmployeeResult> {
   const ctxRoot = dependencies.ctxRoot ?? process.env.CTX_ROOT ?? join(homedir(), '.cortextos', dependencies.instanceId ?? process.env.CTX_INSTANCE_ID ?? 'default');
   const frameworkRoot = dependencies.frameworkRoot ?? process.env.CTX_FRAMEWORK_ROOT ?? process.env.CTX_PROJECT_ROOT ?? process.cwd();
   const instanceId = dependencies.instanceId ?? process.env.CTX_INSTANCE_ID ?? 'default';
@@ -293,7 +327,8 @@ export async function createEmployee(
     working_directory: input.working_directory ?? null,
     telegram_polling: false,
     room_id: roomId,
-    source_work_session_id: input.source_work_session_id ?? null,
+    source_work_session_id: dependencies[PROMOTION_GRANT]?.source_work_session_id ?? null,
+    parent_mutation_id: dependencies[PROMOTION_GRANT]?.parent_mutation_id ?? null,
   });
   const priorMutation = getCrewMutation(ctxRoot, mutationId);
   if (priorMutation) {
@@ -417,8 +452,27 @@ export async function createEmployee(
       if (registry[input.name]) throw new CrewServiceError('CONFLICT', 409, 'Employee already exists');
       const rooms = readRooms(roomsPath);
       const matchingRoom = rooms.find(room => room.id === roomId);
-      const sourceRoom = matchingRoom?.kind === 'work_session'
-        && matchingRoom.work_session_id === input.source_work_session_id;
+      const grant = dependencies[PROMOTION_GRANT];
+      let sourceRoom = false;
+      if (matchingRoom?.kind === 'work_session' && grant) {
+        let sessions: Array<Record<string, unknown>>;
+        try { sessions = JSON.parse(readFileSync(join(ctxRoot, 'config', 'work-sessions.json'), 'utf8')); } catch {
+          throw new CrewServiceError('PROMOTION_UNAUTHORIZED', 409, 'Source Work Session is unavailable');
+        }
+        const source = sessions.find(session => session.id === grant.source_work_session_id);
+        const parent = getCrewMutation(ctxRoot, grant.parent_mutation_id);
+        sourceRoom = matchingRoom.work_session_id === grant.source_work_session_id
+          && source?.lifecycle === 'archived'
+          && source?.mutation_id === grant.parent_mutation_id
+          && source?.room_id === roomId
+          && source?.canonical_cwd === record.working_directory
+          && parent?.target.kind === 'work_session'
+          && parent.target.id === grant.source_work_session_id
+          && parent.action === 'promote'
+          && ['state_committed', 'effect_started'].includes(parent.stage)
+          && promotionEmployeeMutationId(grant.parent_mutation_id) === mutationId;
+        if (!sourceRoom) throw new CrewServiceError('PROMOTION_UNAUTHORIZED', 409, 'Promotion grant does not match durable state');
+      }
       if (matchingRoom && !sourceRoom && (matchingRoom.kind !== 'agent' || matchingRoom.agent !== input.name)) {
         throw new CrewServiceError('ROOM_CONFLICT', 409, 'Room identifier is already in use');
       }
@@ -436,12 +490,12 @@ export async function createEmployee(
         if (sourceRoom) {
           const index = rooms.findIndex(room => room.id === roomId);
           rooms[index] = {
-            ...matchingRoom,
+            ...matchingRoom!,
             kind: 'agent',
             title: input.name,
-            members: Array.from(new Set([...matchingRoom.members, input.name])),
+            members: Array.from(new Set([...matchingRoom!.members, input.name])),
             agent: input.name,
-            work_session_id: input.source_work_session_id,
+            work_session_id: grant?.source_work_session_id,
             mutation_id: mutationId,
           };
         } else if (!matchingRoom) {
