@@ -127,6 +127,20 @@ describe('createEmployee', () => {
     },
   );
 
+  it('replays the exact mutation after a crash at the effect-start boundary', async () => {
+    const mutationId = '97ee842e-b948-4cbb-a4e6-e80c6847dc85';
+    const input = { name: 'ada', org: 'platform', runtime: 'claude-code' as const, telegram_polling: false as const, actor: 'owner:test' };
+    dependencies.failAt = 'after-effect-start';
+    await expect(createEmployee(input, mutationId, dependencies)).rejects.toMatchObject({ code: 'MUTATION_PENDING' });
+    expect(started).toEqual([]);
+
+    dependencies.failAt = undefined;
+    await expect(createEmployee(input, mutationId, dependencies)).resolves.toMatchObject({ status: 'created' });
+    expect(started).toEqual([mutationId]);
+    const journal = JSON.parse(readFileSync(join(ctxRoot, 'state', 'crew-mutation-journal.json'), 'utf8'));
+    expect(journal[0]).toMatchObject({ stage: 'finalized', final_result: { result: 'success' } });
+  });
+
   it('exports the exact request ceilings', () => {
     expect(CREW_BODY_MAX_BYTES).toBe(131_072);
     expect(CREW_NAME_MAX_CHARS).toBe(64);

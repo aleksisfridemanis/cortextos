@@ -23,6 +23,7 @@ import {
   commitCrewMutationState,
   finalizeCrewMutationAudit,
   getCrewMutation,
+  listPendingCrewMutations,
   prepareCrewMutation,
   reconcileCrewMutationJournal,
   recordCrewMutationEffect,
@@ -88,7 +89,7 @@ export interface CreateEmployeeDependencies {
   instanceId?: string;
   now?: () => string;
   startEmployee?: (request: EmployeeStartRequest) => Promise<EmployeeStartReceipt>;
-  failAt?: 'before-state-commit' | 'after-directory-publish' | 'after-enabled-write' | 'after-state-commit' | 'after-effect' | 'after-audit';
+  failAt?: 'before-state-commit' | 'after-directory-publish' | 'after-enabled-write' | 'after-state-commit' | 'after-effect-start' | 'after-effect' | 'after-audit';
 }
 
 export class CrewServiceError extends Error {
@@ -308,7 +309,42 @@ export async function createEmployee(
       const existing = readObject(enabledPath)[input.name];
       if (existing?.mutation_id === mutationId) return resultFromRegistry(input.name, existing);
     }
+    if (['state_committed', 'effect_started', 'effect_recorded', 'audit_written'].includes(priorMutation.stage)) {
+      const existing = readObject(enabledPath)[input.name];
+      const exactState = existing?.mutation_id === mutationId
+        && digestCrewAuditValue(existing) === priorMutation.intended_after_digest
+        && existsSync(join(frameworkRoot, 'orgs', existing.org, 'agents', input.name));
+      if (!exactState) throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
+      if (priorMutation.stage === 'effect_recorded' || priorMutation.stage === 'audit_written') {
+        reconcileCrewMutationJournal(ctxRoot, { frameworkRoot });
+        const reconciled = getCrewMutation(ctxRoot, mutationId);
+        if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') {
+          return resultFromRegistry(input.name, existing);
+        }
+        throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
+      }
+      if (priorMutation.stage === 'state_committed') startCrewMutationEffect(ctxRoot, mutationId);
+      const receipt = await (dependencies.startEmployee ?? (request => defaultStart(instanceId, request)))({
+        name: input.name,
+        org: existing.org,
+        agent_dir: join(frameworkRoot, 'orgs', existing.org, 'agents', input.name),
+        mutation_id: mutationId,
+      });
+      if (receipt.mutation_id !== mutationId || typeof receipt.started !== 'boolean') {
+        throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee start recovery returned an invalid receipt');
+      }
+      recordCrewMutationEffect(ctxRoot, mutationId, {
+        mutation_id: receipt.mutation_id,
+        started: receipt.started,
+        receipt_digest: digestCrewAuditValue(receipt),
+      });
+      finalizeCrewMutationAudit(ctxRoot, mutationId, { result: 'success', after_digest: priorMutation.intended_after_digest });
+      return resultFromRegistry(input.name, existing);
+    }
     throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee mutation requires recovery');
+  }
+  if (listPendingCrewMutations(ctxRoot).some(entry => entry.target.kind === 'employee' && entry.target.id === input.name)) {
+    throw new CrewServiceError('MUTATION_PENDING', 503, 'Employee has a pending mutation');
   }
   const intendedAfterDigest = digestCrewAuditValue(record);
   let prepared;
@@ -444,6 +480,7 @@ export async function createEmployee(
     commitCrewMutationState(ctxRoot, mutationId, intendedAfterDigest);
     if (dependencies.failAt === 'after-state-commit') throw new Error('injected after state commit');
     startCrewMutationEffect(ctxRoot, mutationId);
+    if (dependencies.failAt === 'after-effect-start') throw new Error('injected after effect start');
     const receipt = await (dependencies.startEmployee ?? (request => defaultStart(instanceId, request)))({
       name: input.name,
       org: input.org,

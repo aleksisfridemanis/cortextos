@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { isAbsolute, join } from 'path';
 import { existsSync, lstatSync, mkdirSync } from 'fs';
 import { digestCrewAuditValue } from '../audit/crew-lifecycle-audit.js';
@@ -36,6 +36,10 @@ interface Dependencies {
 }
 
 function safeId(mutationId: string): string { return `ws-${mutationId}`; }
+function childMutationId(mutationId: string): string {
+  const hex = createHash('sha256').update(`work-session-promotion:${mutationId}`, 'utf8').digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
 function stateDigest(record: WorkSessionRecord): string {
   return digestCrewAuditValue({ ...record, resume_handle: record.resume_handle ? digestCrewAuditValue(record.resume_handle) : null });
 }
@@ -92,8 +96,13 @@ export class WorkSessionManager {
       && prior.target.id === targetId
       && prior.request_digest === digestCrewAuditValue(request);
     if (!sameRequest) throw new WorkSessionRegistryError('IDEMPOTENCY_CONFLICT', 'Mutation id is already bound to another request');
-    if (prior.stage === 'finalized' && prior.final_result?.result === 'success') return prior;
-    throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session mutation requires reconciliation');
+    if (prior.stage === 'finalized' && prior.final_result?.result !== 'success') {
+      throw new WorkSessionRegistryError(
+        prior.final_result?.error_code ?? 'RECOVERY_REQUIRED',
+        prior.final_result?.sanitized_error ?? 'Work Session mutation did not succeed',
+      );
+    }
+    return prior;
   }
 
   private originalResult(prior: NonNullable<ReturnType<typeof getCrewMutation>>): WorkSessionRecord {
@@ -138,10 +147,63 @@ export class WorkSessionManager {
         && prior.request_digest === requestDigest;
       if (!sameRequest) throw new WorkSessionRegistryError('IDEMPOTENCY_CONFLICT', 'Mutation id is already bound to another request');
       if (prior.stage === 'finalized' && prior.final_result?.result === 'success') return this.originalResult(prior);
-      throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session mutation requires reconciliation');
+      if (prior.stage === 'finalized') {
+        throw new WorkSessionRegistryError(prior.final_result?.error_code ?? 'RECOVERY_REQUIRED', prior.final_result?.sanitized_error ?? 'Work Session creation failed');
+      }
+      if (['effect_recorded', 'audit_written'].includes(prior.stage)) {
+        reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+        const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
+        if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return this.originalResult(reconciled);
+        throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session creation requires reconciliation');
+      }
+      if (['state_committed', 'effect_started'].includes(prior.stage)) {
+        let recoveryRecord = this.require(id, ['starting', 'active']);
+        if (recoveryRecord.mutation_id !== mutationId) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session state is owned by another mutation');
+        if (prior.stage === 'state_committed') startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
+        try {
+          if (!this.adapter(recoveryRecord).status().running) {
+            const context = this.dependencies.frameworkRoot
+              ? composeWorkSessionContext({ frameworkRoot: this.dependencies.frameworkRoot, projectRoot: recoveryRecord.canonical_cwd, initialRequest: input.initial_request }).text
+              : input.initial_request;
+            if (recoveryRecord.lifecycle === 'active' && recoveryRecord.resume_handle) {
+              await this.adapter(recoveryRecord).resumeExact(
+                recoveryRecord.resume_handle,
+                { id, cwd: recoveryRecord.canonical_cwd, model: input.model, context },
+              );
+            } else {
+              const result = await this.adapter(recoveryRecord).startFresh({ id, cwd: recoveryRecord.canonical_cwd, model: input.model, context });
+              recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', { resume_handle: result.resume_handle }, mutationId);
+            }
+          } else if (recoveryRecord.lifecycle === 'starting') {
+            const handle = this.adapter(recoveryRecord).getResumeHandle();
+            if (!handle) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Running Work Session handle is unavailable');
+            recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', { resume_handle: handle }, mutationId);
+          }
+          if (!recoveryRecord.resume_handle) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Recovered Work Session handle is unavailable');
+          recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, {
+            runtime_started: true, recovered: true,
+            handle_digest: digestCrewAuditValue(recoveryRecord.resume_handle), mutation_id: mutationId,
+          });
+          finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+            result: 'success', after_digest: stateDigest(recoveryRecord), result_snapshot: resultSnapshot(recoveryRecord),
+          });
+          return recoveryRecord;
+        } catch (error) {
+          if (this.adapter(recoveryRecord).status().running) {
+            transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
+            throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
+          }
+          const failed = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'failed', { last_error: 'RUNTIME_START_FAILED' }, mutationId);
+          recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { runtime_started: false, recovered: true, mutation_id: mutationId });
+          finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+            result: 'failure', after_digest: stateDigest(failed), error_code: 'RUNTIME_START_FAILED', sanitized_error: 'Runtime start failed',
+          });
+          throw error;
+        }
+      }
     }
     this.assertTargetAvailable(id, mutationId);
-    const prepared = prepareCrewMutation(this.dependencies.ctxRoot, {
+    const prepared = prior ? { entry: prior, reused: true } : prepareCrewMutation(this.dependencies.ctxRoot, {
       mutation_id: mutationId, idempotency_key: mutationId, actor: input.actor,
       target: { kind: 'work_session', id }, action: 'create',
       request_digest: requestDigest, before_digest: digestCrewAuditValue(null), intended_after_digest: intended,
@@ -217,20 +279,32 @@ export class WorkSessionManager {
     validateMutationActor(mutationId, actor);
     if (typeof text !== 'string' || !text || Buffer.byteLength(text, 'utf8') > 65_536) throw new WorkSessionRegistryError('INVALID_MESSAGE', 'Invalid Work Session message');
     const request = { text_digest: digestCrewAuditValue(text) };
-    if (this.priorMutation(mutationId, actor, 'message', id, request)) return;
+    const prior = this.priorMutation(mutationId, actor, 'message', id, request);
+    if (prior?.stage === 'finalized') return;
+    if (prior?.stage === 'effect_started') {
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+        result: 'indeterminate', after_digest: prior.state_digest ?? prior.before_digest,
+        error_code: 'DELIVERY_RETRY_REQUIRED', sanitized_error: 'Delivery outcome requires owner retry',
+      });
+      throw new WorkSessionRegistryError('DELIVERY_RETRY_REQUIRED', 'Message delivery outcome is uncertain');
+    }
+    if (prior && ['effect_recorded', 'audit_written'].includes(prior.stage)) {
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+      const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
+      if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return;
+      throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Message delivery requires reconciliation');
+    }
     this.assertTargetAvailable(id, mutationId);
     const record = this.require(id, ['active']);
-    const prepared = this.prepare(record, actor, 'message', mutationId, request);
-    if (prepared.reused) {
-      if (prepared.entry.stage === 'finalized') return;
-      if (['effect_started', 'effect_recorded', 'audit_written'].includes(prepared.entry.stage)) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Message delivery requires reconciliation');
+    if (!prior) this.prepare(record, actor, 'message', mutationId, request);
+    if (!prior || prior.stage === 'prepared') {
+      appendRoomMessage(this.dependencies.ctxRoot, {
+        id: mutationId, room_id: record.room_id, from: actor, to: record.id,
+        timestamp: this.now(), text, reply_to: null, thread_id: mutationId,
+        source: 'bus', attachments: [],
+      });
+      commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
     }
-    appendRoomMessage(this.dependencies.ctxRoot, {
-      id: mutationId, room_id: record.room_id, from: actor, to: record.id,
-      timestamp: this.now(), text, reply_to: null, thread_id: mutationId,
-      source: 'bus', attachments: [],
-    });
-    commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
     startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
     try {
       await this.adapter(record).send(text);
@@ -245,10 +319,36 @@ export class WorkSessionManager {
   async stop(id: string, actor: string, mutationId: string = randomUUID()): Promise<WorkSessionRecord> {
     validateMutationActor(mutationId, actor);
     const prior = this.priorMutation(mutationId, actor, 'stop', id, { id });
-    if (prior) return this.originalResult(prior);
+    if (prior?.stage === 'finalized') return this.originalResult(prior);
+    if (prior && ['effect_recorded', 'audit_written'].includes(prior.stage)) {
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+      const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
+      if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return this.originalResult(reconciled);
+      throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session stop requires reconciliation');
+    }
+    if (prior && ['state_committed', 'effect_started'].includes(prior.stage)) {
+      let recoveryRecord = this.require(id, ['stopping', 'archived']);
+      if (recoveryRecord.mutation_id !== mutationId) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session state is owned by another mutation');
+      if (prior.stage === 'state_committed') startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
+      if (recoveryRecord.lifecycle === 'stopping') {
+        try { await this.adapter(recoveryRecord).stop(); } catch {
+          if (this.adapter(recoveryRecord).status().running) {
+            transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'stopping', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
+            throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime stop could not be confirmed');
+          }
+        }
+        recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
+      }
+      recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { stopped: true, recovered: true, mutation_id: mutationId });
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+        result: 'success', after_digest: stateDigest(recoveryRecord), result_snapshot: resultSnapshot(recoveryRecord),
+      });
+      this.adapters.delete(id);
+      return recoveryRecord;
+    }
     this.assertTargetAvailable(id, mutationId);
     let record = this.require(id, ['starting', 'active', 'archived']);
-    const prepared = this.prepare(record, actor, 'stop', mutationId, { id });
+    const prepared = prior ? { entry: prior, reused: true } : this.prepare(record, actor, 'stop', mutationId, { id });
     if (prepared.reused && prepared.entry.stage === 'finalized') return record;
     if (record.lifecycle === 'archived') {
       commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
@@ -291,10 +391,48 @@ export class WorkSessionManager {
     if (!handle) throw new WorkSessionRegistryError('RESUME_HANDLE_MISSING', 'Exact Work Session resume handle is missing');
     const request = { id, handle_digest: digestCrewAuditValue(handle) };
     const prior = this.priorMutation(mutationId, actor, 'resume', id, request);
-    if (prior) return this.originalResult(prior);
+    if (prior?.stage === 'finalized') return this.originalResult(prior);
+    if (prior && ['effect_recorded', 'audit_written'].includes(prior.stage)) {
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+      const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
+      if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return this.originalResult(reconciled);
+      throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session resume requires reconciliation');
+    }
+    if (prior && ['state_committed', 'effect_started'].includes(prior.stage)) {
+      let recoveryRecord = this.require(id, ['starting', 'active']);
+      if (recoveryRecord.mutation_id !== mutationId) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session state is owned by another mutation');
+      if (prior.stage === 'state_committed') startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
+      try {
+        if (!this.adapter(recoveryRecord).status().running) {
+          await this.adapter(recoveryRecord).resumeExact(handle, { id, cwd: recoveryRecord.canonical_cwd, model: recoveryRecord.model ?? undefined });
+        }
+        if (recoveryRecord.lifecycle === 'starting') {
+          recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', {}, mutationId);
+        }
+        recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, {
+          resumed: true, recovered: true, handle_digest: digestCrewAuditValue(handle), mutation_id: mutationId,
+        });
+        finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+          result: 'success', after_digest: stateDigest(recoveryRecord), result_snapshot: resultSnapshot(recoveryRecord),
+        });
+        return recoveryRecord;
+      } catch (error) {
+        try { await this.adapter(recoveryRecord).stop(); } catch { /* status below is authoritative */ }
+        if (this.adapter(recoveryRecord).status().running) {
+          transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'starting', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
+          throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime ownership could not be released');
+        }
+        const failed = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting', 'active'], 'failed', { last_error: 'RESUME_HANDLE_UNAVAILABLE' }, mutationId);
+        recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { resumed: false, recovered: true, mutation_id: mutationId });
+        finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
+          result: 'failure', after_digest: stateDigest(failed), error_code: 'RESUME_HANDLE_UNAVAILABLE', sanitized_error: 'Exact runtime resume failed',
+        });
+        throw error;
+      }
+    }
     this.assertTargetAvailable(id, mutationId);
     record = this.require(id, ['archived', 'failed']);
-    const prepared = this.prepare(record, actor, 'resume', mutationId, request);
+    const prepared = prior ? { entry: prior, reused: true } : this.prepare(record, actor, 'resume', mutationId, request);
     if (prepared.reused && prepared.entry.stage === 'finalized') return record;
     record = transitionWorkSession(this.dependencies.ctxRoot, id, ['archived', 'failed'], 'starting', {}, mutationId);
     commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
@@ -322,18 +460,62 @@ export class WorkSessionManager {
 
   async promote(id: string, input: WorkSessionEmployeeInput, mutationId: string = randomUUID()): Promise<void> {
     validateMutationActor(mutationId, input?.actor);
-    const request = { id, employee: input.name };
-    if (this.priorMutation(mutationId, input.actor, 'promote', id, request)) return;
+    const request = { id, employee: { ...input, actor: undefined } };
+    const prior = this.priorMutation(mutationId, input.actor, 'promote', id, request);
+    if (prior?.stage === 'finalized') return;
+    if (prior && ['effect_recorded', 'audit_written'].includes(prior.stage)) {
+      reconcileCrewMutationJournal(this.dependencies.ctxRoot, { frameworkRoot: this.dependencies.frameworkRoot });
+      const reconciled = getCrewMutation(this.dependencies.ctxRoot, mutationId);
+      if (reconciled?.stage === 'finalized' && reconciled.final_result?.result === 'success') return;
+      throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session promotion requires reconciliation');
+    }
+    if (prior && ['state_committed', 'effect_started'].includes(prior.stage)) {
+      let recoveryRecord = this.require(id, ['stopping', 'archived']);
+      if (recoveryRecord.mutation_id !== mutationId) throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Work Session state is owned by another mutation');
+      if (prior.stage === 'state_committed') startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
+      if (recoveryRecord.lifecycle === 'stopping') {
+        try { await this.adapter(recoveryRecord).stop(); } catch {
+          if (this.adapter(recoveryRecord).status().running) {
+            transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'stopping', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
+            throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime stop could not be confirmed');
+          }
+        }
+        recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
+      }
+      const createEmployee = this.dependencies.createEmployee
+        ?? ((employeeInput, employeeMutationId) => createEmployeeService(employeeInput, employeeMutationId, {
+          ctxRoot: this.dependencies.ctxRoot,
+          frameworkRoot: this.dependencies.frameworkRoot,
+        }));
+      const employeeMutationId = childMutationId(mutationId);
+      await createEmployee({
+        ...input, working_directory: recoveryRecord.canonical_cwd, room_id: recoveryRecord.room_id,
+        source_work_session_id: recoveryRecord.id, telegram_polling: false,
+      }, employeeMutationId);
+      recoveryRecord = transitionWorkSession(this.dependencies.ctxRoot, id, ['archived'], 'archived', { promoted_employee: input.name }, mutationId);
+      recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, {
+        stopped: true, employee_created: true, recovered: true,
+        employee_mutation_digest: digestCrewAuditValue(employeeMutationId), mutation_id: mutationId,
+      });
+      finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, { result: 'success', after_digest: stateDigest(recoveryRecord) });
+      this.adapters.delete(id);
+      return;
+    }
     this.assertTargetAvailable(id, mutationId);
     let record = this.require(id, ['active']);
-    const prepared = this.prepare(record, input.actor, 'promote', mutationId, request);
+    const prepared = prior ? { entry: prior, reused: true } : this.prepare(record, input.actor, 'promote', mutationId, request);
     if (prepared.reused && prepared.entry.stage === 'finalized') return;
     record = transitionWorkSession(this.dependencies.ctxRoot, id, ['active'], 'stopping', {}, mutationId);
     commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
     startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
-    await this.adapter(record).stop();
+    try { await this.adapter(record).stop(); } catch (error) {
+      if (this.adapter(record).status().running) {
+        transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'stopping', { last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' }, mutationId);
+        throw new WorkSessionRegistryError('RECOVERY_REQUIRED', 'Runtime stop could not be confirmed');
+      }
+    }
     record = transitionWorkSession(this.dependencies.ctxRoot, id, ['stopping'], 'archived', {}, mutationId);
-    const employeeMutationId = randomUUID();
+    const employeeMutationId = childMutationId(mutationId);
     const createEmployee = this.dependencies.createEmployee
       ?? ((employeeInput, employeeMutationId) => createEmployeeService(employeeInput, employeeMutationId, {
         ctxRoot: this.dependencies.ctxRoot,

@@ -521,6 +521,15 @@ export function reconcileCrewMutationJournal(
       finalized += 1;
       continue;
     }
+    if (entry.target.kind === 'work_session' && entry.action === 'message'
+      && entry.stage === 'effect_started' && !entry.effect_receipt) {
+      finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, {
+        result: 'indeterminate', after_digest: entry.state_digest ?? entry.before_digest,
+        error_code: 'DELIVERY_RETRY_REQUIRED', sanitized_error: 'Delivery outcome requires owner retry',
+      });
+      finalized += 1;
+      continue;
+    }
     if (entry.target.kind === 'employee'
       && ['approve_merge', 'replace_default', 'disable_default'].includes(entry.action)
       && ['prepared', 'state_committed'].includes(entry.stage)) {
