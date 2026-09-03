@@ -8,7 +8,7 @@ import {
   createWorkSessionAdapter,
   prepareOpenCodeEnvironment,
 } from '../../../src/pty/work-session-pty.js';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -57,6 +57,7 @@ describe('Work Session harness contracts', () => {
       const env = prepareOpenCodeEnvironment({ HOME: join(root, 'personal-home'), XDG_DATA_HOME: hostData }, join(root, 'session'));
       expect(env.HOME).toBe(join(root, 'session', 'home'));
       expect(JSON.parse(readFileSync(join(env.XDG_DATA_HOME, 'opencode', 'auth.json'), 'utf8'))).toEqual({ provider: 'secret' });
+      expect(statSync(join(env.XDG_DATA_HOME, 'opencode', 'auth.json')).mode & 0o777).toBe(0o400);
       expect(existsSync(join(env.XDG_DATA_HOME, 'opencode', 'history.json'))).toBe(false);
       expect(env.XDG_CONFIG_HOME).not.toContain('personal-home');
     } finally { rmSync(root, { recursive: true, force: true }); }

@@ -114,6 +114,16 @@ describe('WorkSessionPTY owned lifecycle', () => {
     expect(output).not.toHaveBeenCalled();
   });
 
+  it('detects an ACP command catalog instead of accepting ambient OpenCode configuration', () => {
+    const internals = adapter as unknown as { ambientOpenCodeCommands: boolean; capture(value: string): void };
+    internals.capture(`${JSON.stringify({
+      jsonrpc: '2.0', method: 'session/update', params: { update: {
+        sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'private-skill' }],
+      } },
+    })}\n`);
+    expect(internals.ambientOpenCodeCommands).toBe(true);
+  });
+
   it('replays a durably spooled completion after room publication fails and the daemon restarts', () => {
     const publish = vi.fn(() => { throw new Error('room unavailable'); });
     const internals = adapter as unknown as {

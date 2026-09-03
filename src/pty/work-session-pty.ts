@@ -115,7 +115,7 @@ export function prepareOpenCodeEnvironment(source: NodeJS.ProcessEnv, stateDir: 
   for (const directory of [home, data, config, cache, authDir]) mkdirSync(directory, { recursive: true, mode: 0o700 });
   const auth = join(authDir, 'auth.json');
   copyFileSync(sourceAuth, auth);
-  chmodSync(auth, 0o600);
+  chmodSync(auth, 0o400);
   return { HOME: home, XDG_DATA_HOME: data, XDG_CONFIG_HOME: config, XDG_CACHE_HOME: cache, OPENCODE_CONFIG_DIR: config };
 }
 
@@ -243,6 +243,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private acpTurnText = '';
   private claudeSessionId: string | null = null;
   private readonly claudeTurnResults: Array<true | Error> = [];
+  private ambientOpenCodeCommands = false;
 
   constructor(private readonly options: NativeWorkSessionOptions) {
     this.timeoutMs = options.timeoutMs ?? 10_000;
@@ -276,6 +277,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         // bounded provider round-trip completes.
         await this.send('Reply with OK to confirm runtime readiness.');
       }
+      if (this.options.record.harness === 'opencode' && this.ambientOpenCodeCommands) throw new Error('AMBIENT_CONFIG_DETECTED');
     } catch (error) {
       await this.stop();
       throw error;
@@ -297,6 +299,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     if (this.options.record.harness === 'claude-code' || this.options.record.harness === 'opencode') {
       await this.send('Reply with OK to confirm runtime readiness.');
     }
+    if (this.options.record.harness === 'opencode' && this.ambientOpenCodeCommands) throw new Error('AMBIENT_CONFIG_DETECTED');
     this.ready = true;
     return { runtime_owner: owner };
   }
@@ -539,6 +542,10 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
           const update = (value.params as Record<string, unknown>).update;
           if (update && typeof update === 'object') {
             const updateValue = update as Record<string, unknown>;
+            if (updateValue.sessionUpdate === 'available_commands_update') {
+              const commands = updateValue.availableCommands ?? updateValue.available_commands;
+              if (Array.isArray(commands) && commands.length > 0) this.ambientOpenCodeCommands = true;
+            }
             const content = updateValue.content && typeof updateValue.content === 'object' ? updateValue.content as Record<string, unknown> : null;
             if (updateValue.sessionUpdate === 'agent_message_chunk' && content?.type === 'text' && typeof content.text === 'string') {
               this.acpTurnText += content.text;
@@ -712,6 +719,7 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   }
 
   private async startOpenCode(input: { cwd: string; model?: string }, sessionId?: string) {
+    this.ambientOpenCodeCommands = false;
     const stateDir = join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id, 'opencode');
     const isolated = prepareOpenCodeEnvironment(process.env, stateDir);
     const configDir = isolated.OPENCODE_CONFIG_DIR;
