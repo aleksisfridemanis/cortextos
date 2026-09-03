@@ -74,10 +74,17 @@ describe('WorkSessionPTY owned lifecycle', () => {
   it('owns the launch handle immediately and confirms termination when initial context injection fails', async () => {
     const handle = { runtime: 'codex-app-server' as const, thread_id: 'thread-exact' };
     vi.spyOn(adapter as never, 'startCodex' as never).mockResolvedValue({ resume_handle: handle } as never);
-    vi.spyOn(adapter, 'send').mockRejectedValue(new Error('injection failed'));
+    (adapter as unknown as { currentOwner: unknown }).currentOwner = {
+      pid: process.pid, started_at: 'test-generation', process_group_id: null,
+      mutation_id: '11111111-1111-4111-8111-111111111111',
+    };
+    const persist = vi.spyOn(adapter as never, 'persistRuntimeReceipt' as never).mockImplementation(() => undefined);
+    const send = vi.spyOn(adapter, 'send').mockRejectedValue(new Error('injection failed'));
     const stop = vi.spyOn(adapter, 'stop').mockResolvedValue();
     await expect(adapter.startFresh({ id: 'ws-one', mutation_id: '11111111-1111-4111-8111-111111111111', cwd, context: 'initial context' })).rejects.toThrow('injection failed');
     expect(adapter.getResumeHandle()).toEqual(handle);
+    expect(persist).toHaveBeenCalledWith(expect.objectContaining({ mutation_id: '11111111-1111-4111-8111-111111111111' }), handle);
+    expect(persist.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
     expect(stop).toHaveBeenCalledOnce();
   });
 });

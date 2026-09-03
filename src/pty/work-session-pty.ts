@@ -232,12 +232,13 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
         ? await this.startCodex(input, undefined)
         : await this.startOpenCode(input, undefined);
     this.currentHandle = result.resume_handle;
-    const owner = this.requireCurrentOwner(input.mutation_id);
-    // The continuation becomes restart-critical the instant discovery succeeds.
-    // Persist it before the optional initial message introduces another await/crash
-    // boundary, so restart can resume rather than treating a known handle as lost.
-    this.persistRuntimeReceipt(owner, result.resume_handle);
+    let owner: ProcessIdentity & { mutation_id: string };
     try {
+      owner = this.requireCurrentOwner(input.mutation_id);
+      // The continuation becomes restart-critical the instant discovery succeeds.
+      // Persist it before the optional initial message introduces another await/crash
+      // boundary, so restart can resume rather than treating a known handle as lost.
+      this.persistRuntimeReceipt(owner, result.resume_handle);
       if (input.context) await this.send(input.context);
     } catch (error) {
       await this.stop();
