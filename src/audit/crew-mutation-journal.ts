@@ -297,7 +297,11 @@ function workSessionSnapshot(record: Record<string, unknown>): Record<string, un
 
 type ReconciliationCertification = CrewMutationFinalResult | 'pending' | null;
 
-function certifyEmployeeCreate(ctxRoot: string, entry: CrewMutationJournalEntry): ReconciliationCertification {
+function certifyEmployeeCreate(
+  ctxRoot: string,
+  entry: CrewMutationJournalEntry,
+  frameworkRoot?: string,
+): ReconciliationCertification {
   try {
     const registry = readJson(join(ctxRoot, 'config', 'enabled-agents.json')) as Record<string, Record<string, unknown>>;
     const rooms = readJson(join(ctxRoot, 'config', 'rooms.json')) as Array<Record<string, unknown>>;
@@ -305,12 +309,15 @@ function certifyEmployeeCreate(ctxRoot: string, entry: CrewMutationJournalEntry)
     const room = Array.isArray(rooms) && employee
       ? rooms.find(item => item.id === employee.room_id && item.kind === 'agent' && item.agent === entry.target.id)
       : null;
-    if (!employee || employee.mutation_id !== entry.mutation_id || !room
+    if (!employee || employee.mutation_id !== entry.mutation_id || !room || !frameworkRoot
+      || typeof employee.org !== 'string'
+      || !existsSync(join(frameworkRoot, 'orgs', employee.org, 'agents', entry.target.id))
       || digestCrewAuditValue(employee) !== entry.intended_after_digest) return null;
     if (entry.stage === 'prepared') commitCrewMutationState(ctxRoot, entry.mutation_id, entry.intended_after_digest);
     if (entry.stage !== 'effect_recorded') return 'pending';
     const receipt = entry.effect_receipt;
-    if (receipt?.mutation_id !== entry.mutation_id || typeof receipt.started !== 'boolean') return null;
+    if (receipt?.mutation_id !== entry.mutation_id || typeof receipt.started !== 'boolean'
+      || receipt.receipt_digest !== digestCrewAuditValue({ mutation_id: entry.mutation_id, started: receipt.started })) return null;
     return { result: 'success', after_digest: entry.intended_after_digest };
   } catch { return null; }
 }
@@ -382,7 +389,10 @@ function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): R
   return null;
 }
 
-export function reconcileCrewMutationJournal(ctxRoot: string): { finalized: number; pending: number } {
+export function reconcileCrewMutationJournal(
+  ctxRoot: string,
+  options: { frameworkRoot?: string } = {},
+): { finalized: number; pending: number } {
   let finalized = 0;
   for (const entry of listPendingCrewMutations(ctxRoot)) {
     if (entry.stage === 'audit_written' && entry.final_result) {
@@ -396,8 +406,9 @@ export function reconcileCrewMutationJournal(ctxRoot: string): { finalized: numb
       let storedDigest: string | null = null;
       try {
         const state = JSON.parse(readFileSync(join(ctxRoot, 'config', 'context-overrides.json'), 'utf8'));
-        const rule = state?.schema_version === 2
-          ? state.employees?.[entry.target.id]?.rules?.['employee-core']
+        const rules = state?.schema_version === 2 ? state.employees?.[entry.target.id]?.rules : null;
+        const rule = rules && typeof rules === 'object'
+          ? Object.values(rules as Record<string, { mutation_id?: string }>).find(item => item?.mutation_id === entry.mutation_id)
           : null;
         if (rule?.mutation_id === entry.mutation_id) storedDigest = digestCrewAuditValue(rule);
       } catch { /* corrupt or absent state cannot be certified */ }
@@ -409,7 +420,7 @@ export function reconcileCrewMutationJournal(ctxRoot: string): { finalized: numb
       continue;
     }
     const certified = entry.target.kind === 'employee' && entry.action === 'create'
-      ? certifyEmployeeCreate(ctxRoot, entry)
+      ? certifyEmployeeCreate(ctxRoot, entry, options.frameworkRoot ?? process.env.CTX_FRAMEWORK_ROOT ?? process.env.CTX_PROJECT_ROOT)
       : entry.target.kind === 'work_session'
         ? certifyWorkSession(ctxRoot, entry)
         : null;

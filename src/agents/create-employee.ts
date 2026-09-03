@@ -261,7 +261,7 @@ export async function createEmployee(
     throw new CrewServiceError('INVALID_MUTATION_ID', 400, 'A valid mutation id is required');
   }
 
-  reconcileCrewMutationJournal(ctxRoot);
+  reconcileCrewMutationJournal(ctxRoot, { frameworkRoot });
   const enabledPath = join(ctxRoot, 'config', 'enabled-agents.json');
   const roomsPath = join(ctxRoot, 'config', 'rooms.json');
   const existingRegistry = readObject(enabledPath);

@@ -77,6 +77,27 @@ describe('WorkSessionManager', () => {
     await expect(manager.send(created.id, 'different', 'owner:test', '22222222-2222-4222-8222-222222222222')).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
   });
 
+  it('retains the cwd lease when startup cleanup cannot confirm process death', async () => {
+    const { manager, adapter, cwd } = fixture();
+    vi.mocked(adapter.startFresh).mockRejectedValueOnce(new Error('context injection failed'));
+    vi.mocked(adapter.status).mockReturnValue({ running: true, pid: 99, error_code: null });
+    await expect(manager.create({ display_name: 'Unsafe start', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'a1111111-1111-4111-8111-111111111111'))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(manager.list()[0]).toMatchObject({ lifecycle: 'starting', last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' });
+    await expect(manager.create({ display_name: 'Second', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'a2222222-2222-4222-8222-222222222222'))
+      .rejects.toMatchObject({ code: 'CWD_LEASE_CONFLICT' });
+  });
+
+  it('retains the cwd lease when stop cannot confirm process death', async () => {
+    const { manager, adapter, cwd } = fixture();
+    const created = await manager.create({ display_name: 'Unsafe stop', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd, actor: 'owner:test' }, 'b1111111-1111-4111-8111-111111111111');
+    vi.mocked(adapter.stop).mockRejectedValueOnce(new Error('death unconfirmed'));
+    vi.mocked(adapter.status).mockReturnValue({ running: true, pid: 99, error_code: null });
+    await expect(manager.stop(created.id, 'owner:test', 'b2222222-2222-4222-8222-222222222222'))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(manager.get(created.id)).toMatchObject({ lifecycle: 'stopping', last_error: 'RUNTIME_OWNERSHIP_UNCONFIRMED' });
+  });
+
   it('compensates a record when room publication fails so the cwd lease is released', async () => {
     const { cwd } = fixture();
     const root = roots.at(-1)!;
