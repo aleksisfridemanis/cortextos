@@ -111,7 +111,8 @@ export function ContextOwnershipPanel({ agentName }: { agentName: string }) {
         <CardDescription>Review effective source and provenance before changing a safety default.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {error && <p role="alert" className="text-sm text-destructive">{error}{pendingMutationId ? <span className="block font-mono text-xs">Pending mutation: {pendingMutationId}</span> : null}</p>}
+        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+        {pendingMutationId && <p className="font-mono text-xs text-muted-foreground">Pending mutation: {pendingMutationId}</p>}
         {!review ? <p className="text-sm text-muted-foreground">Loading context provenance…</p> : <>
           <dl className="grid gap-2 text-sm sm:grid-cols-2">
             <div><dt className="text-muted-foreground">Classification</dt><dd className="font-medium">{review.classification}</dd></div>

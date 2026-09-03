@@ -181,7 +181,8 @@ export function CreateChatDialog({ onCreated }: { onCreated?: (id: string) => vo
             <div className="flex gap-2"><Input id="crew-directory" required={state.kind === 'work_session'} placeholder="/absolute/project/path" value={state.workingDirectory} onChange={event => setState(current => ({ ...current, workingDirectory: event.target.value }))} />{state.kind === 'work_session' && <Button type="button" variant="outline" onClick={browse}>Browse</Button>}</div>
             {state.kind === 'work_session' && browseEntries.length > 0 && <div className="max-h-36 overflow-y-auto rounded border p-1" aria-label="Host directories">{browseEntries.filter(entry => entry.kind === 'directory' && entry.canonical_path).map(entry => <button className="block w-full rounded px-2 py-1 text-left text-sm hover:bg-muted" type="button" key={entry.name} onClick={() => setState(current => ({ ...current, workingDirectory: entry.canonical_path! }))}>{entry.name}{entry.warning ? ' ⚠' : ''}</button>)}</div>}
           </div>
-          {error && <p role="alert" className="text-sm text-destructive">{error}{pendingMutationId ? <span className="block font-mono text-xs">Pending mutation: {pendingMutationId}</span> : null}</p>}
+          {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+          {pendingMutationId && <p className="font-mono text-xs text-muted-foreground">Pending mutation: {pendingMutationId}</p>}
           <DialogFooter><Button type="submit" disabled={!valid || submitting}>{submitting ? 'Creating…' : 'Create'}</Button></DialogFooter>
         </form>
       </DialogContent>
