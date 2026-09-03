@@ -27,7 +27,7 @@ describe('createEmployee', () => {
     ctxRoot = join(root, 'ctx');
     mkdirSync(join(frameworkRoot, 'templates', 'agent'), { recursive: true });
     mkdirSync(join(ctxRoot, 'config'), { recursive: true });
-    mkdirSync(join(ctxRoot, 'orgs', 'platform'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'platform', 'agents'), { recursive: true });
     writeJson(join(frameworkRoot, 'templates', 'agent', 'config.json'), { telegram_polling: true });
     writeFileSync(join(frameworkRoot, 'templates', 'agent', 'IDENTITY.md'), 'template identity\n');
     writeJson(join(ctxRoot, 'config', 'enabled-agents.json'), {});
@@ -62,7 +62,7 @@ describe('createEmployee', () => {
     expect(result.status).toBe('created');
     expect(result.employee.room_id).toBe(`agent-${'a'.repeat(CREW_NAME_MAX_CHARS)}`);
     expect(started).toEqual([mutationId]);
-    const config = JSON.parse(readFileSync(join(ctxRoot, 'agents', 'a'.repeat(64), 'config.json'), 'utf8'));
+    const config = JSON.parse(readFileSync(join(frameworkRoot, 'orgs', 'platform', 'agents', 'a'.repeat(64), 'config.json'), 'utf8'));
     expect(config.telegram_polling).toBe(false);
     expect(config.mutation_id).toBe(mutationId);
     const rooms = JSON.parse(readFileSync(join(ctxRoot, 'config', 'rooms.json'), 'utf8'));
@@ -96,7 +96,7 @@ describe('createEmployee', () => {
         .rejects.toBeInstanceOf(CrewServiceError);
     }
     expect(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8')).toBe(before);
-    expect(() => readFileSync(join(ctxRoot, 'agents'), 'utf8')).toThrow();
+    expect(() => readFileSync(join(frameworkRoot, 'orgs', 'platform', 'agents', 'ada'), 'utf8')).toThrow();
   });
 
   it('removes staging artifacts when a failure occurs before publication', async () => {
@@ -105,7 +105,7 @@ describe('createEmployee', () => {
       name: 'ada', org: 'platform', runtime: 'claude-code', telegram_polling: false, actor: 'owner:test',
     }, '67ee842e-b948-4cbb-a4e6-e80c6847dc85', dependencies)).rejects.toMatchObject({ code: 'CREATE_FAILED' });
     expect(JSON.parse(readFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), 'utf8'))).toEqual({});
-    expect(() => readFileSync(join(ctxRoot, 'agents', 'ada'), 'utf8')).toThrow();
+    expect(() => readFileSync(join(frameworkRoot, 'orgs', 'platform', 'agents', 'ada'), 'utf8')).toThrow();
   });
 
   it('exports the exact request ceilings', () => {

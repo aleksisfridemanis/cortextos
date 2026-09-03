@@ -16,7 +16,7 @@ describe('Crew Employee creation lifecycle', () => {
     const ctxRoot = join(root, 'ctx');
     const frameworkRoot = join(root, 'framework');
     mkdirSync(join(ctxRoot, 'config'), { recursive: true });
-    mkdirSync(join(ctxRoot, 'orgs', 'platform'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'platform', 'agents'), { recursive: true });
     mkdirSync(join(frameworkRoot, 'templates', 'agent'), { recursive: true });
     writeFileSync(join(frameworkRoot, 'templates', 'agent', 'config.json'), '{}');
     writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), '{}');
