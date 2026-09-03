@@ -14,8 +14,11 @@ import { captureProcessIdentity, probeProcessIdentity } from '../../src/utils/pr
 describe('native Work Session process restart ownership', () => {
   const roots: string[] = [];
   const originalPath = process.env.PATH;
+  const originalXdgData = process.env.XDG_DATA_HOME;
   afterEach(() => {
     process.env.PATH = originalPath;
+    if (originalXdgData === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgData;
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   });
 
@@ -79,6 +82,7 @@ const quoted = command.match(/"([^"]+)"$/);
 const ackPath = quoted && quoted[1];
 const sessionId = args.includes('--resume') ? args[args.indexOf('--resume') + 1] : args[args.indexOf('--session-id') + 1];
 fs.writeFileSync(ackPath, JSON.stringify({ session_id: sessionId }));
+process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: sessionId }) + '\\n');
 let buffer = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => {
@@ -87,6 +91,7 @@ process.stdin.on('data', chunk => {
   for (const line of lines) if (line.trim()) {
     const request = JSON.parse(line);
     process.stdout.write(JSON.stringify({ type: 'assistant', uuid: 'claude-native-answer', message: { content: [{ type: 'text', text: 'Claude native answer: ' + request.message.content[0].text }] } }) + '\\n');
+    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId }) + '\\n');
   }
 });
 setInterval(() => {}, 1000);
@@ -116,6 +121,11 @@ setInterval(() => {}, 1000);
 `;
     writeFileSync(executable, source);
     chmodSync(executable, 0o755);
+    const hostData = join(root, 'host-data');
+    mkdirSync(join(hostData, 'opencode'), { recursive: true });
+    writeFileSync(join(hostData, 'opencode', 'auth.json'), JSON.stringify({ test: 'credential' }), { mode: 0o600 });
+    writeFileSync(join(hostData, 'opencode', 'history.json'), JSON.stringify({ private: true }));
+    process.env.XDG_DATA_HOME = hostData;
     process.env.PATH = `${bin}:${originalPath ?? ''}`;
     return { root, cwd, ctxRoot };
   }
@@ -136,8 +146,13 @@ setInterval(() => {}, 1000);
     await adapter.send('native prompt');
     await new Promise(resolve => setTimeout(resolve, 100));
     const args = JSON.parse(readFileSync(join(cwd, 'launch-args.json'), 'utf8')) as string[];
-    if (harness === 'claude-code') expect(args).toEqual(expect.arrayContaining(['--print', '--input-format', 'stream-json', '--output-format', 'stream-json']));
+    if (harness === 'claude-code') expect(args).toEqual(expect.arrayContaining(['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--safe-mode', '--strict-mcp-config', '--disable-slash-commands']));
     else expect(args.slice(0, 3)).toEqual(['acp', '--cwd', cwd]);
+    if (harness === 'opencode') {
+      const isolated = join(ctxRoot, 'state', 'work-sessions', record.id, 'opencode', 'data', 'opencode');
+      expect(JSON.parse(readFileSync(join(isolated, 'auth.json'), 'utf8'))).toEqual({ test: 'credential' });
+      expect(existsSync(join(isolated, 'history.json'))).toBe(false);
+    }
     expect(readRoomLog(ctxRoot, record.room_id).filter(message => message.source === 'work_session'))
       .toEqual([expect.objectContaining({ from: record.id, text: expect.stringContaining('native answer'), delivery_state: 'delivered' })]);
     await adapter.stop();

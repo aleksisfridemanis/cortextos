@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'crypto';
 import {
-  chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, readdirSync, unlinkSync, writeFileSync,
+  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync,
 } from 'fs';
 import { execFileSync } from 'child_process';
-import { dirname, join } from 'path';
+import { join } from 'path';
 import type { WorkSessionRecord } from '../work-sessions/types.js';
 import type { WorkSessionLaunchInput, WorkSessionResumeHandle, WorkSessionRuntimeAdapter, WorkSessionRuntimeOutput } from '../work-sessions/types.js';
 import {
@@ -36,12 +36,14 @@ export function workSessionChildEnv(source: NodeJS.ProcessEnv, identity?: WorkSe
   return env;
 }
 
-export function buildClaudeWorkSessionLaunch(input: { cwd: string; sessionId: string; resume: boolean; settingsPath?: string; model?: string }) {
+export function buildClaudeWorkSessionLaunch(input: { cwd: string; sessionId: string; resume: boolean; settingsPath?: string; mcpConfigPath?: string; model?: string }) {
   const args = ['--print', '--verbose', '--input-format', 'stream-json', '--output-format', 'stream-json', '--include-partial-messages'];
   args.push(...(input.resume
     ? ['--resume', input.sessionId]
     : ['--session-id', input.sessionId]));
   args.push('--permission-mode', 'manual');
+  args.push('--safe-mode', '--disable-slash-commands', '--strict-mcp-config');
+  if (input.mcpConfigPath) args.push('--mcp-config', input.mcpConfigPath);
   if (input.settingsPath) args.push('--settings', input.settingsPath);
   if (input.model) args.push('--model', input.model);
   return { command: 'claude', args, cwd: input.cwd, env: workSessionChildEnv(process.env) };
@@ -96,6 +98,25 @@ export function claudeSessionSettings(canonicalCwd: string, reporterCommand: str
 
 export function openCodePermissionConfig(): Record<string, unknown> {
   return { permission: { '*': 'ask', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow', external_directory: 'ask' } };
+}
+
+/** Build an isolated OpenCode home while copying only its documented auth store. */
+export function prepareOpenCodeEnvironment(source: NodeJS.ProcessEnv, stateDir: string): Record<string, string> {
+  const sourceHome = source.HOME;
+  const sourceData = source.XDG_DATA_HOME ?? (sourceHome ? join(sourceHome, '.local', 'share') : null);
+  if (!sourceData) throw new Error('OPENCODE_AUTH_UNAVAILABLE');
+  const sourceAuth = join(sourceData, 'opencode', 'auth.json');
+  if (!existsSync(sourceAuth)) throw new Error('OPENCODE_AUTH_UNAVAILABLE');
+  const home = join(stateDir, 'home');
+  const data = join(stateDir, 'data');
+  const config = join(stateDir, 'config');
+  const cache = join(stateDir, 'cache');
+  const authDir = join(data, 'opencode');
+  for (const directory of [home, data, config, cache, authDir]) mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const auth = join(authDir, 'auth.json');
+  copyFileSync(sourceAuth, auth);
+  chmodSync(auth, 0o600);
+  return { HOME: home, XDG_DATA_HOME: data, XDG_CONFIG_HOME: config, XDG_CACHE_HOME: cache, OPENCODE_CONFIG_DIR: config };
 }
 
 /**
@@ -220,6 +241,8 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private spawningMutationId: string | null = null;
   private outputSequence = 0;
   private acpTurnText = '';
+  private claudeSessionId: string | null = null;
+  private readonly claudeTurnResults: Array<true | Error> = [];
 
   constructor(private readonly options: NativeWorkSessionOptions) {
     this.timeoutMs = options.timeoutMs ?? 10_000;
@@ -244,8 +267,15 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       // Persist it before the optional initial message introduces another await/crash
       // boundary, so restart can resume rather than treating a known handle as lost.
       this.persistRuntimeReceipt(owner, result.resume_handle);
-      this.ready = true;
-      if (input.context) await this.send(input.context);
+      if (input.context) {
+        this.ready = true;
+        await this.send(input.context);
+      } else if (this.options.record.harness === 'claude-code' || this.options.record.harness === 'opencode') {
+        // A structured session acknowledgement alone does not prove that the
+        // selected model can authenticate. Keep output suppressed until this
+        // bounded provider round-trip completes.
+        await this.send('Reply with OK to confirm runtime readiness.');
+      }
     } catch (error) {
       await this.stop();
       throw error;
@@ -262,9 +292,12 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     else if (handle.runtime === 'codex-app-server') await this.startCodex(input, handle.thread_id);
     else await this.startOpenCode(input, handle.session_id);
     this.currentHandle = handle;
-    this.ready = true;
     const owner = this.requireCurrentOwner(input.mutation_id);
     this.persistRuntimeReceipt(owner, handle);
+    if (this.options.record.harness === 'claude-code' || this.options.record.harness === 'opencode') {
+      await this.send('Reply with OK to confirm runtime readiness.');
+    }
+    this.ready = true;
     return { runtime_owner: owner };
   }
 
@@ -291,10 +324,13 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     if (this.options.record.harness === 'claude-code') {
       const sessionId = this.currentHandle?.runtime === 'claude-code' ? this.currentHandle.session_id : null;
       if (!sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      this.claudeTurnResults.length = 0;
       this.pty.write(`${JSON.stringify({
         type: 'user', session_id: sessionId, parent_tool_use_id: null,
         message: { role: 'user', content: [{ type: 'text', text }] },
       })}\n`);
+      const result = await waitFor(() => this.claudeTurnResults.shift(), this.timeoutMs);
+      if (result instanceof Error) throw result;
       return;
     }
     this.pty.write(`\u001b[200~${text}\u001b[201~\r`);
@@ -479,7 +515,15 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     this.buffer = lines.pop() ?? '';
     for (const line of lines) {
       try {
-        const value = JSON.parse(line) as { id?: unknown; method?: unknown; result?: unknown; error?: unknown; params?: unknown; type?: unknown; message?: unknown };
+        const value = JSON.parse(line) as { id?: unknown; method?: unknown; result?: unknown; error?: unknown; params?: unknown; type?: unknown; subtype?: unknown; session_id?: unknown; is_error?: unknown; message?: unknown };
+        if (value.type === 'system' && value.subtype === 'init' && typeof value.session_id === 'string') {
+          this.claudeSessionId = value.session_id;
+        }
+        if (value.type === 'result') {
+          this.claudeTurnResults.push(value.is_error === true
+            ? new Error(closedRuntimeErrorCode(value, 'claude-code', 'session/prompt'))
+            : true);
+        }
         if (typeof value.id === 'number' && value.method === undefined && ('result' in value || 'error' in value)) {
           this.responses.set(value.id, value);
           if (this.requestMethods.get(value.id) === 'session/prompt' && !value.error) {
@@ -563,25 +607,25 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
 
   private async startClaude(input: { cwd: string; model?: string }, resumeId?: string) {
     const sessionId = resumeId ?? randomUUID();
+    this.claudeSessionId = null;
     const stateDir = join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id);
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const ackPath = join(stateDir, 'claude-session-ack.json');
     try { unlinkSync(ackPath); } catch {}
     const reporter = join(__dirname, '..', 'daemon.js');
     const settingsPath = join(stateDir, 'claude-session-settings.json');
+    const mcpConfigPath = join(stateDir, 'claude-mcp.json');
     const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(reporter)} --claude-session-report ${JSON.stringify(sessionId)} ${JSON.stringify(ackPath)}`;
     writeFileSync(settingsPath, `${JSON.stringify(claudeSessionSettings(input.cwd, command), null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(mcpConfigPath, `${JSON.stringify({ mcpServers: {} }, null, 2)}\n`, { mode: 0o600 });
     chmodSync(settingsPath, 0o600);
-    const spec = buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId, resume: !!resumeId, settingsPath });
+    const spec = buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId, resume: !!resumeId, settingsPath, mcpConfigPath });
     this.spawn(spec.command, spec.args, spec.cwd, this.env());
     try {
       await waitFor(() => {
-        if (!existsSync(ackPath)) return undefined;
-        const siblings = readdirSync(dirname(ackPath)).filter(name => name.startsWith('claude-session-ack'));
-        if (siblings.length !== 1) throw new Error('RESUME_HANDLE_UNAVAILABLE');
-        const ack = JSON.parse(readFileSync(ackPath, 'utf8')) as { session_id?: string };
-        if (ack.session_id !== sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
-        return true;
+        if (this.claudeSessionId === sessionId) return true;
+        if (this.claudeSessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+        return undefined;
       }, this.timeoutMs);
     } catch (error) { await this.stop(); throw error; }
     return { resume_handle: { runtime: 'claude-code' as const, session_id: sessionId } };
@@ -615,13 +659,12 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
 
   private async startOpenCode(input: { cwd: string; model?: string }, sessionId?: string) {
     const stateDir = join(this.options.ctxRoot, 'state', 'work-sessions', this.options.record.id, 'opencode');
-    const configDir = join(stateDir, 'config');
+    const isolated = prepareOpenCodeEnvironment(process.env, stateDir);
+    const configDir = isolated.OPENCODE_CONFIG_DIR;
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     writeFileSync(join(configDir, 'opencode.json'), `${JSON.stringify(openCodePermissionConfig(), null, 2)}\n`, { mode: 0o600 });
-    const dataDir = join(stateDir, 'data');
-    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const spec = buildOpenCodeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId });
-    const env = { ...this.env(), OPENCODE_CONFIG_DIR: configDir, XDG_DATA_HOME: dataDir };
+    const env = { ...this.env(), ...isolated };
     this.spawn(spec.command, spec.args, spec.cwd, env);
     try {
       await this.rpc('initialize', {

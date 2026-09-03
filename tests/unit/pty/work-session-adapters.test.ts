@@ -6,13 +6,18 @@ import {
   selectOpenCodeSession,
   workSessionChildEnv,
   createWorkSessionAdapter,
+  prepareOpenCodeEnvironment,
 } from '../../../src/pty/work-session-pty.js';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 describe('Work Session harness contracts', () => {
   it('uses a generated Claude session id for fresh launch and only that id for resume', () => {
     const fresh = buildClaudeWorkSessionLaunch({ cwd: '/project', sessionId: 'uuid-exact', resume: false });
     expect(fresh.args).toEqual(expect.arrayContaining([
       '--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--session-id', 'uuid-exact',
+      '--safe-mode', '--strict-mcp-config', '--disable-slash-commands',
     ]));
     const resumed = buildClaudeWorkSessionLaunch({ cwd: '/project', sessionId: 'uuid-exact', resume: true });
     expect(resumed.args).toEqual(expect.arrayContaining(['--resume', 'uuid-exact']));
@@ -40,6 +45,21 @@ describe('Work Session harness contracts', () => {
   it('passes only the strict tokenless child environment allowlist', () => {
     const env = workSessionChildEnv({ PATH: '/bin', HOME: '/home/u', TERM: 'xterm', LANG: 'en', AUTH_SECRET: 'forbidden', OPENAI_API_KEY: 'forbidden' });
     expect(env).toEqual({ PATH: '/bin', HOME: '/home/u', TERM: 'xterm', LANG: 'en' });
+  });
+
+  it('isolates OpenCode HOME and copies only the documented auth store', () => {
+    const root = mkdtempSync(join(tmpdir(), 'opencode-isolation-'));
+    try {
+      const hostData = join(root, 'host-data');
+      mkdirSync(join(hostData, 'opencode'), { recursive: true });
+      writeFileSync(join(hostData, 'opencode', 'auth.json'), '{"provider":"secret"}');
+      writeFileSync(join(hostData, 'opencode', 'history.json'), '{"private":true}');
+      const env = prepareOpenCodeEnvironment({ HOME: join(root, 'personal-home'), XDG_DATA_HOME: hostData }, join(root, 'session'));
+      expect(env.HOME).toBe(join(root, 'session', 'home'));
+      expect(JSON.parse(readFileSync(join(env.XDG_DATA_HOME, 'opencode', 'auth.json'), 'utf8'))).toEqual({ provider: 'secret' });
+      expect(existsSync(join(env.XDG_DATA_HOME, 'opencode', 'history.json'))).toBe(false);
+      expect(env.XDG_CONFIG_HOME).not.toContain('personal-home');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('requires an exact native acknowledgement before resume succeeds', async () => {
