@@ -13,7 +13,8 @@ import {
   startCrewMutationEffect,
 } from '../../../src/audit/crew-mutation-journal';
 import { digestCrewAuditValue } from '../../../src/audit/crew-lifecycle-audit.js';
-import { createWorkSessionRecord, readWorkSessions } from '../../../src/work-sessions/registry.js';
+import { createWorkSessionRecord, readWorkSessions, transitionWorkSession } from '../../../src/work-sessions/registry.js';
+import { upsertRoom } from '../../../src/rooms/registry.js';
 
 describe('Crew mutation journal', () => {
   it('persists prepare before state/effect/audit and converges idempotently', () => {
@@ -195,6 +196,41 @@ describe('Crew mutation journal', () => {
 
       expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 0, pending: 1 });
       expect(getCrewMutation(root, stopId)?.stage).toBe('effect_recorded');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('advances exact prepared Work Session publications and transitions after process death', () => {
+    const root = mkdtempSync(join(tmpdir(), 'crew-journal-prepared-state-'));
+    const cwd = join(root, 'project');
+    mkdirSync(cwd);
+    try {
+      const createId = 'b1111111-1111-4111-8111-111111111111';
+      const target = `ws-${createId}`;
+      prepareCrewMutation(root, {
+        mutation_id: createId, idempotency_key: createId, actor: 'owner:1', target: { kind: 'work_session', id: target }, action: 'create',
+        request_digest: '1'.repeat(64), before_digest: '2'.repeat(64), intended_after_digest: '3'.repeat(64),
+      });
+      const created = createWorkSessionRecord(root, {
+        id: target, display_name: 'Published', org: 'platform', harness: 'codex-app-server', requested_cwd: cwd,
+        room_id: `work-${createId}`, mutation_id: createId, created_by: 'owner:1',
+      });
+      upsertRoom(root, {
+        id: created.room_id, kind: 'work_session', title: created.display_name, members: [], work_session_id: target,
+        created_at: created.created_at, created_by: created.created_by, mutation_id: createId,
+      });
+      expect(reconcileCrewMutationJournal(root)).toEqual({ finalized: 0, pending: 1 });
+      expect(getCrewMutation(root, createId)?.stage).toBe('state_committed');
+
+      const stopId = 'b2222222-2222-4222-8222-222222222222';
+      prepareCrewMutation(root, {
+        mutation_id: stopId, idempotency_key: stopId, actor: 'owner:1', target: { kind: 'work_session', id: target }, action: 'stop',
+        request_digest: '4'.repeat(64), before_digest: '5'.repeat(64), intended_after_digest: '6'.repeat(64),
+      });
+      transitionWorkSession(root, target, ['starting'], 'stopping', {}, stopId);
+      reconcileCrewMutationJournal(root);
+      expect(getCrewMutation(root, stopId)?.stage).toBe('state_committed');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

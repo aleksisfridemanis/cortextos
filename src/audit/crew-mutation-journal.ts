@@ -421,8 +421,8 @@ function reconcilePartialEmployeeCreate(
   });
 }
 
-function reconcilePreparedWorkSessionCreate(ctxRoot: string, entry: CrewMutationJournalEntry): 'rolled_back' | 'pending' | null {
-  if (entry.stage !== 'prepared' || entry.action !== 'create') return null;
+function reconcilePreparedWorkSessionState(ctxRoot: string, entry: CrewMutationJournalEntry): 'advanced' | 'rolled_back' | 'pending' | null {
+  if (entry.stage !== 'prepared') return null;
   let records: Array<Record<string, unknown>>;
   let rooms: Array<Record<string, unknown>>;
   try {
@@ -434,11 +434,23 @@ function reconcilePreparedWorkSessionCreate(ctxRoot: string, entry: CrewMutation
   } catch { return 'pending'; }
   const record = records.find(item => item.id === entry.target.id);
   if (!record) return null;
-  if (record.mutation_id !== entry.mutation_id || record.lifecycle !== 'starting') return 'pending';
-  const room = rooms.find(item => item.id === record.room_id);
-  if (room) return room.mutation_id === entry.mutation_id && room.work_session_id === record.id ? null : 'pending';
-  removeStartingWorkSessionRecord(ctxRoot, entry.target.id, entry.mutation_id);
-  return 'rolled_back';
+  if (record.mutation_id !== entry.mutation_id) return 'pending';
+  const expectedLifecycle = entry.action === 'create' || entry.action === 'resume'
+    ? 'starting'
+    : entry.action === 'stop' || entry.action === 'promote'
+      ? 'stopping'
+      : null;
+  if (!expectedLifecycle || record.lifecycle !== expectedLifecycle) return 'pending';
+  if (entry.action === 'create') {
+    const room = rooms.find(item => item.id === record.room_id);
+    if (!room) {
+      removeStartingWorkSessionRecord(ctxRoot, entry.target.id, entry.mutation_id);
+      return 'rolled_back';
+    }
+    if (room.mutation_id !== entry.mutation_id || room.work_session_id !== record.id) return 'pending';
+  }
+  commitCrewMutationState(ctxRoot, entry.mutation_id, workSessionDigest(record));
+  return 'advanced';
 }
 
 function certifyWorkSession(ctxRoot: string, entry: CrewMutationJournalEntry): ReconciliationCertification {
@@ -569,9 +581,10 @@ export function reconcileCrewMutationJournal(
         continue;
       }
     }
-    if (entry.target.kind === 'work_session' && entry.action === 'create') {
-      const partial = reconcilePreparedWorkSessionCreate(ctxRoot, entry);
+    if (entry.target.kind === 'work_session') {
+      const partial = reconcilePreparedWorkSessionState(ctxRoot, entry);
       if (partial === 'pending') continue;
+      if (partial === 'advanced') continue;
       if (partial === 'rolled_back') {
         finalizeCrewMutationAudit(ctxRoot, entry.mutation_id, {
           result: 'failure', after_digest: entry.before_digest,
