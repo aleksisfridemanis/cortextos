@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildClaudeWorkSessionLaunch,
   buildCodexWorkSessionLaunch,
   buildOpenCodeWorkSessionLaunch,
   selectOpenCodeSession,
   workSessionChildEnv,
+  createWorkSessionAdapter,
 } from '../../../src/pty/work-session-pty.js';
 
 describe('Work Session harness contracts', () => {
@@ -37,5 +38,18 @@ describe('Work Session harness contracts', () => {
   it('passes only the strict tokenless child environment allowlist', () => {
     const env = workSessionChildEnv({ PATH: '/bin', HOME: '/home/u', TERM: 'xterm', LANG: 'en', AUTH_SECRET: 'forbidden', OPENAI_API_KEY: 'forbidden' });
     expect(env).toEqual({ PATH: '/bin', HOME: '/home/u', TERM: 'xterm', LANG: 'en' });
+  });
+
+  it('requires an exact native acknowledgement before resume succeeds', async () => {
+    const transport = {
+      launch: vi.fn(async () => ({ session_id: 'different-session' })),
+      send: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+    };
+    const adapter = createWorkSessionAdapter('opencode', transport);
+    await expect(adapter.resumeExact(
+      { runtime: 'opencode', session_id: 'requested-session' },
+      { id: 'ws-one', cwd: '/project' },
+    )).rejects.toThrow('RESUME_HANDLE_UNAVAILABLE');
   });
 });

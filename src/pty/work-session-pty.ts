@@ -51,7 +51,7 @@ export function buildCodexWorkSessionLaunch(input: { cwd: string; model?: string
   return { command: 'codex', args: ['app-server'], cwd: input.cwd, env: workSessionChildEnv(process.env), requests };
 }
 
-export interface OpenCodeSessionCandidate { id: string; cwd: string; created_at: number }
+export interface OpenCodeSessionCandidate { id: string; cwd: string; created_at: number; updated_at?: number }
 export function selectOpenCodeSession(candidates: OpenCodeSessionCandidate[], canonicalCwd: string, spawnStart: number, spawnEnd: number): string {
   const matches = candidates.filter(row => row.cwd === canonicalCwd && row.created_at >= spawnStart && row.created_at <= spawnEnd);
   if (matches.length !== 1) throw new Error(matches.length === 0 ? 'OPENCODE_SESSION_NOT_FOUND' : 'OPENCODE_SESSION_AMBIGUOUS');
@@ -124,9 +124,16 @@ export function createWorkSessionAdapter(
     },
     async resumeExact(handle, input) {
       if (handle.runtime !== harness) throw new Error('RESUME_HANDLE_HARNESS_MISMATCH');
-      if (handle.runtime === 'claude-code') await transport.launch(buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId: handle.session_id, resume: true }));
-      else if (handle.runtime === 'codex-app-server') await transport.launch(buildCodexWorkSessionLaunch({ cwd: input.cwd, model: input.model, threadId: handle.thread_id }));
-      else await transport.launch(buildOpenCodeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId: handle.session_id }));
+      if (handle.runtime === 'claude-code') {
+        const receipt = await transport.launch(buildClaudeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId: handle.session_id, resume: true }));
+        if (receipt.session_id !== handle.session_id) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      } else if (handle.runtime === 'codex-app-server') {
+        const receipt = await transport.launch(buildCodexWorkSessionLaunch({ cwd: input.cwd, model: input.model, threadId: handle.thread_id }));
+        if (receipt.thread_id !== handle.thread_id) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      } else {
+        const receipt = await transport.launch(buildOpenCodeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId: handle.session_id }));
+        if (receipt.session_id !== handle.session_id) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+      }
     },
     send: text => transport.send(text),
     stop: () => transport.stop(),
@@ -178,6 +185,8 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
   private ready = false;
   private currentThreadId: string | null = null;
   private currentHandle: WorkSessionResumeHandle | null;
+  private exitPromise: Promise<void> | null = null;
+  private resolveExit: (() => void) | null = null;
 
   constructor(private readonly options: NativeWorkSessionOptions) {
     this.timeoutMs = options.timeoutMs ?? 10_000;
@@ -191,8 +200,13 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
       : this.options.record.harness === 'codex-app-server'
         ? await this.startCodex(input, undefined)
         : await this.startOpenCode(input, undefined);
-    if (input.context) await this.send(input.context);
     this.currentHandle = result.resume_handle;
+    try {
+      if (input.context) await this.send(input.context);
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
     this.ready = true;
     return result;
   }
@@ -227,8 +241,20 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const pty = this.pty;
     this.intentionalStop = true;
     this.ready = false;
-    this.pty = null;
-    if (pty) { try { pty.kill('SIGTERM'); } catch {} }
+    if (!pty) return;
+    const exit = this.exitPromise;
+    if (!exit) throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
+    try { pty.kill('SIGTERM'); } catch { /* confirm via the exit signal below */ }
+    try {
+      await this.awaitExit(exit, this.timeoutMs);
+      return;
+    } catch { /* bounded graceful stop elapsed; escalate */ }
+    try { pty.kill('SIGKILL'); } catch { /* confirm via the exit signal below */ }
+    try {
+      await this.awaitExit(exit, this.timeoutMs);
+    } catch {
+      throw new Error('WORK_SESSION_STOP_UNCONFIRMED');
+    }
   }
 
   status() { return { running: this.pty !== null, pid: this.pty?.pid ?? null, error_code: null }; }
@@ -253,15 +279,30 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const pty = nodePty.spawn(command, args, { name: 'xterm-256color', cols: 120, rows: 40, cwd, env });
     this.intentionalStop = false;
     this.pty = pty;
+    this.exitPromise = new Promise(resolve => { this.resolveExit = resolve; });
     pty.onData(data => this.capture(data));
     pty.onExit(event => {
       if (this.pty === pty) this.pty = null;
+      this.resolveExit?.();
+      this.resolveExit = null;
       if (!this.intentionalStop && this.ready) {
         this.ready = false;
         setTimeout(() => this.options.onExit?.(event), 0);
       }
     });
     return pty;
+  }
+
+  private async awaitExit(exit: Promise<void>, timeoutMs: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        exit,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('WORK_SESSION_STOP_TIMEOUT')), timeoutMs); }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private capture(data: string): void {
@@ -328,9 +369,13 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
 
   private queryOpenCodeSessions(databasePath: string): OpenCodeSessionCandidate[] {
     try {
-      const raw = execFileSync('sqlite3', ['-json', databasePath, 'SELECT id, directory AS cwd, time_created AS created_at FROM session'], { encoding: 'utf8', timeout: 2000 });
-      const rows = JSON.parse(raw || '[]') as Array<{ id: string; cwd: string; created_at: number }>;
-      return rows.map(row => ({ ...row, created_at: row.created_at < 10_000_000_000 ? row.created_at * 1000 : row.created_at }));
+      const raw = execFileSync('sqlite3', ['-json', databasePath, 'SELECT id, directory AS cwd, time_created AS created_at, time_updated AS updated_at FROM session'], { encoding: 'utf8', timeout: 2000 });
+      const rows = JSON.parse(raw || '[]') as Array<{ id: string; cwd: string; created_at: number; updated_at?: number }>;
+      return rows.map(row => ({
+        ...row,
+        created_at: row.created_at < 10_000_000_000 ? row.created_at * 1000 : row.created_at,
+        updated_at: row.updated_at === undefined ? undefined : row.updated_at < 10_000_000_000 ? row.updated_at * 1000 : row.updated_at,
+      }));
     } catch { return []; }
   }
 
@@ -347,9 +392,23 @@ export class WorkSessionPTY implements WorkSessionRuntimeAdapter {
     const spec = buildOpenCodeWorkSessionLaunch({ cwd: input.cwd, model: input.model, sessionId });
     const env = { ...this.env(), OPENCODE_CONFIG_DIR: configDir, XDG_DATA_HOME: dataDir };
     this.spawn(spec.command, spec.args, spec.cwd, env);
-    if (sessionId) return { resume_handle: { runtime: 'opencode' as const, session_id: sessionId } };
     try {
+      if (sessionId) {
+        const canonicalCwd = realpathSync(input.cwd);
+        const exact = await waitFor(() => {
+          if (!this.pty) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+          const matches = this.queryOpenCodeSessions(databasePath).filter(row => row.id === sessionId);
+          if (matches.length !== 1) return undefined;
+          const candidate = matches[0];
+          if (realpathSync(candidate.cwd) !== canonicalCwd) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+          if ((candidate.updated_at ?? 0) < start) return undefined;
+          return candidate.id;
+        }, this.timeoutMs, 100);
+        if (exact !== sessionId) throw new Error('RESUME_HANDLE_UNAVAILABLE');
+        return { resume_handle: { runtime: 'opencode' as const, session_id: exact } };
+      }
       const exact = await waitFor(() => {
+        if (!this.pty) throw new Error('RESUME_HANDLE_UNAVAILABLE');
         const rows = this.queryOpenCodeSessions(databasePath).filter(row => !before.has(row.id));
         if (!rows.length) return undefined;
         return selectOpenCodeSession(rows, input.cwd, start, Date.now());
