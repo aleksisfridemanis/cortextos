@@ -27,6 +27,7 @@ export async function readBoundedJson(request: NextRequest): Promise<Record<stri
 }
 
 function statusFor(code?: string): number {
+  if (code === 'CONTEXT_BUDGET_EXCEEDED') return 413;
   if (code === 'NOT_FOUND' || code === 'CWD_NOT_FOUND') return 404;
   if (code === 'CWD_LEASE_CONFLICT' || code === 'INVALID_TRANSITION' || code === 'RESUME_HANDLE_MISSING') return 409;
   if (code === 'REGISTRY_CORRUPT' || code === 'RECOVERY_REQUIRED') return 503;

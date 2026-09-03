@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -174,6 +174,21 @@ describe('WorkSessionManager', () => {
       .rejects.toMatchObject({ code: 'REGISTRY_CORRUPT' });
     expect(readFileSync(roomsPath, 'utf8')).toBe('{corrupt');
     expect(manager.list()).toEqual([]);
+  });
+
+  it('rejects oversized launch context before publishing a session or room', async () => {
+    const { manager, adapter, cwd, ctxRoot } = fixture();
+    await expect(manager.create({
+      display_name: 'Too much context',
+      org: 'platform',
+      harness: 'codex-app-server',
+      requested_cwd: cwd,
+      initial_request: 'x'.repeat(64 * 1024 + 1),
+      actor: 'owner:test',
+    }, '82111111-1111-4111-8111-111111111111')).rejects.toMatchObject({ code: 'CONTEXT_BUDGET_EXCEEDED' });
+    expect(manager.list()).toEqual([]);
+    expect(existsSync(join(ctxRoot, 'config', 'rooms.json'))).toBe(false);
+    expect(adapter.startFresh).not.toHaveBeenCalled();
   });
 
   it('recovers a create interrupted after its effect-start write', async () => {

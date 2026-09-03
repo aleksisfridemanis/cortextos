@@ -20,7 +20,7 @@ import type {
   CreateWorkSessionInput, WorkSessionEmployeeInput, WorkSessionRecord,
   WorkSessionResumeHandle, WorkSessionRuntimeAdapter,
 } from './types.js';
-import { composeWorkSessionContext } from '../context/composer.js';
+import { composeWorkSessionContext, WORK_SESSION_CONTEXT_MAX_BYTES } from '../context/composer.js';
 import { promotionEmployeeMutationId } from './promotion.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -217,6 +217,23 @@ export class WorkSessionManager {
       const pattern = input.harness === 'opencode' ? /^[A-Za-z0-9._:-]+\/[A-Za-z0-9._:-]+$/ : /^[A-Za-z0-9._:-]+$/;
       if (input.model.length > 128 || !pattern.test(input.model)) throw new WorkSessionRegistryError('MODEL_UNSUPPORTED', 'Unsupported Work Session model');
     }
+    let launchContext = input.initial_request;
+    try {
+      if (this.dependencies.frameworkRoot) {
+        launchContext = composeWorkSessionContext({
+          frameworkRoot: this.dependencies.frameworkRoot,
+          projectRoot: input.requested_cwd,
+          initialRequest: input.initial_request,
+        }).text;
+      } else if (launchContext && Buffer.byteLength(launchContext, 'utf8') > WORK_SESSION_CONTEXT_MAX_BYTES) {
+        throw new Error('CONTEXT_BUDGET_EXCEEDED');
+      }
+    } catch (error) {
+      if ((error as Error).message.includes('CONTEXT_BUDGET_EXCEEDED')) {
+        throw new WorkSessionRegistryError('CONTEXT_BUDGET_EXCEEDED', 'Work Session context exceeds the allowed budget');
+      }
+      throw error;
+    }
     const id = safeId(mutationId);
     const roomId = `work-${id.slice(3)}`;
     const intended = digestCrewAuditValue({ id, display_name: input.display_name, org: input.org, harness: input.harness, requested_cwd: input.requested_cwd, model: input.model ?? null, room_id: roomId });
@@ -334,10 +351,7 @@ export class WorkSessionManager {
     commitCrewMutationState(this.dependencies.ctxRoot, mutationId, stateDigest(record));
     try {
       startCrewMutationEffect(this.dependencies.ctxRoot, mutationId);
-      const context = this.dependencies.frameworkRoot
-        ? composeWorkSessionContext({ frameworkRoot: this.dependencies.frameworkRoot, projectRoot: record.canonical_cwd, initialRequest: input.initial_request }).text
-        : input.initial_request;
-      const result = await this.adapter(record).startFresh({ id, cwd: record.canonical_cwd, model: input.model, context });
+      const result = await this.adapter(record).startFresh({ id, cwd: record.canonical_cwd, model: input.model, context: launchContext });
       record = transitionWorkSession(this.dependencies.ctxRoot, id, ['starting'], 'active', { resume_handle: result.resume_handle }, mutationId);
       recordCrewMutationEffect(this.dependencies.ctxRoot, mutationId, { runtime_started: true, handle_digest: digestCrewAuditValue(result.resume_handle), mutation_id: mutationId });
       finalizeCrewMutationAudit(this.dependencies.ctxRoot, mutationId, {
