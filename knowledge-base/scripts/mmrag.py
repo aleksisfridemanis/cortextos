@@ -507,7 +507,12 @@ def already_exists(collection, doc_id):
 def ingest_text_file(client, config, collection, file_path):
     """Ingest a text-based file."""
     file_path = Path(file_path)
-    text = file_path.read_text(errors="replace")
+    # Explicit encoding: Path.read_text() without one falls back to
+    # locale.getpreferredencoding(), which is cp1250 on this Baltic Windows
+    # box, not utf-8. That silently mangled every em dash/curly quote/accented
+    # character in every ingested doc (errors="replace" never raises, so
+    # nothing surfaced it). See FW-09.
+    text = file_path.read_text(encoding="utf-8", errors="replace")
     if not text.strip():
         print(f"  SKIP (empty): {file_path}")
         return 0
@@ -1058,7 +1063,11 @@ def ingest_file(client, config, collection, file_path):
     else:
         # Try as text for unknown extensions
         try:
-            file_path.read_text(errors="strict")[:100]
+            # Same encoding fix as ingest_text_file (FW-09): without
+            # encoding="utf-8" this probe decodes under the platform default
+            # (cp1250 here), which has 5 undefined byte positions — a UTF-8
+            # file can hit one mid-sequence and get misclassified as binary.
+            file_path.read_text(encoding="utf-8", errors="strict")[:100]
             return ingest_text_file(client, config, collection, file_path)
         except (UnicodeDecodeError, Exception):
             print(f"  SKIP (binary/unsupported): {file_path}")
