@@ -141,6 +141,19 @@ describe('ingestKnowledgeBase — graceful missing-config', () => {
     // Happy path emits no [kb] warning.
     expect(warnLog.filter((m) => m.includes('[kb]'))).toHaveLength(0);
   });
+
+  it('--collection override replaces scope-derived collection name', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+
+    ingestKnowledgeBase(['/some/file.md'], { ...baseOptions, scope: 'private', collection: 'memory-tester' });
+
+    const [, argv] = execFileSyncMock.mock.calls[0] as [string, string[], object];
+    expect(argv).toEqual(expect.arrayContaining(['--collection', 'memory-tester']));
+    // The scope-derived name (agent-tester) must NOT appear — override wins outright.
+    expect(argv).not.toEqual(expect.arrayContaining(['--collection', 'agent-tester']));
+    expect(logLog.some((m) => m.includes('memory-tester'))).toBe(true);
+  });
 });
 
 describe('queryKnowledgeBase — graceful missing-config', () => {
@@ -178,6 +191,24 @@ describe('queryKnowledgeBase — graceful missing-config', () => {
     expect(result.results[0].content).toBe('hit');
     // Happy path emits no [kb] warning.
     expect(warnLog.filter((m) => m.includes('[kb]'))).toHaveLength(0);
+  });
+
+  it('--collection override queries only that collection, ignoring --scope', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue(JSON.stringify({ results: [] }));
+
+    queryKnowledgeBase(dummyPaths, 'test query', {
+      ...baseOptions,
+      scope: 'all',
+      collection: 'memory-tester',
+    });
+
+    // scope: 'all' would normally fan out to shared-TestOrg + agent-tester
+    // (two execFileSync calls) — an explicit --collection must short-circuit
+    // that and hit exactly one collection, the override.
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+    const [, argv] = execFileSyncMock.mock.calls[0] as [string, string[], object];
+    expect(argv).toEqual(expect.arrayContaining(['--collection', 'memory-tester']));
   });
 });
 
